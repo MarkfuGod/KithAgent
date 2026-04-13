@@ -1,0 +1,12 @@
+# Core
+pyyaml>=6.0
+
+# Optional: real-time file watching (kqueue/FSEvents on macOS)
+watchdog>=4.0
+
+# Optional: HTTP API transport
+aiohttp>=3.9
+
+# Optional: LLM providers (install the ones you need)
+openai>=1.0
+anthropic>=0.30

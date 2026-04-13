@@ -1,0 +1,115 @@
+# AgentOS - SysAgent Configuration
+# Maps traditional OS concepts to an Agent-based architecture
+
+kernel:
+  name: "AgentOS"
+  version: "0.2.0"
+  pid_file: "/tmp/agent_sys.pid"
+  socket_path: "/tmp/agent_sys.sock"
+  log_level: "INFO"
+  log_file: "~/.agent_sys/logs/sysagent.log"
+
+# File system watcher — indexes personal files into a knowledge base
+filesystem:
+  watch_paths:
+    - "~/Documents"
+    - "~/Desktop"
+    - "~/Downloads"
+    - "~/Projects"
+  ignore_patterns:
+    - "node_modules"
+    - ".git"
+    - "__pycache__"
+    - ".DS_Store"
+    - "*.pyc"
+    - ".venv"
+  index_extensions:
+    - ".py"
+    - ".js"
+    - ".ts"
+    - ".md"
+    - ".txt"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".sh"
+    - ".go"
+    - ".rs"
+  scan_interval_seconds: 300  # full rescan every 5 minutes
+  max_file_size_mb: 10
+
+# Memory — context cache and persistent knowledge
+memory:
+  db_path: "~/.agent_sys/memory.db"
+  cache_max_items: 10000
+  embedding_model: "text-embedding-3-small"  # or local model
+  use_local_embeddings: true
+  local_model: "all-MiniLM-L6-v2"
+
+# Scheduler — agent thread pool
+scheduler:
+  max_concurrent_agents: 4
+  default_timeout_seconds: 120
+  priority_levels: 3  # 0=high, 1=normal, 2=low
+
+# Syscall API — how external agents connect
+syscall:
+  transport: "unix_socket"  # unix_socket | tcp | http
+  http_port: 7437
+  auth_token_path: "~/.agent_sys/auth_token"
+  allowed_callers:
+    - "cursor"
+    - "claude_code"
+    - "openclaw"
+    - "cli"
+
+# LLM — unified model abstraction layer
+llm:
+  default_provider: "openai"
+  providers:
+    openai:
+      api_key_env: "OPENAI_API_KEY"
+      models:
+        fast: "gpt-4o-mini"
+        strong: "gpt-4o"
+    claude:
+      api_key_env: "ANTHROPIC_API_KEY"
+      models:
+        fast: "claude-sonnet-4-20250514"
+        strong: "claude-opus-4-20250514"
+    compatible:
+      base_url: ""  # e.g. http://localhost:11434/v1 for Ollama
+      api_key_env: "COMPATIBLE_API_KEY"
+      models:
+        fast: "deepseek-chat"
+        strong: "deepseek-chat"
+  routing:
+    summarize: "fast"
+    analyze: "strong"
+    classify: "fast"
+    report: "strong"
+    profile: "strong"
+    search: "fast"
+
+# Cron — periodic smart agent tasks
+cron:
+  enabled: true
+  jobs:
+    - agent: "summarizer"
+      trigger: "after_scan"
+    - agent: "behavior_analyzer"
+      trigger: "interval"
+      interval_hours: 6
+    - agent: "priority_classifier"
+      trigger: "after:behavior_analyzer"
+    - agent: "report_generator"
+      trigger: "daily"
+      time: "09:00"
+    - agent: "profile_builder"
+      trigger: "weekly"
+
+# Personal profile — auto-built from indexed data
+profile:
+  owner: ""  # auto-detected or manually set
+  data_dir: "~/.agent_sys/profile"
