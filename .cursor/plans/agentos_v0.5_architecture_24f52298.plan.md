@@ -4,25 +4,25 @@ overview: Redesign LLM routing to support per-function provider/model selection 
 todos:
   - id: phase1-llm-config
     content: "Phase 1: Redesign LLM config -- add defaults/functions to LLMConfig, rework ModelRouter resolution with text/vision split and per-function provider+tier override"
-    status: pending
+    status: completed
   - id: phase2-event-bus
     content: "Phase 2a: Create EventBus (src/kernel/event_bus.py) with pub/sub, ring buffer, SSE streaming; inject into kernel context; add emit calls to router, agents, scheduler"
-    status: pending
+    status: completed
   - id: phase2-dashboard
     content: "Phase 2b: Dashboard overhaul -- SSE endpoint, Live Activity tab (running tasks, LLM I/O, triage/summarize progress bars), enhanced Triage tab (by_directory), wire /api/daemon"
-    status: pending
+    status: completed
   - id: phase3-triage-fix
     content: "Phase 3: Fix triage scheduling -- add triage to all _default_decision paths, ensure after_scan always fires triage even without LLM"
-    status: pending
+    status: completed
   - id: phase4-vector-search
     content: "Phase 4: Vector semantic search -- DB migration for embedding column, sentence-transformers wrapper, embed semantic_summary for high/medium files, cosine similarity search"
-    status: pending
+    status: completed
   - id: phase5-syscalls
     content: "Phase 5: Wire 3 dangling syscalls -- file.list (metadata listing), agent.submit (proxy to scheduler), agent.task_status (proxy to scheduler.get_task)"
-    status: pending
+    status: completed
   - id: phase6-subagent
     content: "Phase 6: SubAgent system -- add parent_task_id to AgentTask, fan_out() in scheduler, extend adaptive cron to output task DAGs with parallel branches"
-    status: pending
+    status: completed
 isProject: false
 ---
 

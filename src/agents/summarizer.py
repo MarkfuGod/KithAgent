@@ -15,6 +15,7 @@ summaries by project directory and produces project-level summaries
 stored in the knowledge table.
 """
 
+# TODO：这个总结agent是根据triage的优先级来吗，就是我觉得这里是并行处理任务好时机，比如并行好多subagent一块总结
 from __future__ import annotations
 
 import json
@@ -98,25 +99,30 @@ class SummarizerAgent(BaseAgent):
         mode = task.input_data.get("mode", "deep")
         time_budget = task.input_data.get("time_budget", _DEFAULT_TIME_BUDGET_SECONDS)
         batch_size = task.input_data.get("batch_size", 30 if mode == "deep" else 200)
+        event_bus = context.get("event_bus")
 
         start_time = time.time()
 
         if mode == "light":
             result = await self._run_light(memory, llm, batch_size, time_budget, start_time)
         else:
-            result = await self._run_deep(memory, llm, batch_size, time_budget, start_time)
+            result = await self._run_deep(memory, llm, batch_size, time_budget, start_time, event_bus=event_bus)
 
         # After individual summarization, attempt hierarchical project summaries
-        # if we still have time budget remaining
         elapsed = time.time() - start_time
         remaining = time_budget - elapsed
         if remaining > 30 and mode == "deep":
             hier_result = await self._build_hierarchical_summaries(memory, llm, remaining)
             result["hierarchical"] = hier_result
 
+        # Compute embeddings for newly summarized files (if sentence-transformers available)
+        embed_result = await self._compute_pending_embeddings(memory)
+        if embed_result:
+            result["embeddings_computed"] = embed_result
+
         return result
 
-    async def _run_deep(self, memory, llm, batch_size, time_budget, start_time) -> dict:
+    async def _run_deep(self, memory, llm, batch_size, time_budget, start_time, event_bus=None) -> dict:
         """Deep mode: read file content + LLM summarize, one file at a time."""
         files = await memory.get_files_needing_summary(limit=batch_size)
         if not files:
@@ -144,6 +150,12 @@ class SummarizerAgent(BaseAgent):
                         summarized += 1
                         vision_count += 1
                         summarized_files.append({"path": path, "type": "image", "summary": result[:120]})
+                        if event_bus:
+                            await event_bus.emit_dict("summarize.file_progress", {
+                                "path": path, "type": "image",
+                                "summarized": summarized, "total": len(files),
+                                "preview": result[:120],
+                            })
                     continue
 
                 if is_document(ext):
@@ -153,6 +165,12 @@ class SummarizerAgent(BaseAgent):
                         summarized += 1
                         doc_count += 1
                         summarized_files.append({"path": path, "type": "document", "summary": result[:120]})
+                        if event_bus:
+                            await event_bus.emit_dict("summarize.file_progress", {
+                                "path": path, "type": "document",
+                                "summarized": summarized, "total": len(files),
+                                "preview": result[:120],
+                            })
                     continue
 
                 content_preview = self._read_preview(path)
@@ -182,6 +200,12 @@ class SummarizerAgent(BaseAgent):
                 summarized += 1
                 summarized_files.append({"path": path, "type": "code", "summary": summary_text[:120]})
                 logger.debug("Summarized [deep]: %s", path)
+                if event_bus:
+                    await event_bus.emit_dict("summarize.file_progress", {
+                        "path": path, "type": "code",
+                        "summarized": summarized, "total": len(files),
+                        "preview": summary_text[:120],
+                    })
 
             except Exception as e:
                 errors += 1
@@ -223,7 +247,8 @@ class SummarizerAgent(BaseAgent):
                     LLMMessage(role="system", content=_VISION_SYSTEM),
                     LLMMessage(role="user", content=content),
                 ],
-                task_type="vision",
+                task_type="summarize",
+                is_vision=True,
                 max_tokens=300,
                 temperature=0.2,
             )
@@ -428,6 +453,35 @@ class SummarizerAgent(BaseAgent):
                         continue
 
         return None
+
+    @staticmethod
+    async def _compute_pending_embeddings(memory, batch_size: int = 100) -> int:
+        """Compute vector embeddings for files that have summaries but no embeddings."""
+        try:
+            from src.memory.embeddings import embed_texts, is_available
+            if not is_available():
+                return 0
+        except ImportError:
+            return 0
+
+        files = await memory.get_files_needing_embedding(limit=batch_size)
+        if not files:
+            return 0
+
+        texts = [f["semantic_summary"] for f in files]
+        embeddings = embed_texts(texts)
+        if not embeddings or len(embeddings) != len(files):
+            return 0
+
+        from src.memory.embeddings import get_provider_info
+        model_name = get_provider_info().get("model", "unknown")
+        updates = [
+            (f["path"], emb, model_name)
+            for f, emb in zip(files, embeddings)
+        ]
+        await memory.batch_update_embeddings(updates)
+        logger.info("Computed %d embeddings for summarized files", len(updates))
+        return len(updates)
 
     def _read_preview(self, path: str) -> str | None:
         try:

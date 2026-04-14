@@ -43,6 +43,12 @@ class SysAgentKernel:
         self._write_pid()
         self._install_signal_handlers()
 
+        # EventBus — central pub/sub for real-time visibility
+        from src.kernel.event_bus import EventBus
+        event_bus = EventBus()
+        self._subsystems["event_bus"] = event_bus
+        logger.info("[boot] EventBus ready")
+
         # Boot order mirrors OS: memory → LLM → filesystem → scheduler → cron → syscall
         from src.memory.store import MemoryStore
         memory = MemoryStore(self.config.memory)
@@ -50,13 +56,28 @@ class SysAgentKernel:
         self._subsystems["memory"] = memory
         logger.info("[boot] Memory store ready")
 
+        from src.memory import embeddings as emb_module
+        emb_cfg = self.config.memory.embedding
+        emb_module.configure(
+            provider=emb_cfg.provider,
+            local_model=emb_cfg.local_model,
+            api_key_env=emb_cfg.api_key_env,
+            api_base_url=emb_cfg.api_base_url,
+            model=emb_cfg.model,
+            dimensions=emb_cfg.dimensions,
+        )
+        logger.info("[boot] Embedding engine ready (%s)", emb_module.get_provider_info())
+
         from src.llm.router import create_router_from_config
         llm_cfg = {
             "default_provider": self.config.llm.default_provider,
             "providers": self.config.llm.providers,
             "routing": self.config.llm.routing,
+            "defaults": self.config.llm.defaults,
+            "functions": self.config.llm.functions,
         }
         llm_router = create_router_from_config(llm_cfg)
+        llm_router.set_event_bus(event_bus)
         self._subsystems["llm"] = llm_router
         available = llm_router.available_providers()
         logger.info("[boot] LLM router ready (providers: %s)", available or "none — set API keys")
@@ -100,7 +121,9 @@ class SysAgentKernel:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        """Graceful shutdown — reverse boot order."""
+        """Graceful shutdown — reverse boot order. Safe to call multiple times."""
+        if not self._running:
+            return
         logger.info("Kernel shutting down...")
         self._running = False
 
@@ -126,6 +149,89 @@ class SysAgentKernel:
 
     def get_llm(self):
         return self._subsystems.get("llm")
+
+    def get_event_bus(self):
+        return self._subsystems.get("event_bus")
+
+    async def reload_config(self) -> dict:
+        """Hot-reload: re-read YAML config and rebuild the LLM router without full restart."""
+        from src.kernel.config import load_config
+        new_config = load_config()
+
+        # Merge saved user overrides from ~/.agent_sys/llm_config.yaml
+        self._apply_saved_llm_config(new_config)
+
+        # Rebuild LLM router
+        from src.llm.router import create_router_from_config
+        llm_cfg = {
+            "default_provider": new_config.llm.default_provider,
+            "providers": new_config.llm.providers,
+            "routing": new_config.llm.routing,
+            "defaults": new_config.llm.defaults,
+            "functions": new_config.llm.functions,
+        }
+        new_router = create_router_from_config(llm_cfg)
+        event_bus = self.get_event_bus()
+        if event_bus:
+            new_router.set_event_bus(event_bus)
+        self._subsystems["llm"] = new_router
+        available = new_router.available_providers()
+
+        # Rebuild embedding provider
+        from src.memory import embeddings as emb_module
+        emb_cfg = new_config.memory.embedding
+        emb_module.configure(
+            provider=emb_cfg.provider,
+            local_model=emb_cfg.local_model,
+            api_key_env=emb_cfg.api_key_env,
+            api_base_url=emb_cfg.api_base_url,
+            model=emb_cfg.model,
+            dimensions=emb_cfg.dimensions,
+        )
+
+        # Update cron strategy
+        cron = self._subsystems.get("cron")
+        if cron and hasattr(cron, "config"):
+            cron.config.adaptive.strategy = new_config.cron.adaptive.strategy
+
+        self.config = new_config
+        logger.info("Config reloaded: LLM providers=%s, embedding=%s, strategy=%s",
+                     available, emb_cfg.provider, new_config.cron.adaptive.strategy)
+
+        if event_bus:
+            await event_bus.emit_dict("config.reloaded", {
+                "llm_providers": available,
+                "embedding_provider": emb_cfg.provider,
+                "strategy": new_config.cron.adaptive.strategy,
+            })
+
+        return {
+            "reloaded": True,
+            "llm_providers": available,
+            "embedding_provider": emb_cfg.provider,
+            "strategy": new_config.cron.adaptive.strategy,
+        }
+
+    @staticmethod
+    def _apply_saved_llm_config(config) -> None:
+        """Merge persisted llm_config.yaml overrides into config (same logic as CLI boot)."""
+        import yaml
+
+        saved_path = Path(os.path.expanduser("~/.agent_sys/llm_config.yaml"))
+        if not saved_path.exists():
+            return
+        try:
+            with open(saved_path) as f:
+                saved = yaml.safe_load(f) or {}
+            if saved.get("default_provider"):
+                config.llm.default_provider = saved["default_provider"]
+            if saved.get("providers"):
+                config.llm.providers.update(saved["providers"])
+            for env_var, value in saved.get("env_vars", {}).items():
+                os.environ.setdefault(env_var, value)
+            logger.debug("Merged saved LLM config: provider=%s", saved.get("default_provider"))
+        except Exception as e:
+            logger.warning("Failed to load saved LLM config during reload: %s", e)
 
     # ── internal helpers ──────────────────────────────────────
 

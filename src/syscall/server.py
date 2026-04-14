@@ -67,13 +67,18 @@ class SyscallServer:
         if self._unix_server:
             self._unix_server.close()
             await self._unix_server.wait_closed()
+            self._unix_server = None
 
         socket_path = str(self.kernel.config.kernel.socket_path)
         if os.path.exists(socket_path):
             os.unlink(socket_path)
 
         if self._http_runner:
-            await self._http_runner.cleanup()
+            try:
+                await self._http_runner.cleanup()
+            except Exception:
+                pass
+            self._http_runner = None
 
         logger.info("Syscall server stopped")
 
@@ -114,6 +119,8 @@ class SyscallServer:
             app.router.add_post("/syscall", self._http_handler)
             app.router.add_get("/status", self._http_status)
             app.router.add_get("/health", self._http_health)
+            app.router.add_get("/events", self._http_events_sse)
+            app.router.add_post("/reload", self._http_reload)
 
             runner = web.AppRunner(app)
             await runner.setup()
@@ -141,6 +148,56 @@ class SyscallServer:
     async def _http_health(self, request) -> Any:
         from aiohttp import web
         return web.json_response({"status": "ok"})
+
+    async def _http_reload(self, request) -> Any:
+        """Hot-reload config without restarting the daemon."""
+        from aiohttp import web
+        try:
+            result = await self.kernel.reload_config()
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _http_events_sse(self, request) -> Any:
+        """SSE endpoint on the daemon HTTP port — lets standalone dashboard proxy events."""
+        from aiohttp import web
+
+        resp = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+        await resp.prepare(request)
+
+        event_bus = self.kernel.get_event_bus()
+        if not event_bus:
+            await resp.write(b"event: error\ndata: {\"msg\":\"No EventBus available\"}\n\n")
+            return resp
+
+        queue = event_bus.subscribe(replay_buffer=False)
+        try:
+            recent = event_bus.recent_events(limit=50)
+            for evt in recent:
+                line = json.dumps(evt, default=str)
+                await resp.write(f"event: {evt['type']}\ndata: {line}\n\n".encode())
+
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    await resp.write(event.to_sse().encode())
+                except asyncio.TimeoutError:
+                    await resp.write(b": keepalive\n\n")
+                except ConnectionResetError:
+                    break
+        finally:
+            event_bus.unsubscribe(queue)
+
+        return resp
 
     # ── Core dispatch ─────────────────────────────────────────
 
@@ -183,13 +240,13 @@ class SyscallServer:
             caller=request.caller,
         )
 
-        # Build context with kernel subsystem references
         context = {
             "memory": self.kernel.get_memory(),
             "scheduler": self.kernel.get_scheduler(),
             "filesystem": self.kernel.get_filesystem(),
             "kernel": self.kernel,
             "llm": self.kernel.get_llm(),
+            "event_bus": self.kernel.get_event_bus(),
         }
 
         # Submit and wait

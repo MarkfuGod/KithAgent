@@ -36,7 +36,12 @@ class AgentState(str, Enum):
 
 @dataclass
 class AgentTask:
-    """A unit of work — analogous to a thread/task in an OS."""
+    """A unit of work — analogous to a thread/task in an OS.
+
+    SubAgent pattern: when parent_task_id is set, this task was spawned by
+    another agent (fan-out). The parent agent can await all children via
+    scheduler.fan_out().
+    """
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     name: str = ""
     priority: int = 1           # 0=high, 1=normal, 2=low
@@ -48,6 +53,8 @@ class AgentTask:
     result: Any = None
     error: str | None = None
     caller: str = ""            # which external agent requested this
+    parent_task_id: str | None = None
+    children_ids: list[str] = field(default_factory=list)
 
     def elapsed(self) -> float | None:
         if self.started_at:

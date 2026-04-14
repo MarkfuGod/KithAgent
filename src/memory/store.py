@@ -131,6 +131,8 @@ class MemoryStore:
             ("semantic_summary", "TEXT DEFAULT ''"),
             ("last_accessed_at", "REAL DEFAULT 0"),
             ("triage_status", "TEXT DEFAULT ''"),
+            ("embedding", "BLOB"),
+            ("embedding_model", "TEXT DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -184,13 +186,30 @@ class MemoryStore:
         return None
 
     async def search_files(self, query: str, file_type: str | None = None, limit: int = 20) -> list[dict]:
-        """Full-text search across indexed files, prioritized by file priority."""
+        """Search indexed files — uses vector search for natural language queries,
+        falls back to SQL LIKE for short keyword queries."""
         assert self._db
+
+        use_vector = len(query.split()) >= 3
+        if use_vector:
+            try:
+                from src.memory.embeddings import embed_text, is_available
+                if is_available():
+                    q_emb = embed_text(query)
+                    if q_emb:
+                        results = await self.vector_search(q_emb, limit=limit)
+                        if file_type:
+                            results = [r for r in results if r.get("file_type") == file_type]
+                        if results:
+                            return results
+            except Exception:
+                pass
+
         sql = """SELECT path, file_type, summary, size_bytes, priority,
                         COALESCE(semantic_summary, '') as semantic_summary
                  FROM file_index
-                 WHERE (summary LIKE ? OR semantic_summary LIKE ?)"""
-        params: list[Any] = [f"%{query}%", f"%{query}%"]
+                 WHERE (path LIKE ? OR summary LIKE ? OR semantic_summary LIKE ?)"""
+        params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
         if file_type:
             sql += " AND file_type = ?"
             params.append(file_type)
@@ -262,6 +281,71 @@ class MemoryStore:
                 (semantic_summary, path),
             )
             self._db.commit()
+
+    async def update_embedding(self, path: str, embedding: bytes, model_name: str = "") -> None:
+        async with self._lock:
+            assert self._db
+            self._db.execute(
+                "UPDATE file_index SET embedding = ?, embedding_model = ? WHERE path = ?",
+                (embedding, model_name, path),
+            )
+            self._db.commit()
+
+    async def batch_update_embeddings(self, updates: list[tuple[str, bytes, str]]) -> None:
+        """Bulk update embeddings: [(path, embedding_bytes, model_name), ...]"""
+        async with self._lock:
+            assert self._db
+            self._db.executemany(
+                "UPDATE file_index SET embedding = ?, embedding_model = ? WHERE path = ?",
+                [(emb, model, path) for path, emb, model in updates],
+            )
+            self._db.commit()
+
+    async def get_files_needing_embedding(self, limit: int = 200) -> list[dict]:
+        """Return files that have summaries but no embeddings yet (high/medium triage only)."""
+        assert self._db
+        rows = self._db.execute(
+            """SELECT path, semantic_summary
+               FROM file_index
+               WHERE semantic_summary != '' AND semantic_summary IS NOT NULL
+                 AND (embedding IS NULL OR embedding = '')
+                 AND triage_status IN ('high', 'medium', '')
+               ORDER BY
+                 CASE triage_status WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                 modified_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [{"path": r[0], "semantic_summary": r[1]} for r in rows]
+
+    async def vector_search(self, query_embedding: bytes, limit: int = 20) -> list[dict]:
+        """Find files by cosine similarity to query embedding."""
+        assert self._db
+        from src.memory.embeddings import cosine_similarity
+
+        rows = self._db.execute(
+            """SELECT path, file_type, semantic_summary, size_bytes, priority, embedding
+               FROM file_index
+               WHERE embedding IS NOT NULL AND embedding != ''"""
+        ).fetchall()
+
+        scored = []
+        for r in rows:
+            try:
+                score = cosine_similarity(query_embedding, r[5])
+                scored.append((score, r))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        return [
+            {
+                "path": r[0], "file_type": r[1], "semantic_summary": r[2],
+                "size_bytes": r[3], "priority": r[4], "score": round(score, 4),
+            }
+            for score, r in scored[:limit]
+        ]
 
     async def update_file_priority(self, path: str, priority: int) -> None:
         async with self._lock:
@@ -592,6 +676,12 @@ class MemoryStore:
         return None
 
     # ── Stats ─────────────────────────────────────────────────
+
+    async def count_summarized_files(self) -> int:
+        assert self._db
+        return self._db.execute(
+            "SELECT COUNT(*) FROM file_index WHERE semantic_summary != '' AND semantic_summary IS NOT NULL"
+        ).fetchone()[0]
 
     async def stats(self) -> dict:
         assert self._db

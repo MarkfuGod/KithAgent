@@ -253,29 +253,69 @@ agent-sys dashboard --port 9000     # 指定端口
 agent-sys stop                      # 停止 daemon
 ```
 
+### v0.5（第六轮）— 架构大升级
+
+#### 1. Per-Function LLM 路由
+
+- `LLMConfig` 新增 `defaults`（全局 text/vision provider+tier）和 `functions`（每功能独立覆写）
+- `ModelRouter.complete()` 新增 `is_vision` 参数，独立解析 text vs vision 的 provider+model
+- 可以 Anthropic 处理文字、OpenAI 处理视觉，triage/analyze 可选 reasoning 模型
+- `default.yaml` 新增 `defaults:` 和 `functions:` 配置块
+
+#### 2. EventBus + SSE 实时仪表盘
+
+- **`src/kernel/event_bus.py`**（新文件）：轻量 pub/sub + ring buffer，支持 SSE 流推送
+- 事件类型：`task.started/completed/failed`、`llm.request/response`、`triage.batch_progress`、`summarize.file_progress`
+- Scheduler 发射任务生命周期事件，Router 发射 LLM 调用事件，Triage/Summarizer 发射进度事件
+- Dashboard 新增 **Live Activity** 标签页：活跃任务、LLM 调用日志（model/tokens/latency/preview）、triage/summarize 实时进度条
+- Dashboard 新增 SSE endpoint `GET /api/events`
+- Triage 标签页现在渲染 `by_directory` 数据（之前后端返回但前端没显示）
+
+#### 3. Triage 调度修复
+
+- `_default_decision` 所有路径都包含 triage（不只深夜），因为规则 pass 零 LLM 成本
+- `_after_scan_loop` 修复首次扫描不触发问题（去掉 `last_scan_time > 0` guard）
+
+#### 4. 向量语义搜索
+
+- **`src/memory/embeddings.py`**（新文件）：sentence-transformers 封装（all-MiniLM-L6-v2, 384维）
+- DB 迁移新增 `embedding BLOB` + `embedding_model TEXT` 列
+- `search_files()` 自动判断：3+ 词自然语言查询走向量搜索，短关键词走 SQL LIKE
+- Summarizer 完成后自动批量计算 embedding
+- 只嵌入 triage_status 为 high/medium 的文件（~1万-3万 vs 20万+）
+
+#### 5. 补齐 3 个悬空 Syscall
+
+- `file.list` → `FileListAgent`：按目录/类型/triage 状态过滤文件元数据列表
+- `agent.submit` → `AgentSubmitAgent`：外部 caller 可提交任意 agent 任务
+- `agent.task_status` → `AgentTaskStatusAgent`：查询任务状态/进度
+- 19 个 syscall 现在全部有对应 agent 映射
+
+#### 6. SubAgent + fan_out 并行执行
+
+- `AgentTask` 新增 `parent_task_id` 和 `children_ids`（SubAgent 就是有 parent 的 task）
+- `AgentScheduler.fan_out()`：并行提交多个 task 并等待全部完成（像 Promise.all）
+- Adaptive cron 支持 `stages` 格式：阶段间串行，阶段内 agent 并行（DAG 调度）
+- LLM 调度器 prompt 更新：可输出 stages 表达依赖（triage → [summarizer + analyzer]）
+
+---
+
 ## 已知问题和待完善
 
 ### 已知问题
 
-1. **语义搜索未实现**：config 和 docstring 声称有 embedding 向量搜索，实际搜索全是 SQL `LIKE`
-2. **3 个 Syscall 悬空**：`file.list`、`agent.submit`、`agent.task_status` 在 enum 但未接到 agent
-3. **Auth 未执行**：`allowed_callers` 和 `auth_token_path` 配了但 server.py 没做校验
-4. **IPC 缺失**：内部 agent 间只有共享 context dict，没有消息总线
-5. **Cron 语义**：adaptive mode 开启后，YAML 里的 interval/weekly 触发器被 LLM 决策接管，不独立运行
-6. **after_scan 首次不触发**：`last_scan_time > 0` 的 guard 导致首次扫描完成后不触发 after_scan 链
-7. **Dashboard 离线**：Chart.js 从 CDN 加载，无网络时图表不可用
-8. **Triage 默认调度**：无 LLM 时的 fallback 规则只在深夜 deep hour 运行 triage，日常不主动 triage
+1. **Auth 未执行**：`allowed_callers` 和 `auth_token_path` 配了但 server.py 没做校验
+2. **Cron 语义**：adaptive mode 开启后，YAML 里的 interval/weekly 触发器被 LLM 决策接管，不独立运行
+3. **Dashboard 离线**：Chart.js 从 CDN 加载，无网络时图表不可用
 
 ### 下一步可做的
 
-- 向量化语义搜索（embedding 替代 LIKE）
 - 主动推送通知（异常检测 → 桌面通知）
 - 对话记忆 Agent（跨会话记住历史）
 - 自动化 Agent（检测重复操作，生成脚本）
 - Ollama 深度适配（自动检测可用模型、health check）
 - MLX 本地推理适配
 - 插件系统（第三方注册自定义 Agent）
-- 细分 subagent（当前所有分析都是全人视角，后续可拆分专职子 Agent）
-- 补齐 3 个悬空 syscall + auth 校验
+- Auth 校验（syscall server 验证 caller token）
 - Chart.js 本地化（打包到项目内，离线可用）
-- IPC 消息总线（agent 间结构化通信）
+- Dashboard 支持从 daemon EventBus 连接（当 dashboard 作为独立进程启动时通过 HTTP 转发事件）

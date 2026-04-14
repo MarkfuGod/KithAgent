@@ -1,175 +1,179 @@
-# AgentOS - SysAgent Configuration
-# Maps traditional OS concepts to an Agent-based architecture
-
 kernel:
-  name: "AgentOS"
-  version: "0.2.0"
-  pid_file: "/tmp/agent_sys.pid"
-  socket_path: "/tmp/agent_sys.sock"
-  log_level: "INFO"
-  log_file: "~/.agent_sys/logs/sysagent.log"
-
-# File system watcher — indexes personal files system-wide
+  name: AgentOS
+  version: 0.2.0
+  pid_file: /tmp/agent_sys.pid
+  socket_path: /tmp/agent_sys.sock
+  log_level: INFO
+  log_file: ~/.agent_sys/logs/sysagent.log
 filesystem:
   watch_paths:
-    - "~"
+  - '~'
   ignore_patterns:
-    - "node_modules"
-    - ".git"
-    - "__pycache__"
-    - ".DS_Store"
-    - "*.pyc"
-    - ".venv"
-    - "venv"
-    - "env"
-    - "Library"
-    - ".Trash"
-    - ".cache"
-    - ".npm"
-    - ".cargo"
-    - ".rustup"
-    - ".tox"
-    - "dist"
-    - "build"
-    - ".eggs"
-    - "*.egg-info"
-    - ".local"
-    - ".oh-my-zsh"
-    - ".conda"
-    - "anaconda3"
-    - "opt"
-    - ".docker"
-    - ".kube"
-    - "Movies"
-    - "Music"
-    - "Pictures"
-    - ".agent_sys"
+  - node_modules
+  - .git
+  - __pycache__
+  - .DS_Store
+  - '*.pyc'
+  - .venv
+  - venv
+  - env
+  - Library
+  - .Trash
+  - .cache
+  - .npm
+  - .cargo
+  - .rustup
+  - .tox
+  - dist
+  - build
+  - .eggs
+  - '*.egg-info'
+  - .local
+  - .oh-my-zsh
+  - .conda
+  - anaconda3
+  - opt
+  - .docker
+  - .kube
+  - Movies
+  - Music
+  - Pictures
+  - .agent_sys
   index_extensions:
-    # Code
-    - ".py"
-    - ".js"
-    - ".ts"
-    - ".go"
-    - ".rs"
-    - ".sh"
-    - ".java"
-    - ".c"
-    - ".cpp"
-    - ".swift"
-    # Data / config
-    - ".json"
-    - ".yaml"
-    - ".yml"
-    - ".toml"
-    - ".xml"
-    - ".csv"
-    # Text / docs
-    - ".md"
-    - ".txt"
-    - ".rst"
-    - ".tex"
-    # Documents
-    - ".pdf"
-    - ".docx"
-    - ".doc"
-    - ".pptx"
-    - ".xlsx"
-    # Images
-    - ".png"
-    - ".jpg"
-    - ".jpeg"
-    - ".gif"
-    - ".webp"
-  scan_interval_seconds: 300  # full rescan every 5 minutes
+  - .py
+  - .js
+  - .ts
+  - .go
+  - .rs
+  - .sh
+  - .java
+  - .c
+  - .cpp
+  - .swift
+  - .json
+  - .yaml
+  - .yml
+  - .toml
+  - .xml
+  - .csv
+  - .md
+  - .txt
+  - .rst
+  - .tex
+  - .pdf
+  - .docx
+  - .doc
+  - .pptx
+  - .xlsx
+  - .png
+  - .jpg
+  - .jpeg
+  - .gif
+  - .webp
+  scan_interval_seconds: 300
   max_file_size_mb: 10
-
-# Memory — context cache and persistent knowledge
 memory:
-  db_path: "~/.agent_sys/memory.db"
+  db_path: ~/.agent_sys/memory.db
   cache_max_items: 10000
-  embedding_model: "text-embedding-3-small"  # or local model
   use_local_embeddings: true
-  local_model: "all-MiniLM-L6-v2"
-
-# Scheduler — agent thread pool
+  local_model: all-MiniLM-L6-v2
+  embedding:
+    provider: dashscope
+    api_key_env: DASHSCOPE_API_KEY
+    api_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model: qwen3-vl-embedding
+    dimensions: 0
 scheduler:
   max_concurrent_agents: 4
   default_timeout_seconds: 120
-  priority_levels: 3  # 0=high, 1=normal, 2=low
-
-# Syscall API — how external agents connect
+  priority_levels: 3
 syscall:
-  transport: "unix_socket"  # unix_socket | tcp | http
+  transport: unix_socket
   http_port: 7437
-  auth_token_path: "~/.agent_sys/auth_token"
+  auth_token_path: ~/.agent_sys/auth_token
   allowed_callers:
-    - "cursor"
-    - "claude_code"
-    - "openclaw"
-    - "cli"
-
-# LLM — unified model abstraction layer
+  - cursor
+  - claude_code
+  - openclaw
+  - cli
 llm:
-  default_provider: "openai"
+  default_provider: openai
   providers:
     openai:
-      api_key_env: "OPENAI_API_KEY"
+      api_key_env: OPENAI_API_KEY
       models:
-        fast: "gpt-4o-mini"
-        strong: "gpt-4o"
+        fast: gpt-4o-mini
+        strong: gpt-4o
+        vision: gpt-4o
     openai_compatible:
-      base_url: ""  # e.g. http://localhost:11434/v1 for Ollama
-      api_key_env: "OPENAI_COMPATIBLE_API_KEY"
+      base_url: ''
+      api_key_env: OPENAI_COMPATIBLE_API_KEY
       models:
-        fast: "deepseek-chat"
-        strong: "deepseek-chat"
-        vision: "qwen-vl-plus"
+        fast: qwen-plus
+        strong: qwen-plus
+        vision: qwen-vl-plus
     anthropic:
-      api_key_env: "ANTHROPIC_API_KEY"
+      api_key_env: ANTHROPIC_API_KEY
       models:
-        fast: "claude-sonnet-4-20250514"
-        strong: "claude-opus-4-20250514"
+        fast: claude-sonnet-4-20250514
+        strong: claude-opus-4-20250514
+        reasoning: claude-opus-4-20250514
     anthropic_compatible:
-      base_url: ""  # e.g. https://api.minimaxi.com/anthropic
-      api_key_env: "ANTHROPIC_COMPATIBLE_API_KEY"
+      base_url: ''
+      api_key_env: ANTHROPIC_COMPATIBLE_API_KEY
       models:
-        fast: "MiniMax-M2.7"
-        strong: "MiniMax-M2.7"
+        fast: MiniMax-M2.7
+        strong: MiniMax-M2.7
+  defaults:
+    text_provider: ''
+    text_tier: fast
+    vision_provider: openai_compatible
+    vision_tier: vision
+  functions:
+    triage:
+      text_tier: fast
+    summarize:
+      text_tier: fast
+      vision_provider: openai_compatible
+      vision_tier: fast
+      vision_model: qwen-vl-plus
+    analyze: {}
+    report: {}
+    brief: {}
+    profile: {}
+    search: {}
   routing:
-    summarize: "fast"
-    analyze: "strong"
-    classify: "fast"
-    report: "strong"
-    profile: "strong"
-    search: "fast"
-    vision: "vision"
-
-# Cron — periodic smart agent tasks with LLM-driven adaptive scheduling
+    summarize: fast
+    analyze: strong
+    classify: fast
+    report: strong
+    profile: strong
+    search: fast
+    vision: vision
 cron:
   enabled: true
   adaptive:
     enabled: true
-    default_interval_minutes: 30    # initial polling interval before LLM adapts
-    min_interval_minutes: 10        # floor — never poll faster than this
-    max_interval_minutes: 240       # ceiling — never wait longer than this
-    deep_analysis_hour: 3           # preferred hour for deep analysis (3 AM)
+    default_interval_minutes: 30
+    min_interval_minutes: 10
+    max_interval_minutes: 240
+    deep_analysis_hour: 3
+    strategy: balanced
   jobs:
-    - agent: "triage"
-      trigger: "after_scan"
-    - agent: "summarizer"
-      trigger: "after:triage"
-    - agent: "behavior_analyzer"
-      trigger: "interval"
-      interval_hours: 6
-    - agent: "priority_classifier"
-      trigger: "after:behavior_analyzer"
-    - agent: "report_generator"
-      trigger: "daily"
-      time: "09:00"
-    - agent: "profile_builder"
-      trigger: "weekly"
-
-# Personal profile — auto-built from indexed data
+  - agent: triage
+    trigger: after_scan
+  - agent: summarizer
+    trigger: after:triage
+  - agent: behavior_analyzer
+    trigger: interval
+    interval_hours: 6
+  - agent: priority_classifier
+    trigger: after:behavior_analyzer
+  - agent: report_generator
+    trigger: daily
+    time: 09:00
+  - agent: profile_builder
+    trigger: weekly
 profile:
-  owner: ""  # auto-detected or manually set
-  data_dir: "~/.agent_sys/profile"
+  owner: ''
+  data_dir: ~/.agent_sys/profile

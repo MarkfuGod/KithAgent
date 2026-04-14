@@ -84,6 +84,38 @@ class AgentScheduler:
             task.error = "Timeout"
         return task
 
+    async def fan_out(
+        self,
+        tasks: list[AgentTask],
+        context: dict[str, Any],
+        parent_task_id: str | None = None,
+    ) -> list[AgentTask]:
+        """Submit multiple tasks in parallel and wait for all to complete.
+
+        Like Promise.all / asyncio.gather for agent tasks. Used by agents
+        that want to spawn parallel sub-work (e.g. summarize code + docs + images
+        concurrently).
+        """
+        events: list[tuple[AgentTask, asyncio.Event]] = []
+        for t in tasks:
+            if parent_task_id:
+                t.parent_task_id = parent_task_id
+            event = asyncio.Event()
+            t._done_event = event  # type: ignore[attr-defined]
+            await self.submit(t, context)
+            events.append((t, event))
+
+        async def _wait_one(task: AgentTask, evt: asyncio.Event) -> None:
+            timeout = task.input_data.get("timeout", self.config.default_timeout_seconds)
+            try:
+                await asyncio.wait_for(evt.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                task.state = AgentState.FAILED
+                task.error = "Timeout (fan_out)"
+
+        await asyncio.gather(*[_wait_one(t, e) for t, e in events])
+        return [t for t, _ in events]
+
     # ── dispatch loop ─────────────────────────────────────────
 
     async def _dispatch_loop(self) -> None:
@@ -114,6 +146,11 @@ class AgentScheduler:
             self._active_tasks[task.task_id] = task
             self._total_dispatched += 1
 
+            await self._emit_event("task.started", {
+                "task_id": task.task_id, "name": task.name,
+                "priority": task.priority, "caller": task.caller,
+            }, task)
+
             try:
                 context = getattr(task, "_context", {})
                 timeout = task.input_data.get("timeout", self.config.default_timeout_seconds)
@@ -133,6 +170,13 @@ class AgentScheduler:
             finally:
                 task.completed_at = time.time()
                 self._active_tasks.pop(task.task_id, None)
+                event_type = "task.completed" if task.state == AgentState.COMPLETED else "task.failed"
+                await self._emit_event(event_type, {
+                    "task_id": task.task_id, "name": task.name,
+                    "state": task.state.value,
+                    "elapsed_s": round(task.elapsed() or 0, 2),
+                    "error": task.error,
+                }, task)
                 self._finalize(task)
 
     def _finalize(self, task: AgentTask) -> None:
@@ -149,6 +193,15 @@ class AgentScheduler:
             task.task_id, task.name, task.state.value,
             task.elapsed() or 0,
         )
+
+    async def _emit_event(self, event_type: str, data: dict, task: AgentTask) -> None:
+        ctx = getattr(task, "_context", {})
+        event_bus = ctx.get("event_bus")
+        if event_bus:
+            try:
+                await event_bus.emit_dict(event_type, data)
+            except Exception:
+                pass
 
     def _find_agent(self, task_name: str) -> BaseAgent | None:
         for agent in self._agents:

@@ -37,33 +37,89 @@ _SCHEDULER_SYSTEM = """You are the adaptive scheduler for AgentOS, a system-leve
 Your job is to decide WHAT agents to run and WHEN based on the user's current activity.
 
 Available agents and their purposes:
-- triage: LLM-driven file importance classification — decides which files are worth summarizing based on their value for understanding the user. Should run before summarizer when there are many untriaged files.
-- summarizer: Generates semantic file summaries. Modes: "light" (metadata-only LLM), "deep" (reads content). Respects triage results — only summarizes files marked 'high' or 'medium'.
+- triage: LLM-driven file importance classification — decides which files are worth summarizing. Should run FIRST when there are untriaged files.
+- summarizer: Generates semantic file summaries. Modes: "light" (metadata-only LLM), "deep" (reads content). Respects triage results.
 - behavior_analyzer: Analyzes user's file activity, languages, work patterns.
 - priority_classifier: Classifies files into P0 (hot) / P1 (warm) / P2 (cold).
 - report_generator: Produces daily reports. Types: "daily", "quick", "brief".
 - profile_builder: Builds a user profile from indexed data.
 
-Given the activity snapshot, output a JSON scheduling decision:
+Output a JSON scheduling decision. You can use "stages" for sequential groups
+(each stage runs in order, agents within a stage run in parallel):
+
 {
   "mode": "light" | "deep",
   "next_interval_minutes": <integer between min and max>,
-  "agents_to_run": [
-    {"name": "<agent_name>", "input_data": {<optional overrides>}}
+  "stages": [
+    [{"name": "triage", "input_data": {}}],
+    [{"name": "summarizer", "input_data": {"mode": "deep"}}, {"name": "behavior_analyzer", "input_data": {}}]
   ],
   "reasoning": "<1-2 sentences explaining your decision>"
 }
 
+If you don't need staging, you can use the flat format instead:
+{
+  "mode": "...",
+  "next_interval_minutes": ...,
+  "agents_to_run": [{"name": "...", "input_data": {}}],
+  "reasoning": "..."
+}
+
+The user has configured a "scheduling_strategy" (aggressive/balanced/quiet) that tells
+you how eager the system should be. Respect it:
+- "aggressive": run triage and summarize every cycle, all agents frequently
+- "balanced" (default): triage every cycle, summarize when idle or deep hour, reports daily
+- "quiet": only run agents during deep_analysis_hour, minimize resource usage
+
+The snapshot includes enriched context:
+- "triage_stats": counts per status (untriaged, high, medium, low, skip)
+- "summary_progress": {total, summarized, pending, percent}
+- "embedding": provider info and availability
+- "llm": available providers, cumulative calls/tokens
+
 Guidelines:
-- If the user is actively modifying files right now, prefer "light" mode with shorter intervals (10-30 min) — run quick summaries and lightweight reports so data stays fresh without heavy load.
-- If the user is inactive (night/idle), prefer "deep" mode with longer intervals — run thorough analysis, full summarization, profile rebuild.
-- At the configured deep_analysis_hour, always trigger a comprehensive deep run.
-- Consider the history of past decisions to avoid redundant work.
-- The summarizer in light mode should set "mode": "light" in input_data; in deep mode set "mode": "deep".
-- Report generator: use "report_type": "quick" for active hours, "report_type": "daily" for quiet hours.
-- Don't run profile_builder more than once per day unless activity patterns changed significantly.
+- ALWAYS include triage first when there are many untriaged files (check triage_stats.untriaged).
+- If summary_progress.percent is low and there are triaged files, prioritize summarizer.
+- If the user is actively modifying files, prefer "light" mode with short intervals.
+- If the user is inactive (night/idle), prefer "deep" mode with longer intervals.
+- At the configured deep_analysis_hour, trigger a comprehensive deep run.
+- Use stages to express dependencies: triage before summarizer, summarizer before behavior_analyzer.
+- Agents within the same stage CAN run in parallel (fan-out).
+- Report generator: "report_type": "quick" for active hours, "daily" for quiet hours.
+- Consider embedding availability: if embeddings are ready, summarizer will auto-compute them.
 
 Output ONLY valid JSON."""
+
+
+SCHEDULING_STRATEGIES: dict[str, dict[str, Any]] = {
+    "aggressive": {
+        "description": "Always triage + summarize on every cycle. Good for initial indexing or catching up.",
+        "triage": "always",        # always | active_only | deep_hour_only
+        "summarize": "always",     # always | active_only | deep_hour_only
+        "report": "always",        # always | daily_only | never
+        "behavior": "frequent",    # frequent | daily | deep_hour_only
+        "profile": "daily",        # daily | weekly | deep_hour_only
+        "priority": "always",      # always | after_behavior | deep_hour_only
+    },
+    "balanced": {
+        "description": "Triage every cycle, summarize when idle or deep hour. Default.",
+        "triage": "always",
+        "summarize": "active_only",
+        "report": "daily_only",
+        "behavior": "daily",
+        "profile": "weekly",
+        "priority": "after_behavior",
+    },
+    "quiet": {
+        "description": "Only run during deep hour. Minimal resource usage.",
+        "triage": "deep_hour_only",
+        "summarize": "deep_hour_only",
+        "report": "daily_only",
+        "behavior": "deep_hour_only",
+        "profile": "deep_hour_only",
+        "priority": "deep_hour_only",
+    },
+}
 
 
 class CronScheduler:
@@ -154,25 +210,28 @@ class CronScheduler:
                 snapshot = await self._gather_activity_snapshot()
                 decision = await self._llm_decide_schedule(snapshot)
 
-                # Dispatch recommended agents, skipping ones already running or very recently completed
                 scheduler = self.kernel.get_scheduler()
                 active_names = set()
                 if scheduler:
                     active_names = {t.name for t in scheduler._active_tasks.values()}
 
-                for agent_spec in decision.get("agents_to_run", []):
-                    agent_name = agent_spec.get("name", "")
-                    input_data = agent_spec.get("input_data", {})
-                    if not agent_name:
-                        continue
-                    if agent_name in active_names:
-                        logger.debug("Skipping %s — already running", agent_name)
-                        continue
-                    last = self._last_run.get(agent_name, 0)
-                    if time.time() - last < 60:
-                        logger.debug("Skipping %s — ran %.0fs ago", agent_name, time.time() - last)
-                        continue
-                    await self._dispatch(agent_name, input_data=input_data)
+                stages = decision.get("stages")
+                if stages and isinstance(stages, list):
+                    await self._dispatch_stages(stages, active_names)
+                else:
+                    for agent_spec in decision.get("agents_to_run", []):
+                        agent_name = agent_spec.get("name", "")
+                        input_data = agent_spec.get("input_data", {})
+                        if not agent_name:
+                            continue
+                        if agent_name in active_names:
+                            logger.debug("Skipping %s — already running", agent_name)
+                            continue
+                        last = self._last_run.get(agent_name, 0)
+                        if time.time() - last < 60:
+                            logger.debug("Skipping %s — ran %.0fs ago", agent_name, time.time() - last)
+                            continue
+                        await self._dispatch(agent_name, input_data=input_data)
 
                 # Persist decision for future LLM context
                 await self._persist_decision(decision, snapshot)
@@ -217,16 +276,65 @@ class CronScheduler:
         mem_stats = await memory.stats()
         past_decisions = await memory.get_recent_scheduling_decisions(limit=5)
 
+        # Triage stats: how many files in each triage bucket
+        triage_stats = {}
+        try:
+            triage_stats = await memory.get_triage_stats()
+        except Exception:
+            pass
+
+        # Summary progress: how many files have been summarized
+        summary_progress = {}
+        try:
+            total = mem_stats.get("indexed_files", 0)
+            summarized = await memory.count_summarized_files()
+            summary_progress = {
+                "total": total,
+                "summarized": summarized,
+                "pending": total - summarized,
+                "percent": round(summarized / total * 100, 1) if total > 0 else 0,
+            }
+        except Exception:
+            pass
+
+        # Embedding status
+        embedding_info = {}
+        try:
+            from src.memory.embeddings import get_provider_info, is_available
+            embedding_info = {
+                **get_provider_info(),
+                "available": is_available(),
+            }
+        except Exception:
+            pass
+
+        # LLM router status
+        llm_status = {}
+        llm = self.kernel.get_llm()
+        if llm:
+            llm_status = {
+                "available_providers": llm.available_providers(),
+                "total_calls": llm._total_calls,
+                "total_tokens": llm._total_tokens,
+            }
+
+        strategy = getattr(self.config.adaptive, "strategy", "balanced")
         now = datetime.now()
         return {
             "current_time": now.strftime("%Y-%m-%d %H:%M"),
             "current_hour": now.hour,
             "deep_analysis_hour": self.config.adaptive.deep_analysis_hour,
+            "scheduling_strategy": strategy,
+            "strategy_description": SCHEDULING_STRATEGIES.get(strategy, {}).get("description", ""),
             "files_modified_last_30min": mod_rate_30m,
             "files_modified_last_6h": mod_rate_6h,
             "recent_files_sample": [f["path"].split("/")[-1] for f in recent_files[:10]],
             "indexed_files_total": mem_stats.get("indexed_files", 0),
             "knowledge_entries": mem_stats.get("knowledge_entries", 0),
+            "triage_stats": triage_stats,
+            "summary_progress": summary_progress,
+            "embedding": embedding_info,
+            "llm": llm_status,
             "past_decisions": [
                 json.loads(d["content"]) if isinstance(d.get("content"), str) else d.get("content", {})
                 for d in past_decisions
@@ -260,45 +368,84 @@ class CronScheduler:
         return self._default_decision(snapshot)
 
     def _default_decision(self, snapshot: dict) -> dict:
-        """Rule-based fallback when no LLM is available."""
+        """Rule-based fallback when no LLM is available.
+
+        Uses the configured scheduling strategy to decide which agents run.
+        Strategies: aggressive (always everything), balanced (default),
+        quiet (deep-hour only).
+        """
         hour = snapshot.get("current_hour", 12)
         mod_rate = snapshot.get("files_modified_last_30min", 0)
         deep_hour = self.config.adaptive.deep_analysis_hour
+        strategy_name = getattr(self.config.adaptive, "strategy", "balanced")
+        strat = SCHEDULING_STRATEGIES.get(strategy_name, SCHEDULING_STRATEGIES["balanced"])
 
-        if hour == deep_hour:
-            return {
-                "mode": "deep",
-                "next_interval_minutes": self.config.adaptive.max_interval_minutes,
-                "agents_to_run": [
-                    {"name": "triage", "input_data": {"time_budget": 180, "timeout": 300}},
-                    {"name": "summarizer", "input_data": {"mode": "deep", "time_budget": 240, "timeout": 300}},
-                    {"name": "behavior_analyzer", "input_data": {"timeout": 300}},
-                    {"name": "priority_classifier", "input_data": {}},
-                    {"name": "profile_builder", "input_data": {"timeout": 300}},
-                    {"name": "report_generator", "input_data": {"report_type": "daily", "timeout": 300}},
-                ],
-                "reasoning": f"Deep analysis hour ({deep_hour}:00) — running all agents in deep mode.",
-            }
+        is_deep_hour = (hour == deep_hour)
+        is_active = (mod_rate > 3)
 
-        if mod_rate > 3:
-            return {
-                "mode": "light",
-                "next_interval_minutes": self.config.adaptive.min_interval_minutes,
-                "agents_to_run": [
-                    {"name": "summarizer", "input_data": {"mode": "light", "batch_size": 50, "time_budget": 60, "timeout": 120}},
-                    {"name": "report_generator", "input_data": {"report_type": "quick", "timeout": 120}},
-                ],
-                "reasoning": f"User active ({mod_rate} files in 30min) — light mode, short interval.",
-            }
+        def _should_run(policy: str) -> bool:
+            if policy == "always":
+                return True
+            if policy == "active_only":
+                return is_active or is_deep_hour
+            if policy == "deep_hour_only":
+                return is_deep_hour
+            if policy == "daily" or policy == "daily_only":
+                return is_deep_hour
+            if policy == "weekly":
+                return is_deep_hour and datetime.now().weekday() == 0
+            if policy == "frequent":
+                return True
+            if policy == "after_behavior":
+                return is_deep_hour
+            if policy == "never":
+                return False
+            return True
+
+        agents: list[dict] = []
+
+        if _should_run(strat.get("triage", "always")):
+            budget = 180 if is_deep_hour else (60 if is_active else 120)
+            agents.append({"name": "triage", "input_data": {"time_budget": budget, "timeout": 300}})
+
+        if _should_run(strat.get("summarize", "active_only")):
+            if is_active and not is_deep_hour:
+                agents.append({"name": "summarizer", "input_data": {"mode": "light", "batch_size": 50, "time_budget": 60, "timeout": 120}})
+            else:
+                agents.append({"name": "summarizer", "input_data": {"mode": "deep", "time_budget": 240, "timeout": 300}})
+
+        if _should_run(strat.get("behavior", "daily")):
+            agents.append({"name": "behavior_analyzer", "input_data": {"timeout": 300}})
+
+        if _should_run(strat.get("priority", "after_behavior")):
+            agents.append({"name": "priority_classifier", "input_data": {}})
+
+        if _should_run(strat.get("profile", "weekly")):
+            agents.append({"name": "profile_builder", "input_data": {"timeout": 300}})
+
+        if _should_run(strat.get("report", "daily_only")):
+            rtype = "daily" if is_deep_hour else ("quick" if is_active else "daily")
+            agents.append({"name": "report_generator", "input_data": {"report_type": rtype, "timeout": 300}})
+
+        if is_deep_hour:
+            mode = "deep"
+            interval = self.config.adaptive.max_interval_minutes
+            reason = f"Deep hour ({deep_hour}:00), strategy={strategy_name}"
+        elif is_active:
+            mode = "light"
+            interval = self.config.adaptive.min_interval_minutes
+            reason = f"Active ({mod_rate} files/30min), strategy={strategy_name}"
+        else:
+            mode = "deep"
+            interval = self.config.adaptive.default_interval_minutes * 2
+            reason = f"Quiet ({mod_rate} files/30min), strategy={strategy_name}"
 
         return {
-            "mode": "deep",
-            "next_interval_minutes": self.config.adaptive.default_interval_minutes * 2,
-            "agents_to_run": [
-                {"name": "summarizer", "input_data": {"mode": "deep", "time_budget": 180, "timeout": 240}},
-                {"name": "behavior_analyzer", "input_data": {"timeout": 300}},
-            ],
-            "reasoning": f"User quiet ({mod_rate} files in 30min) — deep mode, longer interval.",
+            "mode": mode,
+            "next_interval_minutes": interval,
+            "agents_to_run": agents,
+            "reasoning": reason,
+            "strategy": strategy_name,
         }
 
     async def _persist_decision(self, decision: dict, snapshot: dict) -> None:
@@ -360,7 +507,7 @@ class CronScheduler:
     async def _after_scan_loop(self, agent_name: str) -> None:
         """Poll filesystem watcher stats to detect scan completions."""
         last_scan_time = 0.0
-        # Default overrides for agents that need longer timeouts
+        first_scan_seen = False
         _after_scan_overrides = {
             "triage": {"timeout": 300, "time_budget": 240},
             "summarizer": {"timeout": 300, "time_budget": 240, "mode": "deep"},
@@ -370,11 +517,13 @@ class CronScheduler:
             fs = self.kernel.get_filesystem()
             if fs and hasattr(fs, "_stats"):
                 current_scan = fs._stats.get("last_scan", 0.0)
-                if current_scan > last_scan_time and last_scan_time > 0:
-                    logger.info("Cron: scan completed, triggering %s", agent_name)
-                    overrides = _after_scan_overrides.get(agent_name, {})
-                    await self._dispatch(agent_name, input_data=overrides)
-                last_scan_time = current_scan
+                if current_scan > last_scan_time:
+                    if first_scan_seen or last_scan_time == 0:
+                        logger.info("Cron: scan completed, triggering %s", agent_name)
+                        overrides = _after_scan_overrides.get(agent_name, {})
+                        await self._dispatch(agent_name, input_data=overrides)
+                    first_scan_seen = True
+                    last_scan_time = current_scan
 
     async def _after_agent_loop(self, agent_name: str, dependency: str) -> None:
         """Poll for completion of a dependency agent, then run."""
@@ -385,6 +534,170 @@ class CronScheduler:
             if dep_last > my_last and dep_last > 0:
                 logger.info("Cron: %s completed, triggering %s", dependency, agent_name)
                 await self._dispatch(agent_name)
+
+    async def _dispatch_stages(self, stages: list[list[dict]], active_names: set[str]) -> None:
+        """Execute a DAG of agent stages with result-gated transitions.
+
+        Stages run sequentially; agents within each stage run in parallel via fan_out.
+        After each stage, results are summarized and (if LLM is available) used to
+        adjust the next stage's parameters — e.g. if triage found many high-priority
+        files, the summarizer gets a larger time budget and deep mode.
+        """
+        scheduler = self.kernel.get_scheduler()
+        if not scheduler:
+            return
+
+        stage_results: list[dict] = []
+
+        for stage_idx, stage in enumerate(stages):
+            if not isinstance(stage, list):
+                continue
+
+            # If we have prior stage results and an LLM, ask it to gate/adjust
+            if stage_idx > 0 and stage_results:
+                adjusted = await self._gate_next_stage(stage_idx, stage, stage_results)
+                if adjusted is not None:
+                    if not adjusted:
+                        logger.info("Stage %d: LLM gate decided to skip remaining stages", stage_idx)
+                        break
+                    stage = adjusted
+
+            tasks_to_fan = []
+            for agent_spec in stage:
+                agent_name = agent_spec.get("name", "")
+                input_data = agent_spec.get("input_data", {})
+                if not agent_name:
+                    continue
+                if agent_name in active_names:
+                    logger.debug("Stage %d: skipping %s — already running", stage_idx, agent_name)
+                    continue
+                last = self._last_run.get(agent_name, 0)
+                if time.time() - last < 60:
+                    continue
+
+                min_t = self._MIN_TIMEOUTS.get(agent_name, 120)
+                data = dict(input_data)
+                if data.get("timeout", 0) < min_t:
+                    data["timeout"] = min_t
+
+                tasks_to_fan.append(AgentTask(
+                    name=agent_name,
+                    priority=2,
+                    input_data=data,
+                    caller="cron_stage",
+                ))
+
+            if not tasks_to_fan:
+                stage_results.append({"stage": stage_idx, "agents": [], "skipped": True})
+                continue
+
+            current_results = {"stage": stage_idx, "agents": []}
+
+            if len(tasks_to_fan) == 1:
+                await self._dispatch(tasks_to_fan[0].name, input_data=tasks_to_fan[0].input_data)
+                current_results["agents"].append({
+                    "name": tasks_to_fan[0].name,
+                    "state": "dispatched",
+                })
+            else:
+                context = {
+                    "memory": self.kernel.get_memory(),
+                    "scheduler": scheduler,
+                    "filesystem": self.kernel.get_filesystem(),
+                    "kernel": self.kernel,
+                    "llm": self.kernel.get_llm(),
+                    "event_bus": self.kernel.get_event_bus(),
+                }
+                logger.info("Stage %d: fan_out %d agents: %s",
+                            stage_idx, len(tasks_to_fan),
+                            [t.name for t in tasks_to_fan])
+                results = await scheduler.fan_out(tasks_to_fan, context)
+                for t in results:
+                    self._last_run[t.name] = time.time()
+                    result_summary = self._summarize_task_result(t)
+                    current_results["agents"].append(result_summary)
+                    logger.info("Stage %d: %s → %s (%.2fs)",
+                                stage_idx, t.name, t.state.value, t.elapsed() or 0)
+
+            stage_results.append(current_results)
+
+    async def _gate_next_stage(
+        self, stage_idx: int, planned_stage: list[dict], prior_results: list[dict],
+    ) -> list[dict] | None:
+        """Ask the LLM whether to proceed with the next stage, and how to adjust its params.
+
+        Returns:
+          - adjusted stage spec (list of agent dicts) if LLM wants to proceed with changes
+          - the original planned_stage unchanged if no LLM or LLM says proceed as-is
+          - empty list [] if LLM says skip this stage
+          - None on error (falls through to original plan)
+        """
+        llm = self.kernel.get_llm()
+        if not llm or not llm.available_providers():
+            return None
+
+        gate_prompt = (
+            f"Stage {stage_idx} is about to run. Prior stage results:\n"
+            f"{json.dumps(prior_results, indent=2, default=str)}\n\n"
+            f"Planned agents for stage {stage_idx}:\n"
+            f"{json.dumps(planned_stage, indent=2)}\n\n"
+            "Based on the prior results, should we:\n"
+            "1. Proceed as planned (return the stage unchanged)\n"
+            "2. Adjust parameters (e.g. increase time_budget, change mode)\n"
+            "3. Skip this stage entirely\n\n"
+            "Return JSON: {\"action\": \"proceed\"|\"adjust\"|\"skip\", "
+            "\"adjusted_stage\": [...] (only if action=adjust), "
+            "\"reason\": \"...\"}\n"
+            "Output ONLY valid JSON."
+        )
+
+        try:
+            resp = await llm.complete(
+                messages=[
+                    LLMMessage(role="system", content=(
+                        "You are the stage gate controller for AgentOS scheduling. "
+                        "You decide whether to proceed, adjust, or skip the next stage "
+                        "based on results from prior stages. Be concise."
+                    )),
+                    LLMMessage(role="user", content=gate_prompt),
+                ],
+                task_type="classify",
+                max_tokens=300,
+                temperature=0.2,
+            )
+            decision = json.loads(resp.content.strip())
+            action = decision.get("action", "proceed")
+
+            if action == "skip":
+                logger.info("Gate: LLM decided to skip stage %d — %s", stage_idx, decision.get("reason", ""))
+                return []
+            elif action == "adjust":
+                adjusted = decision.get("adjusted_stage", planned_stage)
+                logger.info("Gate: LLM adjusted stage %d — %s", stage_idx, decision.get("reason", ""))
+                return adjusted if isinstance(adjusted, list) else planned_stage
+            else:
+                return None
+        except Exception as e:
+            logger.debug("Gate decision failed for stage %d: %s — proceeding as planned", stage_idx, e)
+            return None
+
+    @staticmethod
+    def _summarize_task_result(task: AgentTask) -> dict:
+        """Extract a concise summary from a completed task for the gate LLM."""
+        summary: dict[str, Any] = {
+            "name": task.name,
+            "state": task.state.value,
+            "elapsed_s": round(task.elapsed() or 0, 1),
+        }
+        if task.result and isinstance(task.result, dict):
+            for key in ("llm_triaged", "rule_based_skipped", "triage_distribution",
+                        "summarized", "errors", "mode", "total_candidates",
+                        "vision_files", "document_files", "hierarchical"):
+                if key in task.result:
+                    summary[key] = task.result[key]
+        if task.error:
+            summary["error"] = task.error
+        return summary
 
     # ── Dispatch helper ───────────────────────────────────────
 
@@ -420,6 +733,7 @@ class CronScheduler:
             "filesystem": self.kernel.get_filesystem(),
             "kernel": self.kernel,
             "llm": self.kernel.get_llm(),
+            "event_bus": self.kernel.get_event_bus(),
         }
 
         try:
@@ -430,10 +744,13 @@ class CronScheduler:
             logger.error("Cron task %s failed: %s", agent_name, e)
 
     def status(self) -> dict:
+        strategy = getattr(self.config.adaptive, "strategy", "balanced")
         return {
             "enabled": self.config.enabled,
             "running": self._running,
             "adaptive": self.config.adaptive.enabled,
+            "strategy": strategy,
+            "strategy_description": SCHEDULING_STRATEGIES.get(strategy, {}).get("description", ""),
             "jobs": len(self.config.jobs),
             "active_tasks": len(self._tasks),
             "last_run": dict(self._last_run),

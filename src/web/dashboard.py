@@ -25,6 +25,7 @@ logger = logging.getLogger("agent_sys.dashboard")
 
 DB_PATH = Path.home() / ".agent_sys" / "memory.db"
 LLM_CONFIG_PATH = Path.home() / ".agent_sys" / "llm_config.yaml"
+_DAEMON_HTTP_PORT = 7437
 
 
 def _get_db() -> sqlite3.Connection:
@@ -271,6 +272,51 @@ async def api_file_search(request: web.Request) -> web.Response:
     q = request.query.get("q", "")
     if not q or len(q) < 2:
         return web.json_response([])
+
+    home = str(Path.home())
+    use_vector = len(q.split()) >= 3
+
+    if use_vector:
+        try:
+            from src.memory.embeddings import embed_text, is_available, cosine_similarity
+            if is_available():
+                q_emb = embed_text(q)
+                if q_emb:
+                    db = _get_db()
+                    try:
+                        rows = db.execute(
+                            """SELECT path, file_type, size_bytes, priority,
+                                      COALESCE(semantic_summary, '') as ss,
+                                      COALESCE(summary, '') as s, embedding
+                               FROM file_index
+                               WHERE embedding IS NOT NULL AND embedding != ''"""
+                        ).fetchall()
+                        scored = []
+                        for r in rows:
+                            try:
+                                score = cosine_similarity(q_emb, r[6])
+                                scored.append((score, r))
+                            except Exception:
+                                continue
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        results = [
+                            {
+                                "path": r[0].replace(home, "~"),
+                                "type": r[1], "size": r[2], "priority": r[3],
+                                "summary": (r[4] or r[5] or "")[:200],
+                                "score": round(score, 4),
+                                "search_mode": "vector",
+                            }
+                            for score, r in scored[:50]
+                            if score > 0.25
+                        ]
+                        if results:
+                            return web.json_response(results)
+                    finally:
+                        db.close()
+        except Exception as e:
+            logger.warning("Vector search failed, falling back to LIKE: %s", e)
+
     db = _get_db()
     try:
         rows = db.execute(
@@ -282,12 +328,12 @@ async def api_file_search(request: web.Request) -> web.Response:
             (f"%{q}%", f"%{q}%", f"%{q}%")
         ).fetchall()
 
-        home = str(Path.home())
         return web.json_response([
             {
                 "path": r[0].replace(home, "~"),
                 "type": r[1], "size": r[2], "priority": r[3],
                 "summary": (r[4] or r[5] or "")[:200],
+                "search_mode": "keyword",
             }
             for r in rows
         ])
@@ -414,12 +460,165 @@ async def api_llm_config_save(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def api_scheduling_strategy(request: web.Request) -> web.Response:
+    """Get available scheduling strategies and current selection."""
+    from src.kernel.cron import SCHEDULING_STRATEGIES
+
+    import yaml
+    config_path = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+    current = "balanced"
+    try:
+        if config_path.exists():
+            with open(config_path) as f:
+                raw = yaml.safe_load(f) or {}
+            current = raw.get("cron", {}).get("adaptive", {}).get("strategy", "balanced")
+    except Exception:
+        pass
+
+    strategies = []
+    for name, s in SCHEDULING_STRATEGIES.items():
+        entry = {"name": name, "description": s.get("description", "")}
+        entry["policies"] = {k: v for k, v in s.items() if k != "description"}
+        strategies.append(entry)
+
+    return web.json_response({
+        "current": current,
+        "strategies": strategies,
+    })
+
+
+async def api_scheduling_strategy_set(request: web.Request) -> web.Response:
+    """Update the scheduling strategy in default.yaml."""
+    import yaml
+    from src.kernel.cron import SCHEDULING_STRATEGIES
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    name = body.get("strategy", "")
+    if name not in SCHEDULING_STRATEGIES:
+        return web.json_response({"error": f"Unknown strategy: {name}"}, status=400)
+
+    config_path = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+
+        raw.setdefault("cron", {}).setdefault("adaptive", {})["strategy"] = name
+
+        with open(config_path, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        return web.json_response({"success": True, "strategy": name, "message": "Strategy updated. Restart daemon to apply."})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_embedding_info(request: web.Request) -> web.Response:
+    """Return current embedding provider info."""
+    from src.memory import embeddings
+    return web.json_response(embeddings.get_provider_info())
+
+
+async def api_llm_routing_get(request: web.Request) -> web.Response:
+    """Read per-function LLM routing + defaults + providers from default.yaml."""
+    import yaml
+    config_path = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+        llm = raw.get("llm", {})
+        providers = {}
+        for pname, pcfg in llm.get("providers", {}).items():
+            tiers = list((pcfg.get("models") or {}).keys())
+            providers[pname] = {"tiers": tiers, "models": pcfg.get("models", {})}
+        return web.json_response({
+            "default_provider": llm.get("default_provider", ""),
+            "providers": providers,
+            "defaults": llm.get("defaults", {}),
+            "functions": llm.get("functions", {}),
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_llm_routing_save(request: web.Request) -> web.Response:
+    """Update per-function LLM routing and/or defaults in default.yaml."""
+    import yaml
+    config_path = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+
+        llm = raw.setdefault("llm", {})
+
+        if "defaults" in body:
+            llm["defaults"] = body["defaults"]
+        if "functions" in body:
+            llm["functions"] = body["functions"]
+
+        with open(config_path, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        return web.json_response({"success": True, "message": "Routing updated. Restart daemon to apply."})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_embedding_config_get(request: web.Request) -> web.Response:
+    """Read embedding config from default.yaml."""
+    import yaml
+    from src.memory import embeddings
+    config_path = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+        emb_cfg = raw.get("memory", {}).get("embedding", {})
+        live_info = embeddings.get_provider_info()
+        return web.json_response({
+            "config": emb_cfg,
+            "live": live_info,
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_embedding_config_save(request: web.Request) -> web.Response:
+    """Update embedding config in default.yaml."""
+    import yaml
+    config_path = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+
+        raw.setdefault("memory", {})["embedding"] = body.get("embedding", {})
+
+        with open(config_path, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        return web.json_response({"success": True, "message": "Embedding config updated. Restart daemon to apply."})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def api_daemon_status(request: web.Request) -> web.Response:
     """Try to get live status from the running daemon."""
     try:
         import aiohttp as ah
         async with ah.ClientSession() as session:
-            async with session.get("http://127.0.0.1:7437/status", timeout=ah.ClientTimeout(total=3)) as resp:
+            async with session.get(f"http://127.0.0.1:{_DAEMON_HTTP_PORT}/status", timeout=ah.ClientTimeout(total=3)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return web.json_response({"connected": True, **data})
@@ -428,14 +627,176 @@ async def api_daemon_status(request: web.Request) -> web.Response:
     return web.json_response({"connected": False})
 
 
+async def api_trigger_agent(request: web.Request) -> web.Response:
+    """Manually trigger an agent via the daemon's syscall HTTP endpoint."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    agent_name = body.get("agent", "")
+    input_data = body.get("input_data", {})
+
+    if not agent_name:
+        return web.json_response({"error": "Missing 'agent' parameter"}, status=400)
+
+    allowed_agents = {
+        "triage", "summarizer", "behavior_analyzer",
+        "priority_classifier", "report_generator", "profile_builder",
+    }
+    if agent_name not in allowed_agents:
+        return web.json_response({"error": f"Agent '{agent_name}' not in allowed list"}, status=400)
+
+    syscall_payload = {
+        "call_type": "agent.submit",
+        "params": {
+            "agent_name": agent_name,
+            "input_data": input_data,
+        },
+        "caller": "dashboard",
+    }
+
+    try:
+        import aiohttp as ah
+        async with ah.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{_DAEMON_HTTP_PORT}/syscall",
+                json=syscall_payload,
+                timeout=ah.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json()
+                if data.get("success"):
+                    return web.json_response({
+                        "success": True,
+                        "task_id": data.get("data", {}).get("task_id"),
+                        "message": f"Agent '{agent_name}' submitted successfully",
+                    })
+                return web.json_response({
+                    "success": False,
+                    "error": data.get("error", "Unknown error from daemon"),
+                })
+    except Exception as e:
+        return web.json_response({
+            "success": False,
+            "error": f"Cannot reach daemon: {e}. Is it running?",
+        }, status=503)
+
+
+async def api_reload_config(request: web.Request) -> web.Response:
+    """Ask the daemon to hot-reload its config (LLM router, embeddings, strategy)."""
+    try:
+        import aiohttp as ah
+        async with ah.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{_DAEMON_HTTP_PORT}/reload",
+                timeout=ah.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json()
+                if data.get("reloaded"):
+                    return web.json_response({
+                        "success": True,
+                        "message": "Config reloaded successfully",
+                        **data,
+                    })
+                return web.json_response({"success": False, "error": data.get("error", "Unknown")})
+    except Exception as e:
+        return web.json_response({
+            "success": False,
+            "error": f"Cannot reach daemon: {e}. Is it running?",
+        }, status=503)
+
+
+async def api_events_sse(request: web.Request) -> web.StreamResponse:
+    """SSE endpoint — streams real-time events from the daemon's EventBus.
+
+    When running standalone (no in-process event_bus), proxies SSE from
+    the daemon's HTTP endpoint at 127.0.0.1:7437/events.
+    """
+    resp = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+    await resp.prepare(request)
+
+    event_bus = request.app.get("event_bus")
+    if event_bus:
+        queue = event_bus.subscribe(replay_buffer=False)
+        try:
+            recent = event_bus.recent_events(limit=30)
+            for evt in recent:
+                line = json.dumps(evt, default=str)
+                await resp.write(f"event: {evt['type']}\ndata: {line}\n\n".encode())
+
+            while True:
+                try:
+                    import asyncio
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    await resp.write(event.to_sse().encode())
+                except asyncio.TimeoutError:
+                    await resp.write(b": keepalive\n\n")
+                except ConnectionResetError:
+                    break
+        finally:
+            event_bus.unsubscribe(queue)
+        return resp
+
+    # Standalone mode: proxy SSE from the daemon's HTTP server
+    try:
+        import aiohttp as ah
+        async with ah.ClientSession() as session:
+            daemon_url = f"http://127.0.0.1:{_DAEMON_HTTP_PORT}/events"
+            async with session.get(daemon_url, timeout=ah.ClientTimeout(total=0, sock_read=0)) as upstream:
+                if upstream.status != 200:
+                    await resp.write(
+                        b"event: error\ndata: {\"msg\":\"Daemon not reachable for SSE proxy\"}\n\n"
+                    )
+                    return resp
+
+                await resp.write(
+                    b"event: info\ndata: {\"msg\":\"Connected to daemon SSE (proxy mode)\"}\n\n"
+                )
+                async for chunk in upstream.content.iter_any():
+                    try:
+                        await resp.write(chunk)
+                    except ConnectionResetError:
+                        break
+    except Exception as e:
+        msg = json.dumps({"msg": f"SSE proxy failed: {e}"})
+        await resp.write(f"event: error\ndata: {msg}\n\n".encode())
+
+    return resp
+
+
 async def serve_dashboard(request: web.Request) -> web.Response:
     html_path = Path(__file__).parent / "dashboard.html"
     return web.Response(text=html_path.read_text(), content_type="text/html")
 
 
-def create_app() -> web.Application:
+async def serve_static(request: web.Request) -> web.Response:
+    filename = request.match_info["filename"]
+    static_dir = Path(__file__).parent
+    safe_path = (static_dir / filename).resolve()
+    if not str(safe_path).startswith(str(static_dir.resolve())):
+        return web.Response(status=403)
+    if not safe_path.exists():
+        return web.Response(status=404)
+    content_types = {".js": "application/javascript", ".css": "text/css", ".png": "image/png"}
+    ct = content_types.get(safe_path.suffix, "application/octet-stream")
+    return web.Response(body=safe_path.read_bytes(), content_type=ct)
+
+
+def create_app(event_bus=None) -> web.Application:
     app = web.Application()
+    if event_bus:
+        app["event_bus"] = event_bus
     app.router.add_get("/", serve_dashboard)
+    app.router.add_get("/static/{filename}", serve_static)
     app.router.add_get("/api/overview", api_overview)
     app.router.add_get("/api/directories", api_directory_tree)
     app.router.add_get("/api/knowledge", api_knowledge)
@@ -447,6 +808,16 @@ def create_app() -> web.Application:
     app.router.add_get("/api/llm-config", api_llm_config_get)
     app.router.add_post("/api/llm-config", api_llm_config_save)
     app.router.add_get("/api/daemon", api_daemon_status)
+    app.router.add_get("/api/events", api_events_sse)
+    app.router.add_get("/api/scheduling-strategy", api_scheduling_strategy)
+    app.router.add_post("/api/scheduling-strategy", api_scheduling_strategy_set)
+    app.router.add_get("/api/embedding-info", api_embedding_info)
+    app.router.add_get("/api/llm-routing", api_llm_routing_get)
+    app.router.add_post("/api/llm-routing", api_llm_routing_save)
+    app.router.add_get("/api/embedding-config", api_embedding_config_get)
+    app.router.add_post("/api/embedding-config", api_embedding_config_save)
+    app.router.add_post("/api/trigger-agent", api_trigger_agent)
+    app.router.add_post("/api/reload-config", api_reload_config)
     return app
 
 

@@ -89,6 +89,105 @@ class ContextAgent(BaseAgent):
             return {"session_id": session_id, "context": ctx}
 
 
+class FileListAgent(BaseAgent):
+    """List files matching directory/type/triage filters — metadata listing, not content search."""
+    name = "file_list"
+
+    async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
+        memory = context["memory"]
+        directory = task.input_data.get("directory", "")
+        file_type = task.input_data.get("file_type")
+        triage_status = task.input_data.get("triage_status")
+        limit = task.input_data.get("limit", 100)
+
+        assert memory._db
+        sql = "SELECT path, file_type, size_bytes, modified_at, priority, triage_status FROM file_index WHERE 1=1"
+        params: list[Any] = []
+
+        if directory:
+            sql += " AND path LIKE ?"
+            params.append(f"{directory}%")
+        if file_type:
+            sql += " AND file_type = ?"
+            params.append(file_type)
+        if triage_status:
+            sql += " AND triage_status = ?"
+            params.append(triage_status)
+
+        sql += " ORDER BY modified_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = memory._db.execute(sql, params).fetchall()
+        files = [
+            {"path": r[0], "file_type": r[1], "size_bytes": r[2],
+             "modified_at": r[3], "priority": r[4], "triage_status": r[5]}
+            for r in rows
+        ]
+        return {"files": files, "count": len(files)}
+
+
+class AgentSubmitAgent(BaseAgent):
+    """Proxy: submit an arbitrary agent task via syscall."""
+    name = "agent_submit"
+
+    async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
+        scheduler = context.get("scheduler")
+        if not scheduler:
+            return {"error": "Scheduler not available"}
+
+        target_name = task.input_data.get("agent_name", "")
+        if not target_name:
+            return {"error": "Missing 'agent_name' parameter"}
+
+        agent = scheduler._find_agent(target_name)
+        if not agent:
+            return {"error": f"No agent registered for: {target_name}"}
+
+        child = AgentTask(
+            name=target_name,
+            priority=task.input_data.get("priority", 1),
+            input_data=task.input_data.get("input_data", {}),
+            caller=task.caller or "syscall",
+        )
+        submitted = await scheduler.submit(child, context)
+        return {
+            "submitted": True,
+            "task_id": submitted.task_id,
+            "name": submitted.name,
+            "state": submitted.state.value,
+        }
+
+
+class AgentTaskStatusAgent(BaseAgent):
+    """Proxy: query task status by task_id."""
+    name = "agent_task_status"
+
+    async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
+        scheduler = context.get("scheduler")
+        if not scheduler:
+            return {"error": "Scheduler not available"}
+
+        task_id = task.input_data.get("task_id", "")
+        if not task_id:
+            return {"error": "Missing 'task_id' parameter"}
+
+        found = scheduler.get_task(task_id)
+        if not found:
+            return {"found": False, "task_id": task_id}
+
+        return {
+            "found": True,
+            "task_id": found.task_id,
+            "name": found.name,
+            "state": found.state.value,
+            "priority": found.priority,
+            "caller": found.caller,
+            "elapsed": round(found.elapsed() or 0, 2),
+            "error": found.error,
+            "has_result": found.result is not None,
+        }
+
+
 class SystemStatusAgent(BaseAgent):
     """Report system status — like 'top' or 'htop' for AgentOS."""
     name = "system_status"
@@ -123,6 +222,7 @@ BUILTIN_AGENTS: list[BaseAgent] = [
     # v0.1 — rule-based
     FileSearchAgent(),
     FileReadAgent(),
+    FileListAgent(),
     KnowledgeQueryAgent(),
     KnowledgeStoreAgent(),
     ContextAgent(),
@@ -135,4 +235,7 @@ BUILTIN_AGENTS: list[BaseAgent] = [
     ProfileBuilderAgent(),
     # v0.3 — LLM triage (decides what's worth summarizing)
     TriageAgent(),
+    # v0.5 — agent management syscalls
+    AgentSubmitAgent(),
+    AgentTaskStatusAgent(),
 ]

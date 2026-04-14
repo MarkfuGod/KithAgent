@@ -34,11 +34,22 @@ class FilesystemConfig:
 
 
 @dataclass
+class EmbeddingConfig:
+    provider: str = "dashscope"
+    local_model: str = "all-MiniLM-L6-v2"
+    api_key_env: str = "DASHSCOPE_API_KEY"
+    api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model: str = "qwen3-vl-embedding"
+    dimensions: int = 0
+
+
+@dataclass
 class MemoryConfig:
     db_path: Path = Path("~/.agent_sys/memory.db")
     cache_max_items: int = 10000
     use_local_embeddings: bool = True
     local_model: str = "all-MiniLM-L6-v2"
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
 
 
 @dataclass
@@ -74,6 +85,13 @@ class LLMConfig:
         "summarize": "fast", "analyze": "strong", "classify": "fast",
         "report": "strong", "profile": "strong", "search": "fast",
     })
+    defaults: dict[str, str] = field(default_factory=lambda: {
+        "text_provider": "",
+        "text_tier": "fast",
+        "vision_provider": "",
+        "vision_tier": "vision",
+    })
+    functions: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -91,6 +109,7 @@ class AdaptiveConfig:
     min_interval_minutes: int = 10
     max_interval_minutes: int = 240
     deep_analysis_hour: int = 3
+    strategy: str = "balanced"  # aggressive | balanced | quiet | custom
 
 
 @dataclass
@@ -140,10 +159,25 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
         raw = {}
 
     llm_raw = raw.get("llm", {})
+    _llm_defaults = LLMConfig()
     llm_config = LLMConfig(
         default_provider=llm_raw.get("default_provider", "openai"),
-        providers=llm_raw.get("providers", LLMConfig().providers),
-        routing=llm_raw.get("routing", LLMConfig().routing),
+        providers=llm_raw.get("providers", _llm_defaults.providers),
+        routing=llm_raw.get("routing", _llm_defaults.routing),
+        defaults=llm_raw.get("defaults", _llm_defaults.defaults),
+        functions=llm_raw.get("functions") or {},
+    )
+
+    # Embedding config
+    mem_raw = raw.get("memory", {})
+    emb_raw = mem_raw.get("embedding", {})
+    embedding_config = EmbeddingConfig(
+        provider=emb_raw.get("provider", "local"),
+        local_model=emb_raw.get("local_model", mem_raw.get("local_model", "all-MiniLM-L6-v2")),
+        api_key_env=emb_raw.get("api_key_env", ""),
+        api_base_url=emb_raw.get("api_base_url", ""),
+        model=emb_raw.get("model", ""),
+        dimensions=emb_raw.get("dimensions", 0),
     )
 
     cron_raw = raw.get("cron", {})
@@ -154,6 +188,7 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
         min_interval_minutes=adaptive_raw.get("min_interval_minutes", 10),
         max_interval_minutes=adaptive_raw.get("max_interval_minutes", 240),
         deep_analysis_hour=adaptive_raw.get("deep_analysis_hour", 3),
+        strategy=adaptive_raw.get("strategy", "balanced"),
     )
     cron_config = CronConfig(
         enabled=cron_raw.get("enabled", True),
@@ -161,10 +196,13 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
         adaptive=adaptive_config,
     )
 
+    memory_config = _build_section(MemoryConfig, raw.get("memory"))
+    memory_config.embedding = embedding_config
+
     return AgentOSConfig(
         kernel=_build_section(KernelConfig, raw.get("kernel")),
         filesystem=_build_section(FilesystemConfig, raw.get("filesystem")),
-        memory=_build_section(MemoryConfig, raw.get("memory")),
+        memory=memory_config,
         scheduler=_build_section(SchedulerConfig, raw.get("scheduler")),
         syscall=_build_section(SyscallConfig, raw.get("syscall")),
         llm=llm_config,
