@@ -68,7 +68,7 @@ class LLMConfig:
     default_provider: str = "openai"
     providers: dict[str, dict[str, Any]] = field(default_factory=lambda: {
         "openai": {"api_key_env": "OPENAI_API_KEY", "models": {"fast": "gpt-4o-mini", "strong": "gpt-4o"}},
-        "claude": {"api_key_env": "ANTHROPIC_API_KEY", "models": {"fast": "claude-sonnet-4-20250514", "strong": "claude-opus-4-20250514"}},
+        "anthropic": {"api_key_env": "ANTHROPIC_API_KEY", "models": {"fast": "claude-sonnet-4-20250514", "strong": "claude-opus-4-20250514"}},
     })
     routing: dict[str, str] = field(default_factory=lambda: {
         "summarize": "fast", "analyze": "strong", "classify": "fast",
@@ -85,9 +85,19 @@ class CronJobConfig:
 
 
 @dataclass
+class AdaptiveConfig:
+    enabled: bool = True
+    default_interval_minutes: int = 30
+    min_interval_minutes: int = 10
+    max_interval_minutes: int = 240
+    deep_analysis_hour: int = 3
+
+
+@dataclass
 class CronConfig:
     enabled: bool = True
     jobs: list[dict[str, Any]] = field(default_factory=list)
+    adaptive: AdaptiveConfig = field(default_factory=AdaptiveConfig)
 
 
 @dataclass
@@ -137,9 +147,18 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
     )
 
     cron_raw = raw.get("cron", {})
+    adaptive_raw = cron_raw.get("adaptive", {})
+    adaptive_config = AdaptiveConfig(
+        enabled=adaptive_raw.get("enabled", True),
+        default_interval_minutes=adaptive_raw.get("default_interval_minutes", 30),
+        min_interval_minutes=adaptive_raw.get("min_interval_minutes", 10),
+        max_interval_minutes=adaptive_raw.get("max_interval_minutes", 240),
+        deep_analysis_hour=adaptive_raw.get("deep_analysis_hour", 3),
+    )
     cron_config = CronConfig(
         enabled=cron_raw.get("enabled", True),
         jobs=cron_raw.get("jobs", []),
+        adaptive=adaptive_config,
     )
 
     return AgentOSConfig(

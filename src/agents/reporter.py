@@ -1,10 +1,16 @@
 """
-ReportGeneratorAgent — produces structured reports for external agents.
+ReportGeneratorAgent — produces holistic structured reports.
 
-Three report types:
-  1. daily_report:   What changed today, progress summary, inferred TODOs
-  2. project_profile: Per-project tech stack, key files, dependencies
-  3. context_brief:   "Everything you need to know" for a new agent session
+Covers three dimensions of the user's digital life:
+  - Work:     code projects, tech changes, inferred dev TODOs
+  - Study:    learning materials accessed, research patterns
+  - Personal: documents, images, personal file activity
+
+Report types:
+  1. daily:   Full day review across all dimensions
+  2. quick:   Lightweight status snapshot (runs frequently)
+  3. project: Per-project deep dive
+  4. brief:   Context briefing for a new agent session
 
 Reports are stored in the knowledge table and served via syscalls.
 """
@@ -15,6 +21,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from src.agents.base import AgentTask, BaseAgent
@@ -23,33 +30,68 @@ from src.llm.base import LLMMessage
 logger = logging.getLogger("agent_sys.agents.reporter")
 
 _DAILY_SYSTEM = """You are a daily report generator for AgentOS.
-Given today's file activity, produce a concise daily report in JSON:
+You are reporting on the user's ENTIRE digital day — not just coding.
+
+Given today's file activity (code, documents, images, configs, etc.), produce
+a holistic daily report in JSON:
 {
   "date": "YYYY-MM-DD",
-  "summary": "1-2 sentence overview of the day",
-  "files_changed": N,
-  "active_projects": ["project dirs"],
-  "key_changes": ["brief descriptions of notable changes"],
-  "inferred_todos": ["things that seem in progress or need attention"]
+  "summary": "2-3 sentence overview of the whole day",
+  "dimensions": {
+    "work": {
+      "files_changed": N,
+      "active_projects": ["project names"],
+      "key_changes": ["notable work-related changes"],
+      "inferred_todos": ["things in progress or needing attention"]
+    },
+    "study": {
+      "activity": "what learning/research activity was detected (if any)",
+      "topics": ["topics studied or referenced"]
+    },
+    "personal": {
+      "activity": "personal file activity (docs, photos, downloads, etc.)",
+      "notable": ["anything interesting outside of work"]
+    }
+  },
+  "highlights": ["top 3-5 highlights of the day across all dimensions"],
+  "time_pattern": "when the user was active and what they did at different times"
 }
 Output ONLY valid JSON."""
 
+_QUICK_SYSTEM = """You are a quick status reporter for AgentOS.
+Given the user's recent activity (ALL file types — code, documents, images, etc.),
+produce a concise quick report in JSON:
+{
+  "timestamp": "ISO datetime",
+  "activity_level": "active|moderate|quiet",
+  "files_modified": N,
+  "breakdown": {"code": N, "documents": N, "images": N, "other": N},
+  "active_areas": ["top directories or projects"],
+  "current_focus": "inferred from recent activity across ALL file types",
+  "notable": ["anything worth highlighting"]
+}
+Be concise. Output ONLY valid JSON."""
+
 _BRIEF_SYSTEM = """You are a context briefing generator for AgentOS.
 Given the user's recent activity, behavior insights, and profile, produce a
-JSON context brief that an AI agent can consume to quickly understand the user's
-current state:
+JSON context brief that captures the WHOLE person (not just coding):
 {
-  "current_focus": "what the user is working on right now",
-  "recent_activity": "summary of recent work",
-  "key_files": ["most relevant files for current work"],
-  "user_preferences": "known preferences and patterns",
+  "who": "brief description of this person based on their digital footprint",
+  "current_focus": "what they are doing right now",
+  "recent_activity": {
+    "work": "summary of recent work",
+    "study": "recent learning/research",
+    "personal": "recent personal file activity"
+  },
+  "key_files": ["most relevant files for current context"],
+  "preferences": "known preferences, patterns, and style",
   "suggested_context": "anything else a new agent session should know"
 }
 Output ONLY valid JSON."""
 
 
 class ReportGeneratorAgent(BaseAgent):
-    """Generate structured reports: daily, project profile, context brief."""
+    """Generate structured reports: daily, quick, project, brief."""
     name = "report_generator"
 
     async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
@@ -57,6 +99,8 @@ class ReportGeneratorAgent(BaseAgent):
 
         if report_type == "daily":
             return await self._generate_daily(context)
+        elif report_type == "quick":
+            return await self._generate_quick(context)
         elif report_type == "project":
             return await self._generate_project_profile(context, task.input_data.get("project_dir"))
         elif report_type == "brief":
@@ -64,22 +108,164 @@ class ReportGeneratorAgent(BaseAgent):
         else:
             return {"error": f"Unknown report type: {report_type}"}
 
+    async def _generate_quick(self, context: dict[str, Any]) -> dict:
+        memory = context["memory"]
+        llm = context.get("llm")
+
+        recent = await memory.get_recently_modified_files(hours=1, limit=50)
+        mod_rate = await memory.get_modification_rate(minutes=30)
+        dir_activity = await memory.get_directory_activity(depth=2)
+
+        code_ext = {".py", ".js", ".ts", ".go", ".rs", ".sh", ".java", ".c", ".cpp", ".swift"}
+        doc_ext = {".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".md", ".txt"}
+        img_ext = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+        breakdown = {"code": 0, "documents": 0, "images": 0, "other": 0}
+        for f in recent:
+            ext = (f.get("file_type") or "").lower()
+            if ext in code_ext:
+                breakdown["code"] += 1
+            elif ext in doc_ext:
+                breakdown["documents"] += 1
+            elif ext in img_ext:
+                breakdown["images"] += 1
+            else:
+                breakdown["other"] += 1
+
+        data_lines = [
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"Files modified in last hour: {len(recent)}",
+            f"Files modified in last 30min: {mod_rate}",
+            f"Breakdown: code={breakdown['code']}, docs={breakdown['documents']}, "
+            f"images={breakdown['images']}, other={breakdown['other']}",
+            "",
+            "Recent files (last hour):",
+        ]
+        for f in recent[:20]:
+            ts = datetime.fromtimestamp(f["modified_at"]).strftime("%H:%M") if f["modified_at"] else "?"
+            name = Path(f["path"]).name
+            data_lines.append(f"  [{ts}] {f['file_type']}  {name} — {f['path']}")
+
+        data_lines.append("\nTop directories:")
+        for d in dir_activity[:8]:
+            data_lines.append(f"  {d['directory']}: {d['file_count']} files")
+
+        data_text = "\n".join(data_lines)
+
+        if llm and llm.available_providers():
+            try:
+                resp = await llm.complete(
+                    messages=[
+                        LLMMessage(role="system", content=_QUICK_SYSTEM),
+                        LLMMessage(role="user", content=data_text),
+                    ],
+                    task_type="report", max_tokens=500, temperature=0.3,
+                )
+                report = json.loads(resp.content)
+            except Exception as e:
+                logger.warning("LLM quick report failed: %s", e)
+                report = self._fallback_quick(recent, dir_activity, mod_rate, breakdown)
+        else:
+            report = self._fallback_quick(recent, dir_activity, mod_rate, breakdown)
+
+        await memory.store_knowledge(
+            kid=f"quick_report_{int(time.time())}",
+            category="quick_report",
+            content=json.dumps(report, ensure_ascii=False),
+            metadata={"generated_at": time.time()},
+        )
+        return report
+
+    def _fallback_quick(self, recent, dir_activity, mod_rate, breakdown) -> dict:
+        level = "active" if mod_rate > 5 else ("moderate" if mod_rate > 0 else "quiet")
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "activity_level": level,
+            "files_modified": len(recent),
+            "breakdown": breakdown,
+            "active_areas": [d["directory"] for d in dir_activity[:3]],
+            "current_focus": recent[0]["path"].split("/")[-2] if recent else "unknown",
+            "notable": [],
+        }
+
     async def _generate_daily(self, context: dict[str, Any]) -> dict:
         memory = context["memory"]
         llm = context.get("llm")
 
-        recent = await memory.get_recently_modified_files(hours=24, limit=100)
+        recent = await memory.get_recently_modified_files(hours=24, limit=150)
         dir_activity = await memory.get_directory_activity(depth=3)
+        doc_files = await memory.get_files_by_category("document", limit=20)
+        img_files = await memory.get_files_by_category("image", limit=20)
+        dir_breakdown = await memory.get_directory_breakdown(depth=2)
 
-        data_lines = [f"Date: {datetime.now().strftime('%Y-%m-%d')}",
-                      f"Files modified in last 24h: {len(recent)}", ""]
-        for f in recent[:30]:
+        code_ext = {".py", ".js", ".ts", ".go", ".rs", ".sh", ".java", ".c", ".cpp", ".swift"}
+        doc_ext = {".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".md", ".txt"}
+        img_ext = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+        breakdown = {"code": 0, "documents": 0, "images": 0, "config_data": 0, "other": 0}
+        for f in recent:
+            ext = (f.get("file_type") or "").lower()
+            if ext in code_ext:
+                breakdown["code"] += 1
+            elif ext in doc_ext:
+                breakdown["documents"] += 1
+            elif ext in img_ext:
+                breakdown["images"] += 1
+            elif ext in (".json", ".yaml", ".yml", ".toml", ".xml", ".csv"):
+                breakdown["config_data"] += 1
+            else:
+                breakdown["other"] += 1
+
+        data_lines = [
+            f"Date: {datetime.now().strftime('%Y-%m-%d')}",
+            f"Files modified in last 24h: {len(recent)}",
+            f"Breakdown: {json.dumps(breakdown)}",
+            "",
+        ]
+
+        # Time distribution
+        hours_seen: dict[int, int] = {}
+        for f in recent:
+            if f.get("modified_at"):
+                h = datetime.fromtimestamp(f["modified_at"]).hour
+                hours_seen[h] = hours_seen.get(h, 0) + 1
+        if hours_seen:
+            sorted_hours = sorted(hours_seen.items(), key=lambda x: -x[1])
+            data_lines.append(f"Active hours: {', '.join(f'{h}:00({c})' for h, c in sorted_hours[:8])}")
+
+        data_lines.append("\n=== All modified files (by time) ===")
+        for f in recent[:50]:
             ts = datetime.fromtimestamp(f["modified_at"]).strftime("%H:%M") if f["modified_at"] else "?"
             data_lines.append(f"  [{ts}] {f['file_type']}  {f['path']}")
 
-        data_lines.append("\nActive directories:")
-        for d in dir_activity[:10]:
+        data_lines.append("\n=== Active directories ===")
+        for d in dir_activity[:12]:
             data_lines.append(f"  {d['directory']}: {d['file_count']} files")
+
+        data_lines.append("\n=== Directory content breakdown (top dirs) ===")
+        for d in dir_breakdown[:10]:
+            data_lines.append(
+                f"  ~/{d['directory']}: code={d['code']} doc={d['document']} "
+                f"img={d['image']} data={d['data']} other={d['other']}"
+            )
+
+        if doc_files:
+            today = datetime.now().strftime("%Y-%m-%d")
+            recent_docs = [f for f in doc_files if f.get("modified_at") and
+                          datetime.fromtimestamp(f["modified_at"]).strftime("%Y-%m-%d") == today]
+            if recent_docs:
+                data_lines.append(f"\n=== Documents touched today ({len(recent_docs)}) ===")
+                for f in recent_docs[:10]:
+                    data_lines.append(f"  {f['file_type']} {Path(f['path']).name} — {f['path']}")
+
+        if img_files:
+            today = datetime.now().strftime("%Y-%m-%d")
+            recent_imgs = [f for f in img_files if f.get("modified_at") and
+                          datetime.fromtimestamp(f["modified_at"]).strftime("%Y-%m-%d") == today]
+            if recent_imgs:
+                data_lines.append(f"\n=== Images touched today ({len(recent_imgs)}) ===")
+                for f in recent_imgs[:10]:
+                    data_lines.append(f"  {f['file_type']} {Path(f['path']).name} — {f['path']}")
 
         data_text = "\n".join(data_lines)
 
@@ -90,14 +276,14 @@ class ReportGeneratorAgent(BaseAgent):
                         LLMMessage(role="system", content=_DAILY_SYSTEM),
                         LLMMessage(role="user", content=data_text),
                     ],
-                    task_type="report", max_tokens=800, temperature=0.3,
+                    task_type="report", max_tokens=1500, temperature=0.3,
                 )
                 report = json.loads(resp.content)
             except Exception as e:
                 logger.warning("LLM daily report failed: %s", e)
-                report = self._fallback_daily(recent, dir_activity)
+                report = self._fallback_daily(recent, dir_activity, breakdown)
         else:
-            report = self._fallback_daily(recent, dir_activity)
+            report = self._fallback_daily(recent, dir_activity, breakdown)
 
         await memory.store_knowledge(
             kid=f"daily_report_{datetime.now().strftime('%Y%m%d')}",
@@ -107,14 +293,25 @@ class ReportGeneratorAgent(BaseAgent):
         )
         return report
 
-    def _fallback_daily(self, recent, dir_activity) -> dict:
+    def _fallback_daily(self, recent, dir_activity, breakdown) -> dict:
         return {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "summary": f"{len(recent)} files modified today",
-            "files_changed": len(recent),
-            "active_projects": [d["directory"] for d in dir_activity[:5]],
-            "key_changes": [f["path"].split("/")[-1] for f in recent[:10]],
-            "inferred_todos": [],
+            "dimensions": {
+                "work": {
+                    "files_changed": breakdown.get("code", 0),
+                    "active_projects": [d["directory"] for d in dir_activity[:5]],
+                    "key_changes": [],
+                    "inferred_todos": [],
+                },
+                "study": {"activity": "requires LLM", "topics": []},
+                "personal": {
+                    "activity": f"{breakdown.get('documents', 0)} docs, {breakdown.get('images', 0)} images",
+                    "notable": [],
+                },
+            },
+            "highlights": [],
+            "time_pattern": "",
         }
 
     async def _generate_project_profile(self, context: dict[str, Any], project_dir: str | None) -> dict:
@@ -148,7 +345,11 @@ class ReportGeneratorAgent(BaseAgent):
             try:
                 resp = await llm.complete(
                     messages=[
-                        LLMMessage(role="system", content="Analyze this project structure and output a JSON profile with keys: tech_stack, description, entry_points, dependencies. Output ONLY JSON."),
+                        LLMMessage(role="system", content=(
+                            "Analyze this project structure and output a JSON profile with keys: "
+                            "tech_stack, description, entry_points, dependencies, content_types "
+                            "(what kinds of files — code, docs, images, data). Output ONLY JSON."
+                        )),
                         LLMMessage(role="user", content=json.dumps(profile, indent=2)),
                     ],
                     task_type="report", max_tokens=600, temperature=0.3,
@@ -171,7 +372,6 @@ class ReportGeneratorAgent(BaseAgent):
         memory = context["memory"]
         llm = context.get("llm")
 
-        # Gather all available intelligence
         behavior = await memory.query_knowledge(category="behavior_insight", limit=1)
         profile = await memory.query_knowledge(category="user_profile", limit=1)
         recent = await memory.get_recently_modified_files(hours=48, limit=50)
@@ -191,7 +391,7 @@ class ReportGeneratorAgent(BaseAgent):
                         LLMMessage(role="system", content=_BRIEF_SYSTEM),
                         LLMMessage(role="user", content=json.dumps(data, indent=2, default=str)),
                     ],
-                    task_type="report", max_tokens=800, temperature=0.3,
+                    task_type="report", max_tokens=1000, temperature=0.3,
                 )
                 brief = json.loads(resp.content)
             except Exception as e:
@@ -199,10 +399,11 @@ class ReportGeneratorAgent(BaseAgent):
                 brief = {"raw_data": data}
         else:
             brief = {
-                "current_focus": data["behavior_insight"].get("focus_areas", ["unknown"]),
-                "recent_activity": f"{len(recent)} files in last 48h",
+                "who": "analysis requires LLM",
+                "current_focus": data["behavior_insight"].get("current_focus", "unknown"),
+                "recent_activity": {"work": f"{len(recent)} files in 48h"},
                 "key_files": data["recent_files"][:10],
-                "user_preferences": data["user_profile"],
+                "preferences": data["user_profile"],
                 "suggested_context": "",
             }
 

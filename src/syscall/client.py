@@ -131,13 +131,15 @@ class SysAgentClient:
     # ── v0.2: Smart Agent APIs ────────────────────────────────
 
     async def report_daily(self) -> dict:
-        resp = await self._call(SyscallType.REPORT_DAILY)
+        resp = await self._call(SyscallType.REPORT_DAILY, {"timeout": 300})
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
 
     async def report_project(self, project_dir: str | None = None) -> dict:
-        params = {"project_dir": project_dir} if project_dir else {}
+        params: dict = {"timeout": 300}
+        if project_dir:
+            params["project_dir"] = project_dir
         resp = await self._call(SyscallType.REPORT_PROJECT, params)
         if resp.success:
             return resp.data
@@ -145,31 +147,46 @@ class SysAgentClient:
 
     async def report_brief(self) -> dict:
         """Get a context brief — 'everything a new agent session needs to know'."""
-        resp = await self._call(SyscallType.REPORT_BRIEF)
+        resp = await self._call(SyscallType.REPORT_BRIEF, {"timeout": 300})
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
 
     async def profile_get(self) -> dict:
-        resp = await self._call(SyscallType.PROFILE_GET)
+        resp = await self._call(SyscallType.PROFILE_GET, {"timeout": 300})
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
 
     async def analyze_behavior(self, hours: float = 168) -> dict:
-        resp = await self._call(SyscallType.ANALYZE_BEHAVIOR, {"hours": hours})
+        resp = await self._call(SyscallType.ANALYZE_BEHAVIOR, {"hours": hours, "timeout": 300})
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
 
     async def classify_priority(self) -> dict:
-        resp = await self._call(SyscallType.CLASSIFY_PRIORITY)
+        resp = await self._call(SyscallType.CLASSIFY_PRIORITY, {"timeout": 180})
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
 
-    async def summarize_files(self, batch_size: int = 30) -> dict:
-        resp = await self._call(SyscallType.FILE_SUMMARIZE, {"batch_size": batch_size})
+    async def triage_files(self, batch_size: int = 500, timeout: int = 300) -> dict:
+        """Run LLM-based file importance triage."""
+        resp = await self._call(SyscallType.TRIAGE_FILES, {
+            "batch_size": batch_size,
+            "timeout": timeout,
+            "time_budget": timeout - 30,
+        })
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def summarize_files(self, batch_size: int = 30, timeout: int = 300) -> dict:
+        resp = await self._call(SyscallType.FILE_SUMMARIZE, {
+            "batch_size": batch_size,
+            "timeout": timeout,
+            "time_budget": timeout - 30,
+        })
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
@@ -243,6 +260,9 @@ class SyncSysAgentClient:
 
     def classify_priority(self) -> dict:
         return self._get_loop().run_until_complete(self._async_client.classify_priority())
+
+    def triage_files(self, batch_size: int = 500) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.triage_files(batch_size))
 
     def summarize_files(self, batch_size: int = 30) -> dict:
         return self._get_loop().run_until_complete(self._async_client.summarize_files(batch_size))

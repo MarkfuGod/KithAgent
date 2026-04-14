@@ -46,7 +46,12 @@ class OpenAIAdapter(LLMProvider):
         **kwargs,
     ) -> LLMResponse:
         model = model or self._models.get("fast", "gpt-4o-mini")
-        msgs = [{"role": m.role, "content": m.content} for m in messages]
+        msgs = []
+        for m in messages:
+            if isinstance(m.content, list):
+                msgs.append({"role": m.role, "content": m.content})
+            else:
+                msgs.append({"role": m.role, "content": m.content})
 
         # Try the openai SDK first
         try:

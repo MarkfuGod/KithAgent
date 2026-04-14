@@ -9,13 +9,10 @@ kernel:
   log_level: "INFO"
   log_file: "~/.agent_sys/logs/sysagent.log"
 
-# File system watcher — indexes personal files into a knowledge base
+# File system watcher — indexes personal files system-wide
 filesystem:
   watch_paths:
-    - "~/Documents"
-    - "~/Desktop"
-    - "~/Downloads"
-    - "~/Projects"
+    - "~"
   ignore_patterns:
     - "node_modules"
     - ".git"
@@ -23,19 +20,66 @@ filesystem:
     - ".DS_Store"
     - "*.pyc"
     - ".venv"
+    - "venv"
+    - "env"
+    - "Library"
+    - ".Trash"
+    - ".cache"
+    - ".npm"
+    - ".cargo"
+    - ".rustup"
+    - ".tox"
+    - "dist"
+    - "build"
+    - ".eggs"
+    - "*.egg-info"
+    - ".local"
+    - ".oh-my-zsh"
+    - ".conda"
+    - "anaconda3"
+    - "opt"
+    - ".docker"
+    - ".kube"
+    - "Movies"
+    - "Music"
+    - "Pictures"
+    - ".agent_sys"
   index_extensions:
+    # Code
     - ".py"
     - ".js"
     - ".ts"
-    - ".md"
-    - ".txt"
+    - ".go"
+    - ".rs"
+    - ".sh"
+    - ".java"
+    - ".c"
+    - ".cpp"
+    - ".swift"
+    # Data / config
     - ".json"
     - ".yaml"
     - ".yml"
     - ".toml"
-    - ".sh"
-    - ".go"
-    - ".rs"
+    - ".xml"
+    - ".csv"
+    # Text / docs
+    - ".md"
+    - ".txt"
+    - ".rst"
+    - ".tex"
+    # Documents
+    - ".pdf"
+    - ".docx"
+    - ".doc"
+    - ".pptx"
+    - ".xlsx"
+    # Images
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".gif"
+    - ".webp"
   scan_interval_seconds: 300  # full rescan every 5 minutes
   max_file_size_mb: 10
 
@@ -73,17 +117,24 @@ llm:
       models:
         fast: "gpt-4o-mini"
         strong: "gpt-4o"
-    claude:
+    openai_compatible:
+      base_url: ""  # e.g. http://localhost:11434/v1 for Ollama
+      api_key_env: "OPENAI_COMPATIBLE_API_KEY"
+      models:
+        fast: "deepseek-chat"
+        strong: "deepseek-chat"
+        vision: "qwen-vl-plus"
+    anthropic:
       api_key_env: "ANTHROPIC_API_KEY"
       models:
         fast: "claude-sonnet-4-20250514"
         strong: "claude-opus-4-20250514"
-    compatible:
-      base_url: ""  # e.g. http://localhost:11434/v1 for Ollama
-      api_key_env: "COMPATIBLE_API_KEY"
+    anthropic_compatible:
+      base_url: ""  # e.g. https://api.minimaxi.com/anthropic
+      api_key_env: "ANTHROPIC_COMPATIBLE_API_KEY"
       models:
-        fast: "deepseek-chat"
-        strong: "deepseek-chat"
+        fast: "MiniMax-M2.7"
+        strong: "MiniMax-M2.7"
   routing:
     summarize: "fast"
     analyze: "strong"
@@ -91,13 +142,22 @@ llm:
     report: "strong"
     profile: "strong"
     search: "fast"
+    vision: "vision"
 
-# Cron — periodic smart agent tasks
+# Cron — periodic smart agent tasks with LLM-driven adaptive scheduling
 cron:
   enabled: true
+  adaptive:
+    enabled: true
+    default_interval_minutes: 30    # initial polling interval before LLM adapts
+    min_interval_minutes: 10        # floor — never poll faster than this
+    max_interval_minutes: 240       # ceiling — never wait longer than this
+    deep_analysis_hour: 3           # preferred hour for deep analysis (3 AM)
   jobs:
-    - agent: "summarizer"
+    - agent: "triage"
       trigger: "after_scan"
+    - agent: "summarizer"
+      trigger: "after:triage"
     - agent: "behavior_analyzer"
       trigger: "interval"
       interval_hours: 6

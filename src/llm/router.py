@@ -23,6 +23,7 @@ DEFAULT_ROUTING: dict[str, str] = {
     "report": "strong",
     "profile": "strong",
     "search": "fast",
+    "vision": "vision",
 }
 
 
@@ -134,8 +135,8 @@ class ModelRouter:
 def create_router_from_config(llm_config: dict[str, Any]) -> ModelRouter:
     """Factory: build a ModelRouter from the 'llm' section of config YAML."""
     from src.llm.openai_adapter import OpenAIAdapter
-    from src.llm.claude_adapter import ClaudeAdapter
-    from src.llm.compatible_adapter import CompatibleAdapter
+    from src.llm.claude_adapter import AnthropicAdapter, AnthropicCompatibleAdapter
+    from src.llm.compatible_adapter import OpenAICompatibleAdapter
 
     providers_cfg = llm_config.get("providers", {})
     router = ModelRouter(
@@ -151,18 +152,27 @@ def create_router_from_config(llm_config: dict[str, Any]) -> ModelRouter:
             models=cfg.get("models"),
         ))
 
-    if "claude" in providers_cfg:
-        cfg = providers_cfg["claude"]
-        router.register_provider(ClaudeAdapter(
+    if "anthropic" in providers_cfg:
+        cfg = providers_cfg["anthropic"]
+        router.register_provider(AnthropicAdapter(
             api_key_env=cfg.get("api_key_env", "ANTHROPIC_API_KEY"),
+            base_url=cfg.get("base_url"),
             models=cfg.get("models"),
         ))
 
-    if "compatible" in providers_cfg:
-        cfg = providers_cfg["compatible"]
-        router.register_provider(CompatibleAdapter(
+    if "anthropic_compatible" in providers_cfg:
+        cfg = providers_cfg["anthropic_compatible"]
+        router.register_provider(AnthropicCompatibleAdapter(
             base_url=cfg.get("base_url", ""),
-            api_key_env=cfg.get("api_key_env", "COMPATIBLE_API_KEY"),
+            api_key_env=cfg.get("api_key_env", "ANTHROPIC_COMPATIBLE_API_KEY"),
+            models=cfg.get("models"),
+        ))
+
+    if "openai_compatible" in providers_cfg:
+        cfg = providers_cfg["openai_compatible"]
+        router.register_provider(OpenAICompatibleAdapter(
+            base_url=cfg.get("base_url", ""),
+            api_key_env=cfg.get("api_key_env", "OPENAI_COMPATIBLE_API_KEY"),
             models=cfg.get("models"),
         ))
 

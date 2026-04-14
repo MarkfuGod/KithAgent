@@ -116,6 +116,7 @@ from src.agents.analyzer import BehaviorAnalyzerAgent
 from src.agents.prioritizer import PriorityClassifierAgent
 from src.agents.reporter import ReportGeneratorAgent
 from src.agents.profile_builder import ProfileBuilderAgent
+from src.agents.triage import TriageAgent
 
 
 BUILTIN_AGENTS: list[BaseAgent] = [
@@ -132,4 +133,6 @@ BUILTIN_AGENTS: list[BaseAgent] = [
     PriorityClassifierAgent(),
     ReportGeneratorAgent(),
     ProfileBuilderAgent(),
+    # v0.3 — LLM triage (decides what's worth summarizing)
+    TriageAgent(),
 ]

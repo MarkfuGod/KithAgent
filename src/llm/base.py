@@ -19,7 +19,7 @@ logger = logging.getLogger("agent_sys.llm")
 @dataclass
 class LLMMessage:
     role: str          # "system" | "user" | "assistant"
-    content: str
+    content: str | list[dict]  # str for text, list for multimodal (OpenAI vision format)
 
 
 @dataclass

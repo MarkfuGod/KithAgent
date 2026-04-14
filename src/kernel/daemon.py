@@ -153,10 +153,20 @@ class SysAgentKernel:
     # ── status ────────────────────────────────────────────────
 
     def status(self) -> dict:
-        return {
+        result = {
             "name": self.config.kernel.name,
             "version": self.config.kernel.version,
             "pid": os.getpid(),
             "running": self._running,
             "subsystems": list(self._subsystems.keys()),
         }
+        fs = self.get_filesystem()
+        if fs:
+            fs_status = fs.status()
+            result["filesystem"] = {
+                "scan_in_progress": fs_status.get("scan_in_progress", False),
+                "files_indexed": fs_status.get("files_indexed", 0),
+                "scan_progress": fs_status.get("scan_progress_files", 0),
+                "realtime_watcher": fs_status.get("realtime", False),
+            }
+        return result

@@ -117,6 +117,7 @@ class MemoryStore:
 
         # Step 3: indexes that depend on migrated columns
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_file_priority ON file_index(priority)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_file_triage ON file_index(triage_status)")
         self._db.commit()
 
     def _migrate_schema(self) -> None:
@@ -129,6 +130,7 @@ class MemoryStore:
             ("priority", "INTEGER DEFAULT 1"),
             ("semantic_summary", "TEXT DEFAULT ''"),
             ("last_accessed_at", "REAL DEFAULT 0"),
+            ("triage_status", "TEXT DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -202,19 +204,54 @@ class MemoryStore:
         ]
 
     async def get_files_needing_summary(self, limit: int = 50) -> list[dict]:
-        """Return files that have no semantic summary or whose hash changed since last summary."""
+        """Return files that need summarization, prioritized by triage importance.
+
+        Order: triage_status='high' first, then 'medium', then untriaged.
+        Files marked 'skip' or 'low' are excluded.
+        Within each tier, diversify across code/doc/image categories.
+        """
         assert self._db
-        rows = self._db.execute(
-            """SELECT path, hash, file_type, size_bytes, summary
-               FROM file_index
-               WHERE semantic_summary = '' OR semantic_summary IS NULL
-               ORDER BY priority ASC, modified_at DESC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
+
+        _code_ext = ("'.py'","'.js'","'.ts'","'.go'","'.rs'","'.sh'","'.java'","'.c'","'.cpp'","'.swift'",
+                      "'.json'","'.yaml'","'.yml'","'.toml'","'.xml'","'.csv'")
+        _doc_ext = ("'.pdf'","'.docx'","'.doc'","'.pptx'","'.xlsx'","'.md'","'.txt'","'.rst'","'.tex'")
+        _img_ext = ("'.png'","'.jpg'","'.jpeg'","'.gif'","'.webp'","'.bmp'")
+
+        code_limit = max(limit // 2, 1)
+        doc_limit = max(limit // 4, 1)
+        img_limit = max(limit // 4, 1)
+
+        # triage_rank: 'high'=0, 'medium'=1, untriaged=2 (skip/low excluded)
+        triage_filter = "AND triage_status NOT IN ('skip', 'low')"
+        triage_order = """CASE triage_status
+            WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2
+        END"""
+
+        results = []
+        for ext_group, grp_limit in [
+            (_code_ext, code_limit),
+            (_doc_ext, doc_limit),
+            (_img_ext, img_limit),
+        ]:
+            ext_list = ",".join(ext_group)
+            rows = self._db.execute(
+                f"""SELECT path, hash, file_type, size_bytes, summary, modified_at
+                    FROM file_index
+                    WHERE (semantic_summary = '' OR semantic_summary IS NULL)
+                      AND file_type IN ({ext_list})
+                      {triage_filter}
+                    ORDER BY {triage_order}, priority ASC, modified_at DESC
+                    LIMIT ?""",
+                (grp_limit,),
+            ).fetchall()
+            results.extend(rows)
+
+        results.sort(key=lambda r: (r[3] or 0), reverse=True)
+
         return [
-            {"path": r[0], "hash": r[1], "file_type": r[2], "size_bytes": r[3], "summary": r[4]}
-            for r in rows
+            {"path": r[0], "hash": r[1], "file_type": r[2], "size_bytes": r[3],
+             "summary": r[4], "modified_at": r[5]}
+            for r in results[:limit]
         ]
 
     async def update_semantic_summary(self, path: str, semantic_summary: str) -> None:
@@ -310,6 +347,187 @@ class MemoryStore:
             "SELECT path, modified_at, priority FROM file_index"
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
+
+    async def get_modification_rate(self, minutes: float = 30) -> int:
+        """Count files modified in the last N minutes (for activity detection)."""
+        assert self._db
+        cutoff = time.time() - (minutes * 60)
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM file_index WHERE modified_at > ?", (cutoff,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    async def get_project_directories(self, min_files: int = 3) -> list[dict]:
+        """Identify project root directories by looking for marker files."""
+        assert self._db
+        markers = ("pyproject.toml", "package.json", "Cargo.toml", "go.mod",
+                    "requirements.txt", "Makefile", "setup.py", ".git")
+        project_dirs: list[dict] = []
+        for marker in markers:
+            rows = self._db.execute(
+                "SELECT path FROM file_index WHERE path LIKE ?",
+                (f"%/{marker}",),
+            ).fetchall()
+            for (p,) in rows:
+                d = str(Path(p).parent)
+                project_dirs.append({"directory": d, "marker": marker})
+
+        # Deduplicate by directory, count files per project
+        seen: dict[str, dict] = {}
+        for pd in project_dirs:
+            d = pd["directory"]
+            if d not in seen:
+                count = self._db.execute(
+                    "SELECT COUNT(*) FROM file_index WHERE path LIKE ?",
+                    (f"{d}/%",),
+                ).fetchone()[0]
+                if count >= min_files:
+                    seen[d] = {"directory": d, "file_count": count, "marker": pd["marker"]}
+        return sorted(seen.values(), key=lambda x: x["file_count"], reverse=True)
+
+    async def get_directory_breakdown(self, depth: int = 2) -> list[dict]:
+        """Group ALL files by top-level directory and file category for holistic analysis."""
+        assert self._db
+        rows = self._db.execute(
+            "SELECT path, file_type, size_bytes FROM file_index"
+        ).fetchall()
+
+        from collections import defaultdict
+        dir_stats: dict[str, dict] = defaultdict(lambda: {
+            "code": 0, "document": 0, "image": 0, "data": 0, "other": 0,
+            "total": 0, "total_size": 0,
+        })
+
+        _code_ext = {".py", ".js", ".ts", ".go", ".rs", ".sh", ".java", ".c", ".cpp", ".swift", ".kt", ".rb", ".php"}
+        _doc_ext = {".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".md", ".txt", ".rst", ".tex"}
+        _img_ext = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+        _data_ext = {".json", ".yaml", ".yml", ".toml", ".xml", ".csv"}
+
+        home = str(Path.home())
+        for path, ftype, size in rows:
+            rel = path[len(home):] if path.startswith(home) else path
+            parts = rel.strip("/").split("/")
+            dir_key = "/".join(parts[:depth]) if len(parts) > depth else "/".join(parts[:-1]) or "root"
+
+            s = dir_stats[dir_key]
+            s["total"] += 1
+            s["total_size"] += (size or 0)
+
+            ext = (ftype or "").lower()
+            if ext in _code_ext:
+                s["code"] += 1
+            elif ext in _doc_ext:
+                s["document"] += 1
+            elif ext in _img_ext:
+                s["image"] += 1
+            elif ext in _data_ext:
+                s["data"] += 1
+            else:
+                s["other"] += 1
+
+        result = []
+        for d, s in sorted(dir_stats.items(), key=lambda x: x[1]["total"], reverse=True):
+            s["directory"] = d
+            result.append(s)
+        return result[:50]
+
+    async def get_files_by_category(self, category: str, limit: int = 50) -> list[dict]:
+        """Get files by category (document, image, etc.) for non-code analysis."""
+        assert self._db
+        ext_map = {
+            "document": ("'.pdf'", "'.docx'", "'.doc'", "'.pptx'", "'.xlsx'", "'.txt'", "'.md'"),
+            "image": ("'.png'", "'.jpg'", "'.jpeg'", "'.gif'", "'.webp'", "'.bmp'"),
+        }
+        exts = ext_map.get(category)
+        if not exts:
+            return []
+
+        ext_list = ",".join(exts)
+        rows = self._db.execute(
+            f"""SELECT path, file_type, size_bytes, modified_at,
+                       COALESCE(semantic_summary, '') as semantic_summary
+                FROM file_index
+                WHERE file_type IN ({ext_list})
+                ORDER BY modified_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {"path": r[0], "file_type": r[1], "size_bytes": r[2],
+             "modified_at": r[3], "semantic_summary": r[4]}
+            for r in rows
+        ]
+
+    async def get_files_by_directory(self, directory: str) -> list[dict]:
+        """Get all indexed files under a directory with their summaries."""
+        assert self._db
+        rows = self._db.execute(
+            """SELECT path, file_type, semantic_summary, size_bytes
+               FROM file_index WHERE path LIKE ?
+               ORDER BY priority ASC, modified_at DESC""",
+            (f"{directory}/%",),
+        ).fetchall()
+        return [
+            {"path": r[0], "file_type": r[1], "semantic_summary": r[2] or "", "size_bytes": r[3]}
+            for r in rows
+        ]
+
+    async def get_recent_scheduling_decisions(self, limit: int = 5) -> list[dict]:
+        """Retrieve recent adaptive scheduling decisions for LLM context."""
+        return await self.query_knowledge(category="scheduling_decision", limit=limit)
+
+    # ── Triage operations ──────────────────────────────────────
+
+    async def get_untriaged_files(self, limit: int = 500) -> list[dict]:
+        """Return files that haven't been triaged yet, grouped to give LLM directory context."""
+        assert self._db
+        rows = self._db.execute(
+            """SELECT path, file_type, size_bytes, modified_at
+               FROM file_index
+               WHERE (triage_status = '' OR triage_status IS NULL)
+               ORDER BY modified_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {"path": r[0], "file_type": r[1], "size_bytes": r[2], "modified_at": r[3]}
+            for r in rows
+        ]
+
+    async def get_triage_stats(self) -> dict:
+        """Return triage status distribution."""
+        assert self._db
+        rows = self._db.execute(
+            """SELECT
+                 CASE WHEN triage_status = '' OR triage_status IS NULL THEN 'untriaged'
+                      ELSE triage_status END as status,
+                 COUNT(*) as cnt
+               FROM file_index
+               GROUP BY status
+               ORDER BY cnt DESC"""
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    async def batch_update_triage(self, updates: list[tuple[str, str]]) -> None:
+        """Bulk update triage status: [(path, status), ...]"""
+        async with self._lock:
+            assert self._db
+            self._db.executemany(
+                "UPDATE file_index SET triage_status = ? WHERE path = ?",
+                [(status, path) for path, status in updates],
+            )
+            self._db.commit()
+
+    async def batch_update_triage_by_prefix(self, prefix: str, status: str) -> int:
+        """Mark all files under a directory prefix with the given triage status.
+        Returns the number of rows affected."""
+        async with self._lock:
+            assert self._db
+            cursor = self._db.execute(
+                "UPDATE file_index SET triage_status = ? WHERE path LIKE ? AND (triage_status = '' OR triage_status IS NULL)",
+                (status, f"{prefix}%"),
+            )
+            self._db.commit()
+            return cursor.rowcount
 
     async def remove_file(self, path: str) -> None:
         async with self._lock:

@@ -1,7 +1,9 @@
 """
-Claude Adapter — supports Sonnet, Opus via the Anthropic Messages API.
+Anthropic Adapter — supports Claude Sonnet/Opus via the Anthropic Messages API,
+and any Anthropic-compatible third-party endpoint (MiniMax, etc.).
 
 Uses the anthropic SDK if installed, falls back to raw HTTP via aiohttp.
+Handles extended thinking models that return thinking+text content blocks.
 """
 
 from __future__ import annotations
@@ -13,21 +15,40 @@ from typing import Any
 
 from src.llm.base import LLMMessage, LLMProvider, LLMResponse
 
-logger = logging.getLogger("agent_sys.llm.claude")
+logger = logging.getLogger("agent_sys.llm.anthropic")
 
 _DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 
-class ClaudeAdapter(LLMProvider):
-    name = "claude"
+def _extract_text_from_content(content_blocks: list) -> str:
+    """Extract text from Anthropic content blocks, skipping thinking blocks."""
+    for block in content_blocks:
+        if isinstance(block, dict):
+            if block.get("type") == "text":
+                return block.get("text", "")
+        elif hasattr(block, "type") and block.type == "text":
+            return block.text
+    # Fallback: grab first block's text if no explicit text type found
+    if content_blocks:
+        first = content_blocks[0]
+        if isinstance(first, dict):
+            return first.get("text", first.get("thinking", ""))
+        return getattr(first, "text", getattr(first, "thinking", ""))
+    return ""
+
+
+class AnthropicAdapter(LLMProvider):
+    name = "anthropic"
 
     def __init__(
         self,
         api_key: str | None = None,
         api_key_env: str = "ANTHROPIC_API_KEY",
+        base_url: str | None = None,
         models: dict[str, str] | None = None,
     ):
         self._api_key = api_key or os.environ.get(api_key_env, "")
+        self._base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
         self._models = models or {
             "fast": "claude-sonnet-4-20250514",
             "strong": "claude-opus-4-20250514",
@@ -50,7 +71,6 @@ class ClaudeAdapter(LLMProvider):
     ) -> LLMResponse:
         model = model or self._models.get("fast", "claude-sonnet-4-20250514")
 
-        # Separate system message from conversation (Anthropic requires it as a top-level param)
         system_text = ""
         conv_messages: list[dict[str, str]] = []
         for m in messages:
@@ -83,7 +103,10 @@ class ClaudeAdapter(LLMProvider):
         import anthropic
 
         if self._client is None:
-            self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
+            kwargs_client: dict[str, Any] = {"api_key": self._api_key}
+            if self._base_url:
+                kwargs_client["base_url"] = self._base_url
+            self._client = anthropic.AsyncAnthropic(**kwargs_client)
 
         params: dict[str, Any] = {
             "model": model,
@@ -95,7 +118,7 @@ class ClaudeAdapter(LLMProvider):
             params["system"] = system
 
         resp = await self._client.messages.create(**params)
-        content = resp.content[0].text if resp.content else ""
+        content = _extract_text_from_content(resp.content) if resp.content else ""
         return LLMResponse(
             content=content,
             model=model,
@@ -118,7 +141,8 @@ class ClaudeAdapter(LLMProvider):
     ) -> LLMResponse:
         import aiohttp
 
-        url = "https://api.anthropic.com/v1/messages"
+        base = self._base_url.rstrip("/") if self._base_url else "https://api.anthropic.com"
+        url = f"{base}/v1/messages"
         headers = {
             "x-api-key": self._api_key,
             "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
@@ -137,12 +161,12 @@ class ClaudeAdapter(LLMProvider):
             async with session.post(url, headers=headers, json=payload) as resp:
                 data = await resp.json()
                 if resp.status != 200:
-                    raise RuntimeError(f"Claude API error ({resp.status}): {data}")
+                    raise RuntimeError(f"Anthropic API error ({resp.status}): {data}")
 
-        content_block = data.get("content", [{}])[0]
+        content = _extract_text_from_content(data.get("content", []))
         usage = data.get("usage", {})
         return LLMResponse(
-            content=content_block.get("text", ""),
+            content=content,
             model=model,
             provider=self.name,
             usage={
@@ -151,3 +175,31 @@ class ClaudeAdapter(LLMProvider):
             },
             raw=data,
         )
+
+
+# Backward compat alias
+ClaudeAdapter = AnthropicAdapter
+
+
+class AnthropicCompatibleAdapter(AnthropicAdapter):
+    """Anthropic API-compatible endpoint (MiniMax, custom proxies, etc.)."""
+
+    name = "anthropic_compatible"
+
+    def __init__(
+        self,
+        base_url: str = "",
+        api_key: str | None = None,
+        api_key_env: str = "ANTHROPIC_COMPATIBLE_API_KEY",
+        models: dict[str, str] | None = None,
+    ):
+        resolved_url = base_url or os.environ.get("ANTHROPIC_COMPATIBLE_BASE_URL", "")
+        super().__init__(
+            api_key=api_key,
+            api_key_env=api_key_env,
+            base_url=resolved_url,
+            models=models or {"fast": "MiniMax-M2.7", "strong": "MiniMax-M2.7"},
+        )
+
+    def available(self) -> bool:
+        return bool(self._api_key) and bool(self._base_url)

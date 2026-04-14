@@ -76,8 +76,9 @@ class AgentScheduler:
         event = asyncio.Event()
         task._done_event = event  # type: ignore[attr-defined]
         await self.submit(task, context)
+        timeout = task.input_data.get("timeout", self.config.default_timeout_seconds)
         try:
-            await asyncio.wait_for(event.wait(), timeout=self.config.default_timeout_seconds)
+            await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             task.state = AgentState.FAILED
             task.error = "Timeout"
@@ -115,9 +116,10 @@ class AgentScheduler:
 
             try:
                 context = getattr(task, "_context", {})
+                timeout = task.input_data.get("timeout", self.config.default_timeout_seconds)
                 result = await asyncio.wait_for(
                     agent.execute(task, context),
-                    timeout=self.config.default_timeout_seconds,
+                    timeout=timeout,
                 )
                 task.result = result
                 task.state = AgentState.COMPLETED

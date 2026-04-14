@@ -14,6 +14,7 @@ Two modes:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -25,6 +26,11 @@ from src.memory.store import MemoryStore, content_hash
 
 logger = logging.getLogger("agent_sys.filesystem")
 
+_BINARY_EXTENSIONS = frozenset({
+    ".pdf", ".docx", ".doc", ".pptx", ".xlsx",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+})
+
 
 class FileSystemWatcher:
     """Watches directories and indexes files into Memory."""
@@ -34,26 +40,35 @@ class FileSystemWatcher:
         self.memory = memory
         self._running = False
         self._scan_task: asyncio.Task | None = None
+        self._initial_scan_task: asyncio.Task | None = None
         self._observer = None  # watchdog observer, lazily initialized
-        self._stats = {"files_indexed": 0, "last_scan": 0.0}
+        self._stats = {
+            "files_indexed": 0,
+            "last_scan": 0.0,
+            "scan_in_progress": False,
+            "scan_progress_files": 0,
+        }
 
     async def start(self) -> None:
         self._running = True
-        # Initial full scan
+        # Run initial scan in background — don't block boot
+        self._initial_scan_task = asyncio.create_task(self._initial_scan_and_watch())
+
+    async def _initial_scan_and_watch(self) -> None:
+        """Run initial scan, then start periodic rescan + realtime watcher."""
         await self._full_scan()
-        # Start periodic rescan in background
-        self._scan_task = asyncio.create_task(self._periodic_scan_loop())
-        # Try to start real-time watcher
         self._start_realtime_watcher()
+        self._scan_task = asyncio.create_task(self._periodic_scan_loop())
 
     async def stop(self) -> None:
         self._running = False
-        if self._scan_task:
-            self._scan_task.cancel()
-            try:
-                await self._scan_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._initial_scan_task, self._scan_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._observer:
             self._observer.stop()
             self._observer.join(timeout=5)
@@ -63,6 +78,8 @@ class FileSystemWatcher:
 
     async def _full_scan(self) -> None:
         logger.info("Starting full filesystem scan...")
+        self._stats["scan_in_progress"] = True
+        self._stats["scan_progress_files"] = 0
         count = 0
         for watch_path in self.config.watch_paths:
             expanded = Path(os.path.expanduser(str(watch_path)))
@@ -72,69 +89,117 @@ class FileSystemWatcher:
             count += await self._scan_directory(expanded)
 
         self._stats["files_indexed"] = count
+        self._stats["scan_progress_files"] = count
         self._stats["last_scan"] = time.time()
+        self._stats["scan_in_progress"] = False
         logger.info("Full scan complete: %d files indexed", count)
 
     async def _scan_directory(self, root: Path) -> int:
+        """Walk directory tree, pruning ignored dirs early to avoid wasting time."""
         count = 0
+        visited = 0
         max_size = self.config.max_file_size_mb * 1024 * 1024
+        extensions = set(self.config.index_extensions)
 
         try:
-            for entry in root.rglob("*"):
+            for dirpath, dirnames, filenames in os.walk(str(root)):
                 if not self._running:
                     break
-                if not entry.is_file():
-                    continue
-                if self._should_ignore(entry):
-                    continue
-                if entry.suffix not in self.config.index_extensions:
-                    continue
 
-                try:
-                    stat = entry.stat()
-                    if stat.st_size > max_size:
+                # Prune ignored directories IN-PLACE so os.walk skips them
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not self._should_ignore_dir(d, dirpath)
+                ]
+
+                for fname in filenames:
+                    if not self._running:
+                        break
+
+                    visited += 1
+                    if visited % 200 == 0:
+                        self._stats["scan_progress_files"] = count
+                        self._stats["files_indexed"] = count
+                        await asyncio.sleep(0)
+
+                    ext = os.path.splitext(fname)[1]
+                    if ext not in extensions:
                         continue
 
-                    existing = await self.memory.get_file_info(str(entry))
-                    if existing and existing.get("modified_at") == stat.st_mtime:
+                    full_path = os.path.join(dirpath, fname)
+
+                    try:
+                        stat = os.stat(full_path)
+                        if stat.st_size > max_size:
+                            continue
+
+                        existing = await self.memory.get_file_info(full_path)
+                        if existing and existing.get("modified_at") == stat.st_mtime:
+                            count += 1
+                            continue
+
+                        if ext in _BINARY_EXTENSIONS:
+                            raw = Path(full_path).read_bytes()
+                            chash = hashlib.sha256(raw[:8192]).hexdigest()[:16]
+                            summary = ""
+                        else:
+                            content = Path(full_path).read_text(errors="replace")
+                            chash = content_hash(content)
+                            summary = self._extract_summary(Path(full_path), content)
+
+                        await self.memory.upsert_file(
+                            path=full_path,
+                            content_hash=chash,
+                            size_bytes=stat.st_size,
+                            modified_at=stat.st_mtime,
+                            file_type=ext,
+                            summary=summary,
+                        )
                         count += 1
-                        continue
-
-                    content = entry.read_text(errors="replace")
-                    chash = content_hash(content)
-
-                    summary = self._extract_summary(entry, content)
-
-                    await self.memory.upsert_file(
-                        path=str(entry),
-                        content_hash=chash,
-                        size_bytes=stat.st_size,
-                        modified_at=stat.st_mtime,
-                        file_type=entry.suffix,
-                        summary=summary,
-                    )
-                    count += 1
-                except (PermissionError, OSError) as e:
-                    logger.debug("Skip %s: %s", entry, e)
-                except Exception as e:
-                    logger.warning("Error indexing %s: %s", entry, e)
-
-                # Yield to event loop periodically
-                if count % 100 == 0:
-                    await asyncio.sleep(0)
+                    except (PermissionError, OSError) as e:
+                        logger.debug("Skip %s: %s", full_path, e)
+                    except Exception as e:
+                        logger.warning("Error indexing %s: %s", full_path, e)
 
         except PermissionError:
             logger.debug("Permission denied: %s", root)
 
+        self._stats["scan_progress_files"] = count
+        self._stats["files_indexed"] = count
         return count
 
+    def _should_ignore_dir(self, dirname: str, parent: str) -> bool:
+        """Fast check for directory pruning during os.walk — called on dir names only."""
+        # Match against ignore patterns
+        for pattern in self.config.ignore_patterns:
+            if fnmatch(dirname, pattern):
+                return True
+
+        # Skip hidden directories under home (except .cursor)
+        home = str(Path.home())
+        if parent == home and dirname.startswith(".") and dirname not in (".cursor",):
+            return True
+
+        return False
+
     def _should_ignore(self, path: Path) -> bool:
+        """Full path check for realtime watcher events."""
         parts = path.parts
         for pattern in self.config.ignore_patterns:
             if any(fnmatch(part, pattern) for part in parts):
                 return True
             if fnmatch(path.name, pattern):
                 return True
+
+        home = Path.home()
+        try:
+            rel = path.relative_to(home)
+            top = rel.parts[0] if rel.parts else ""
+            if top.startswith(".") and top not in (".cursor",):
+                return True
+        except ValueError:
+            pass
+
         return False
 
     def _extract_summary(self, path: Path, content: str) -> str:
@@ -241,14 +306,24 @@ class FileSystemWatcher:
                 stat = path.stat()
                 if stat.st_size > self.config.max_file_size_mb * 1024 * 1024:
                     return
-                content = path.read_text(errors="replace")
+
+                ext = path.suffix.lower()
+                if ext in _BINARY_EXTENSIONS:
+                    raw = path.read_bytes()
+                    chash = hashlib.sha256(raw[:8192]).hexdigest()[:16]
+                    summary = ""
+                else:
+                    content = path.read_text(errors="replace")
+                    chash = content_hash(content)
+                    summary = self._extract_summary(path, content)
+
                 await self.memory.upsert_file(
                     path=str(path),
-                    content_hash=content_hash(content),
+                    content_hash=chash,
                     size_bytes=stat.st_size,
                     modified_at=stat.st_mtime,
-                    file_type=path.suffix,
-                    summary=self._extract_summary(path, content),
+                    file_type=ext,
+                    summary=summary,
                 )
                 logger.debug("Indexed [%s]: %s", event_type, path)
             except Exception as e:
@@ -258,5 +333,8 @@ class FileSystemWatcher:
         return {
             "running": self._running,
             "realtime": self._observer is not None,
-            **self._stats,
+            "files_indexed": self._stats.get("files_indexed", 0),
+            "last_scan": self._stats.get("last_scan", 0.0),
+            "scan_in_progress": self._stats.get("scan_in_progress", False),
+            "scan_progress_files": self._stats.get("scan_progress_files", 0),
         }

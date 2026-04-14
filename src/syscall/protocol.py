@@ -49,6 +49,9 @@ class SyscallType(str, Enum):
     ANALYZE_BEHAVIOR = "analyze.behavior"
     CLASSIFY_PRIORITY = "classify.priority"
 
+    # Triage (v0.3)
+    TRIAGE_FILES = "triage.files"
+
     # System
     SYS_STATUS = "sys.status"
     SYS_PING = "sys.ping"
@@ -69,6 +72,7 @@ SYSCALL_TO_AGENT: dict[str, str] = {
     SyscallType.PROFILE_GET: "profile_builder",
     SyscallType.ANALYZE_BEHAVIOR: "behavior_analyzer",
     SyscallType.CLASSIFY_PRIORITY: "priority_classifier",
+    SyscallType.TRIAGE_FILES: "triage",
     SyscallType.SYS_STATUS: "system_status",
 }
 

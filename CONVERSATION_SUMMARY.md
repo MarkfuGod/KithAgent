@@ -4,7 +4,7 @@
 
 AgentOS 是一个 **系统级 Agent 守护进程**，核心思想是把传统操作系统的架构映射到 LLM Agent 系统上。
 
-它开机即运行、常驻后台，持续索引用户的文件和数据，构建个人知识库。当用户使用 Cursor、Claude Code、OpenClaw 等 Agent 工具时，它们可以直接调用 SysAgent 的 API（Unix Socket / HTTP），无需每次重新扫描文件系统。
+它开机即运行、常驻后台，持续索引用户 **整个 home 目录** 的文件和数据，构建个人知识库。不只分析代码项目，而是 **全面理解这个人** — 工作、学习、个人生活。当用户使用 Cursor、Claude Code、OpenClaw 等 Agent 工具时，它们可以直接调用 SysAgent 的 API（Unix Socket / HTTP），无需每次重新扫描文件系统。
 
 ### 核心映射
 
@@ -13,81 +13,153 @@ AgentOS 是一个 **系统级 Agent 守护进程**，核心思想是把传统操
 | 内核 (Kernel) | `SysAgentKernel` — 守护进程，管理所有子系统 |
 | 线程 (Thread) | `AgentTask` — 最小执行单元 |
 | 进程调度器 | `AgentScheduler` — 优先级队列 + 并发控制 |
-| 文件系统 (VFS) | `FileSystemWatcher` — 实时监控 + 定时全量扫描 |
+| 文件系统 (VFS) | `FileSystemWatcher` — `os.walk` 全量扫描 + watchdog 实时监控 |
 | 内存/缓存 | `MemoryStore` — LRU 热缓存 + SQLite 冷存储 |
 | 系统调用 | `SyscallServer` — Unix Socket / HTTP API |
-| Cron 定时器 | `CronScheduler` — 定时触发智能 Agent |
+| Cron 定时器 | `CronScheduler` — LLM 自适应调度 + 固定触发器 |
 
 ---
 
-## 这次对话做了什么
+## 版本演进
 
-### v0.1（第一轮对话）— 从零搭建骨架
+### v0.1（第一轮）— 从零搭建骨架
 
 1. **设计了整体架构**，创建了项目目录结构
-2. **实现了 6 个核心模块**：
-   - `src/kernel/` — 守护进程 + 配置加载
-   - `src/filesystem/` — 文件监控与索引（watchdog 实时 + 定时全扫）
-   - `src/memory/` — LRU 缓存 + SQLite 持久化
-   - `src/scheduler/` — 优先级队列 + 并发池
-   - `src/syscall/` — 协议定义 + Socket/HTTP 服务端 + 客户端 SDK
-   - `src/agents/` — 6 个规则驱动的内置 Agent
+2. **实现了 6 个核心模块**：kernel、filesystem、memory、scheduler、syscall、agents
 3. **成功启动**：索引了用户 **160,429 个文件**
 4. **修复了 watchdog bug**：子线程无法获取 event loop 的问题
 
-### v0.2（第二轮对话）— 从索引到理解
+### v0.2（第二轮）— 从索引到理解
 
 按照 [plan](/.cursor/plans/agentos_llm_evolution_fdac4bb4.plan.md) 实现了 3 个阶段：
 
-#### Phase 1: LLM 统一抽象层
+- **Phase 1 — LLM 统一抽象层**：`src/llm/`（OpenAI、Claude、任意兼容 API），`ModelRouter` 按任务路由
+- **Phase 2 — 智能 Agent + Cron**：summarizer、analyzer、prioritizer、CronScheduler
+- **Phase 3 — 报告 + 画像**：reporter、profile_builder、7 个新 Syscall、CLI 5 个新命令
+- **DB 迁移**：file_index 新增 priority / semantic_summary / last_accessed_at
 
-- **`src/llm/base.py`** — `LLMProvider` 统一接口
-- **`src/llm/openai_adapter.py`** — 支持 GPT-4o / GPT-4.1（SDK 或 HTTP fallback）
-- **`src/llm/claude_adapter.py`** — 支持 Claude Sonnet / Opus（SDK 或 HTTP fallback）
-- **`src/llm/compatible_adapter.py`** — 任何 OpenAI 兼容 API（DeepSeek, Ollama, Groq...）
-- **`src/llm/router.py`** — `ModelRouter` 按任务类型路由到 provider + model tier
-- **配置**：`config/default.yaml` 新增 `llm:` 段（provider、model、routing 全可配）
+### v0.2.1（第三轮）— LLM 启动引导
 
-#### Phase 2: 智能 Agent + Cron 调度
+- 交互式 LLM 选择（Ollama / 远程 API / 跳过）
 
-- **`src/agents/summarizer.py`** — LLM 语义文件摘要（替代规则提取）
-- **`src/agents/analyzer.py`** — 用户行为分析（活跃目录、语言偏好、工作模式）
-- **`src/agents/prioritizer.py`** — 文件优先级分类（P0 热/P1 温/P2 冷）
-- **`src/kernel/cron.py`** — `CronScheduler`，支持 5 种触发器（interval/daily/weekly/after_scan/after:agent）
+### v0.3（第四轮）— 系统级全面升级
 
-#### Phase 3: 报告 + 画像 + 新 Syscall
+这是最大的一次升级，涉及几乎所有模块：
 
-- **`src/agents/reporter.py`** — 日报 / 项目画像 / 上下文简报
-- **`src/agents/profile_builder.py`** — 个人画像（语言、框架、项目、编码风格）
-- **新增 7 个 Syscall 类型**：`report.daily`, `report.project`, `report.brief`, `profile.get`, `analyze.behavior`, `classify.priority`, `summarize.file`
-- **客户端 SDK** 更新：Async + Sync 各 7 个新方法
-- **CLI 新增 5 个命令**：`report`, `profile`, `summarize`, `analyze`, `classify`
+#### 1. 系统级扫描（从项目级 → 全用户）
 
-#### 数据库迁移
+- `config/default.yaml`：`watch_paths` 改为 `["~"]`，扫描整个 home 目录
+- `watcher.py`：从 `Path.rglob("*")` 重写为 `os.walk()` + 目录级剪枝，21 万文件 15 秒扫完
+- 非阻塞启动：文件扫描在后台 `asyncio.create_task` 中运行，不阻塞 daemon 启动
+- `agent-sys status` 显示扫描进度和已索引文件数
 
-- `file_index` 表新增 3 列：`priority`, `semantic_summary`, `last_accessed_at`
-- 自动迁移：`_migrate_schema()` 检测旧表并 ALTER TABLE
-- `search_files` 现在按 priority 排序，同时搜索 semantic_summary
+#### 2. 多模态支持
 
-#### Bug 修复
+- 索引扩展到 **文档**（PDF、DOCX、PPTX、XLSX）和 **图片**（PNG、JPG、GIF、WEBP）
+- `src/extractors.py`（新文件）：PDF 文本提取（PyMuPDF）、DOCX 文本提取（python-docx）、图片 base64 编码
+- `llm/base.py`：`LLMMessage.content` 支持 `str | list[dict]`（OpenAI 多模态格式）
+- `llm/router.py`：新增 `vision` 路由，指向 `qwen-vl-plus`
+- `summarizer.py`：新增 `_summarize_image()`（视觉模型）和 `_summarize_document()`（文本/OCR）
 
-- watchdog 子线程 event loop 问题（`asyncio.get_running_loop()` 捕获主线程 loop）
-- `pyproject.toml` build-backend 路径错误
-- SQLite 迁移顺序问题：先 ALTER TABLE 再 CREATE INDEX
+#### 3. LLM 自适应调度（Adaptive Scheduling）
 
-### v0.2.1（第三轮对话）— LLM 启动引导
+- `config.py`：新增 `AdaptiveConfig` 数据类
+- `cron.py` 重构：
+  - 新增 `_adaptive_loop()`：采集活动快照 → LLM 决定运行哪些 agent、用什么 mode、多久下次运行
+  - 白天活跃时：light 模式、10 分钟间隔、快速报告
+  - 夜间空闲时：deep 模式、长间隔、全面分析
+  - 决策持久化到 knowledge 表，供后续 LLM 参考
+  - 自动去重：跳过已在运行的 agent，防止 after_scan 和 adaptive 冲突
 
-#### 交互式 LLM 选择
+#### 4. 全人分析（从"分析项目" → "分析这个人"）
 
-启动时自动检测是否有可用的 LLM provider，如果没有检测到（无 API Key），会交互式提示用户选择：
+**所有 5 个智能 Agent** 都已升级为跨 work / study / personal 三维度的全面分析：
 
-1. **本地 Ollama** — 指向 `localhost:11434`，用户可自选模型（llama3, mistral, gemma2 等）
-2. **远程 API** — 输入 OpenAI / Anthropic / 其他兼容 API 的 key，当场注入环境变量
-3. **跳过** — 不用 LLM，纯规则模式运行
+- `analyzer.py`：重写 system prompt，分析工作项目 + 学习资料 + 个人文件，跨目录综合推断
+- `reporter.py`：日报/快速报告/简报全面涵盖代码、文档、图片的分类活动
+- `profile_builder.py`：构建"完整的人"画像，不只是编程习惯
+- `prioritizer.py`：对所有文件类型（代码、文档、图片）分别报告 P0/P1/P2 分布
+- `summarizer.py`：支持 deep/light 两种模式、时间预算控制、增量处理
 
-涉及文件：
-- **`src/cli.py`** — 新增 `_check_llm_and_prompt()`, `_setup_ollama()`, `_setup_api_key()` 三个函数
-- **`src/llm/router.py`** — 新增 `check_llm_availability()` 工具函数
+#### 5. 增量式文件总结
+
+- `summarizer.py`：时间预算机制 — 每批处理文件，超时自动停止，下次 cron 继续
+- `_run_light()`：只读 metadata 让 LLM 批量总结（适合白天）
+- `_run_deep()`：读文件内容/调视觉模型逐个总结（适合夜间）
+- `_parse_json_lenient()`：容错解析 LLM 截断的 JSON
+- `_build_hierarchical_summaries()`：文件摘要 → 项目级摘要
+
+#### 6. 持久化与健壮性
+
+- **API Key 持久化**：`~/.agent_sys/llm_config.yaml`，重启不用重新配置
+- **进程管理**：`cmd_stop` 先 SIGTERM 后 SIGKILL，处理挂起/僵尸进程
+- **文件选择多样化**：`get_files_needing_summary()` 按比例分配 code/doc/image 名额
+- **全局 timeout 修复**：CLI 和 cron 的所有 agent 调用都传了足够长的 timeout（300s）
+- **输出改进**：summarize 输出表格化显示每个文件，analyze/report/profile 完整 JSON 输出
+
+#### 7. MemoryStore 新增查询
+
+- `get_modification_rate(minutes)`：最近 N 分钟的文件修改数
+- `get_project_directories(min_files)`：发现项目根目录
+- `get_files_by_directory(directory)`：某目录下所有文件 + 摘要
+- `get_directory_breakdown(depth)`：按目录 + 文件类型分组统计
+- `get_files_by_category(category, limit)`：按类别采样文件
+- `get_recent_scheduling_decisions(limit)`：最近的调度决策
+
+### v0.4（第五轮）— 架构审计 + 可视化 + 智能分诊 + 多模型
+
+这一轮做了四件大事：
+
+#### 1. OS→AgentOS 映射审计
+
+对整个代码库做了全面审计，确认 6 个核心映射的完成度：
+
+| OS 概念 | 完成度 | 关键发现 |
+|---|---|---|
+| 文件系统 (VFS) | **Strong** | os.walk + watchdog + SQLite 索引，不是真 VFS 但够用 |
+| 进程调度器 | **Strong** | 优先级队列 + 并发 + 自适应 cron |
+| 内存管理 | **Partial** | LRU + SQLite 工作正常，但 **向量/embedding 搜索声称有实际没实现**（搜索仍是 SQL LIKE） |
+| Shell/CLI | **Strong** | 15 个子命令，功能完整 |
+| 系统调用 | **Mostly** | 19 个 syscall 类型，3 个仍未映射（file.list, agent.submit, agent.task_status），auth 未执行 |
+| IPC | **Weak** | 外部 RPC 有，内部 agent 间只是共享 context dict，没有消息总线 |
+
+#### 2. Web UI 仪表盘（新模块 `src/web/`）
+
+从零构建了完整的 Web 调试仪表盘：
+
+- **`src/web/dashboard.py`**：aiohttp 后端，直接读 SQLite（daemon 不运行也能用），10 个 API endpoint
+- **`src/web/dashboard.html`**：暗色主题 SPA，Chart.js 可视化，7 个标签页：
+  - **Overview** — 文件总量/总结进度/知识条目/daemon 状态 + 类型分布饼图 + 优先级柱图 + 最近修改表
+  - **Files & Directories** — 文件搜索 + 目录组成堆叠条形图（code/doc/image/data/config/other）
+  - **Knowledge Base** — 按 category 浏览所有 knowledge 条目（报告、分析、调度决策等）
+  - **LLM Config** — 可视化编辑 provider、模型、API key，保存到 `llm_config.yaml`
+  - **Triage** — 分诊分布饼图 + pipeline 流程示意 + 各状态说明
+  - **Scheduling** — 自适应调度决策历史
+  - **Summary Progress** — 按文件类型的总结进度堆叠柱图 + 逐类型进度条
+- **CLI**：`agent-sys dashboard [--port 7438]`
+
+#### 3. LLM 智能分诊系统（新 Agent: `TriageAgent`）
+
+解决了核心问题：21 万文件中大量是第三方库源码（PyTorch-YOLOv3 占 12 万），浪费 LLM token。
+
+- **新文件** `src/agents/triage.py`：
+  - **Phase 1 — 规则跳过**：`site-packages/`、`node_modules/`、`__pycache__/` 等模式直接标 `skip`，零 LLM 成本
+  - **Phase 2 — LLM 分诊**：按目录分组 → LLM 批量决策（支持 `bulk` 前缀规则 + `individual` 覆盖）
+  - 四级分类：`high`（用户原创）→ `medium`（有用上下文）→ `low`（通用代码）→ `skip`（噪音）
+- **DB 迁移**：`file_index` 新增 `triage_status` 列 + 索引
+- **Summarizer 联动**：`get_files_needing_summary()` 现在按 high → medium → untriaged 排序，skip/low 完全排除
+- **Cron 管道**：`after_scan → triage → (after:triage) → summarizer`
+- **Syscall**：新增 `triage.files` syscall
+- **CLI**：`agent-sys triage [--batch-size 500]`
+
+#### 4. Anthropic Compatible 适配器 + MiniMax-M2.7
+
+- **`ClaudeAdapter`** 新增 `base_url` 参数（SDK + HTTP 双路径都支持自定义 endpoint）
+- **新增 `AnthropicCompatibleAdapter`**：专用于 MiniMax 等第三方 Anthropic API 兼容服务
+- **Router** 注册 `anthropic_compatible` provider 类型
+- **已配置** MiniMax-M2.7（base_url: `https://api.minimaxi.com/anthropic`）
+- **CLI** 交互式配置新增选项 `[3] Anthropic-Compat`
+- **Dashboard** LLM Config 面板支持可视化增删改所有 provider
 
 ---
 
@@ -95,37 +167,63 @@ AgentOS 是一个 **系统级 Agent 守护进程**，核心思想是把传统操
 
 ```
 agent_sys/
-├── config/default.yaml              # 系统配置（含 LLM + Cron）
+├── config/default.yaml              # 系统配置（扫描 ~/，含 LLM + Cron + Adaptive + Triage）
 ├── src/
 │   ├── kernel/
-│   │   ├── config.py                # 配置加载（含 LLMConfig, CronConfig）
+│   │   ├── config.py                # 配置加载（含 AdaptiveConfig）
 │   │   ├── daemon.py                # 守护进程主循环
-│   │   └── cron.py                  # 定时调度器 [v0.2]
-│   ├── llm/                         # [v0.2] LLM 统一抽象层
-│   │   ├── base.py                  # LLMProvider 接口
-│   │   ├── openai_adapter.py        # OpenAI
-│   │   ├── claude_adapter.py        # Claude
-│   │   ├── compatible_adapter.py    # OpenAI 兼容 API
-│   │   └── router.py               # 任务类型→模型路由
-│   ├── filesystem/watcher.py        # 文件监控与索引
-│   ├── memory/store.py              # LRU + SQLite（含迁移）
-│   ├── scheduler/pool.py            # 优先级队列 + 并发池
+│   │   └── cron.py                  # LLM 自适应调度 + 固定触发器（含 triage 管道）
+│   ├── llm/                         # LLM 统一抽象层
+│   │   ├── base.py                  # LLMProvider 接口（支持多模态 content）
+│   │   ├── openai_adapter.py        # OpenAI / GPT
+│   │   ├── claude_adapter.py        # Anthropic Claude + AnthropicCompatibleAdapter
+│   │   ├── compatible_adapter.py    # 任何 OpenAI 兼容 API
+│   │   └── router.py               # 任务类型→模型路由（含 vision + anthropic_compatible）
+│   ├── filesystem/watcher.py        # os.walk 全量扫描 + watchdog 实时监控
+│   ├── memory/store.py              # LRU + SQLite（多维度查询 + triage 操作）
+│   ├── scheduler/pool.py            # 优先级队列 + 并发池 + per-task timeout
 │   ├── syscall/
-│   │   ├── protocol.py              # 18 个 Syscall 类型
+│   │   ├── protocol.py              # 19 个 Syscall 类型（含 triage.files）
 │   │   ├── server.py                # Socket/HTTP 服务端
-│   │   └── client.py               # Async + Sync 客户端 SDK
+│   │   └── client.py                # Async + Sync 客户端 SDK（含 triage）
 │   ├── agents/
 │   │   ├── base.py                  # AgentTask + BaseAgent
-│   │   ├── builtin.py               # 注册全部 11 个 Agent
-│   │   ├── summarizer.py            # [v0.2] LLM 文件摘要
-│   │   ├── analyzer.py              # [v0.2] 行为分析
-│   │   ├── prioritizer.py           # [v0.2] 优先级分类
-│   │   ├── reporter.py              # [v0.2] 日报/画像/简报
-│   │   └── profile_builder.py       # [v0.2] 个人画像
-│   └── cli.py                       # 命令行入口（11 个子命令）
+│   │   ├── builtin.py               # 注册全部 12 个 Agent
+│   │   ├── triage.py                # LLM 智能分诊（规则 + LLM 两阶段）
+│   │   ├── summarizer.py            # 多模态文件摘要（尊重 triage 结果）
+│   │   ├── analyzer.py              # 全人行为分析（work / study / personal）
+│   │   ├── prioritizer.py           # 文件优先级分类（按类型分组统计）
+│   │   ├── reporter.py              # 全维度报告（daily / quick / brief）
+│   │   └── profile_builder.py       # 完整个人画像
+│   ├── web/                         # Web 仪表盘（新模块）
+│   │   ├── dashboard.py             # aiohttp 后端（10 个 API endpoint）
+│   │   └── dashboard.html           # 暗色主题 SPA（7 个标签页，Chart.js）
+│   ├── extractors.py                # PDF/DOCX 文本提取 + 图片 base64 编码
+│   └── cli.py                       # 命令行入口（15 个子命令，格式化输出）
 ├── pyproject.toml
-├── requirements.txt
+├── requirements.txt                 # 含 PyMuPDF、python-docx
 └── README.md
+```
+
+## 数据存储
+
+所有数据都在 `~/.agent_sys/` 下：
+
+| 文件 | 内容 |
+|---|---|
+| `memory.db` | SQLite 主数据库：`file_index`（21万+文件元数据、摘要、triage 状态）、`knowledge`（报告、分析、调度决策）|
+| `llm_config.yaml` | 持久化的 LLM API Key 和 provider 配置（权限 0o600） |
+| `logs/sysagent.log` | daemon 运行日志 |
+
+### 查看存储的报告和分析结果
+
+```bash
+agent-sys query --category daily_report        # 日报
+agent-sys query --category quick_report        # 快速报告
+agent-sys query --category context_brief       # 上下文简报
+agent-sys query --category behavior_insight    # 行为分析结果
+agent-sys query --category scheduling_decision # 自适应调度决策
+agent-sys query --category project_summary     # 项目级摘要
 ```
 
 ## 如何运行
@@ -134,34 +232,50 @@ agent_sys/
 # 安装
 pip install -e ".[full]"
 
-# 启动（如果没有检测到 LLM API Key，会自动提示选择）
-agent-sys start
-# → 选 [1] 本地 Ollama（需先 ollama serve）
-# → 选 [2] 输入 API Key（OpenAI / Anthropic / 其他）
-# → 选 [3] 跳过，纯规则模式
-
-# 或者提前设置好 key，就不会弹出选择
-export OPENAI_API_KEY="sk-..."
-# 或
-export ANTHROPIC_API_KEY="sk-ant-..."
+# 启动（首次会提示配置 LLM，配置后自动保存到 ~/.agent_sys/llm_config.yaml）
 agent-sys start
 
-# 新终端中使用
-agent-sys ping
-agent-sys status
-agent-sys search "database"
-agent-sys report daily
-agent-sys profile
-agent-sys analyze
-agent-sys classify
+# 常用命令
+agent-sys status                    # 查看系统状态（含扫描进度）
+agent-sys triage                    # 运行 LLM 分诊（决定哪些文件值得总结）
+agent-sys triage --batch-size 1000  # 大批量分诊
+agent-sys summarize                 # 手动触发文件总结（尊重 triage 结果）
+agent-sys summarize --batch-size 50 # 指定批次大小
+agent-sys analyze                   # 运行全人行为分析
+agent-sys analyze --hours 24        # 分析最近 24 小时
+agent-sys report daily              # 生成日报
+agent-sys report brief              # 生成上下文简报
+agent-sys profile                   # 查看个人画像
+agent-sys classify                  # 运行文件优先级分类
+agent-sys query --category daily_report  # 查看历史报告
+agent-sys dashboard                 # 启动 Web 仪表盘（http://127.0.0.1:7438）
+agent-sys dashboard --port 9000     # 指定端口
+agent-sys stop                      # 停止 daemon
 ```
 
-## 下一步可做的
+## 已知问题和待完善
+
+### 已知问题
+
+1. **语义搜索未实现**：config 和 docstring 声称有 embedding 向量搜索，实际搜索全是 SQL `LIKE`
+2. **3 个 Syscall 悬空**：`file.list`、`agent.submit`、`agent.task_status` 在 enum 但未接到 agent
+3. **Auth 未执行**：`allowed_callers` 和 `auth_token_path` 配了但 server.py 没做校验
+4. **IPC 缺失**：内部 agent 间只有共享 context dict，没有消息总线
+5. **Cron 语义**：adaptive mode 开启后，YAML 里的 interval/weekly 触发器被 LLM 决策接管，不独立运行
+6. **after_scan 首次不触发**：`last_scan_time > 0` 的 guard 导致首次扫描完成后不触发 after_scan 链
+7. **Dashboard 离线**：Chart.js 从 CDN 加载，无网络时图表不可用
+8. **Triage 默认调度**：无 LLM 时的 fallback 规则只在深夜 deep hour 运行 triage，日常不主动 triage
+
+### 下一步可做的
 
 - 向量化语义搜索（embedding 替代 LIKE）
-- 主动推送通知（异常检测）
+- 主动推送通知（异常检测 → 桌面通知）
 - 对话记忆 Agent（跨会话记住历史）
 - 自动化 Agent（检测重复操作，生成脚本）
-- Ollama 深度适配（自动检测可用模型、health check、按模型能力选 tier）
+- Ollama 深度适配（自动检测可用模型、health check）
 - MLX 本地推理适配
 - 插件系统（第三方注册自定义 Agent）
+- 细分 subagent（当前所有分析都是全人视角，后续可拆分专职子 Agent）
+- 补齐 3 个悬空 syscall + auth 校验
+- Chart.js 本地化（打包到项目内，离线可用）
+- IPC 消息总线（agent 间结构化通信）

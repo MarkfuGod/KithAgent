@@ -13,24 +13,24 @@ import os
 from src.llm.base import LLMMessage, LLMProvider, LLMResponse
 from src.llm.openai_adapter import OpenAIAdapter
 
-logger = logging.getLogger("agent_sys.llm.compatible")
+logger = logging.getLogger("agent_sys.llm.openai_compatible")
 
 
-class CompatibleAdapter(OpenAIAdapter):
+class OpenAICompatibleAdapter(OpenAIAdapter):
     """Thin wrapper over OpenAIAdapter with a different base_url and name."""
 
-    name = "compatible"
+    name = "openai_compatible"
     _PLACEHOLDER_KEY = "sk-placeholder"
 
     def __init__(
         self,
         base_url: str = "",
         api_key: str | None = None,
-        api_key_env: str = "COMPATIBLE_API_KEY",
+        api_key_env: str = "OPENAI_COMPATIBLE_API_KEY",
         models: dict[str, str] | None = None,
     ):
         self._explicit_key = api_key or os.environ.get(api_key_env, "")
-        self._explicit_url = base_url or os.environ.get("COMPATIBLE_BASE_URL", "")
+        self._explicit_url = base_url or os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "")
         resolved_models = models or {"fast": "deepseek-chat", "strong": "deepseek-chat"}
 
         super().__init__(
@@ -43,3 +43,7 @@ class CompatibleAdapter(OpenAIAdapter):
         has_real_key = bool(self._explicit_key) and self._explicit_key != self._PLACEHOLDER_KEY
         has_explicit_url = bool(self._explicit_url)
         return has_real_key or has_explicit_url
+
+
+# Backward compat alias
+CompatibleAdapter = OpenAICompatibleAdapter

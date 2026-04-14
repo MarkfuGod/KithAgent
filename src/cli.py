@@ -51,8 +51,24 @@ def cmd_start(args: argparse.Namespace) -> None:
         try:
             old_pid = int(pid_file.read_text().strip())
             os.kill(old_pid, 0)
-            logger.error("SysAgent already running (PID %d). Use 'agent-sys stop' first.", old_pid)
-            sys.exit(1)
+            # Process exists — but could be a zombie or suspended process
+            # Check if it's actually our agent-sys or a recycled PID
+            if old_pid == os.getpid():
+                pid_file.unlink(missing_ok=True)
+            else:
+                logger.warning("Found existing process PID %d, attempting cleanup...", old_pid)
+                os.kill(old_pid, signal.SIGTERM)
+                import time as _time
+                _time.sleep(1)
+                try:
+                    os.kill(old_pid, 0)
+                    # Still alive — force kill
+                    os.kill(old_pid, signal.SIGKILL)
+                    _time.sleep(0.5)
+                except ProcessLookupError:
+                    pass
+                pid_file.unlink(missing_ok=True)
+                logger.info("Cleaned up old process, starting fresh.")
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
 
@@ -98,13 +114,34 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
     try:
         pid = int(pid_file.read_text().strip())
+        # First try graceful SIGTERM
         os.kill(pid, signal.SIGTERM)
-        print(f"Sent SIGTERM to SysAgent (PID {pid})")
+        print(f"Sent SIGTERM to SysAgent (PID {pid}), waiting...")
+
+        # Wait up to 5 seconds for the process to exit
+        import time as _time
+        for _ in range(50):
+            _time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                print("SysAgent stopped.")
+                pid_file.unlink(missing_ok=True)
+                return
+
+        # Process didn't exit — force kill (handles suspended/stuck processes)
+        print(f"Process {pid} didn't exit, sending SIGKILL...")
+        os.kill(pid, signal.SIGKILL)
+        _time.sleep(0.5)
+        pid_file.unlink(missing_ok=True)
+        print("SysAgent force-killed.")
+
     except ProcessLookupError:
         print("SysAgent process not found. Cleaning up PID file.")
         pid_file.unlink(missing_ok=True)
     except Exception as e:
         print(f"Error stopping SysAgent: {e}")
+        pid_file.unlink(missing_ok=True)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -169,8 +206,20 @@ async def _async_query(category: str | None) -> None:
             if not entries:
                 print("No knowledge entries found.")
                 return
+            print(f"\n{'='*60}")
+            print(f" Knowledge entries: {len(entries)}" + (f" (category: {category})" if category else ""))
+            print(f"{'='*60}")
             for e in entries:
-                print(f"  [{e.get('category')}] {e.get('content', '')[:100]}")
+                kid = e.get("id", "?")
+                cat = e.get("category", "?")
+                content_raw = e.get("content", "")
+                print(f"\n--- [{cat}] {kid} ---")
+                try:
+                    parsed = json.loads(content_raw)
+                    print(json.dumps(parsed, indent=2, ensure_ascii=False))
+                except (json.JSONDecodeError, TypeError):
+                    print(content_raw)
+            print()
     except (ConnectionRefusedError, FileNotFoundError):
         print("SysAgent is not running.")
 
@@ -192,7 +241,7 @@ async def _async_report(report_type: str, project_dir: str | None) -> None:
             else:
                 print(f"Unknown report type: {report_type}")
                 return
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            _print_full_json(f"Report [{report_type}]", data)
     except (ConnectionRefusedError, FileNotFoundError):
         print("SysAgent is not running.")
 
@@ -206,7 +255,7 @@ async def _async_profile() -> None:
     try:
         async with SysAgentClient() as client:
             data = await client.profile_get()
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            _print_full_json("User Profile", data)
     except (ConnectionRefusedError, FileNotFoundError):
         print("SysAgent is not running.")
 
@@ -220,9 +269,48 @@ async def _async_summarize(batch_size: int) -> None:
     try:
         async with SysAgentClient() as client:
             data = await client.summarize_files(batch_size)
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            _print_summarize_result(data)
     except (ConnectionRefusedError, FileNotFoundError):
         print("SysAgent is not running.")
+
+
+def _print_full_json(title: str, data: dict) -> None:
+    """Pretty-print full JSON output with a header, ensuring no truncation."""
+    print(f"\n{'='*60}")
+    print(f" {title}")
+    print(f"{'='*60}")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    print()
+
+
+def _print_summarize_result(data: dict) -> None:
+    mode = data.get("mode", "?")
+    total = data.get("summarized", 0)
+    vision = data.get("vision_files", 0)
+    docs = data.get("document_files", 0)
+    code = total - vision - docs
+    errors = data.get("errors", 0)
+    elapsed = data.get("elapsed_seconds", 0)
+    candidates = data.get("total_candidates", total)
+
+    print(f"\n{'='*60}")
+    print(f" Summarizer [{mode}]  —  {total}/{candidates} files in {elapsed:.1f}s")
+    print(f"{'='*60}")
+    print(f"  Code: {code}   Documents: {docs}   Images: {vision}   Errors: {errors}")
+
+    files_list = data.get("files", [])
+    if files_list:
+        print(f"\n  {'Type':<10} {'Path':<50} Summary")
+        print(f"  {'-'*10} {'-'*50} {'-'*40}")
+        for f in files_list:
+            ftype = f.get("type", "?")
+            path = f.get("path", "")
+            short = path.replace(str(Path.home()), "~")
+            if len(short) > 48:
+                short = "..." + short[-45:]
+            summary = f.get("summary", "")[:60]
+            print(f"  {ftype:<10} {short:<50} {summary}")
+    print()
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
@@ -234,9 +322,60 @@ async def _async_analyze(hours: float) -> None:
     try:
         async with SysAgentClient() as client:
             data = await client.analyze_behavior(hours)
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            _print_full_json("Behavior Analysis", data)
     except (ConnectionRefusedError, FileNotFoundError):
         print("SysAgent is not running.")
+
+
+def cmd_triage(args: argparse.Namespace) -> None:
+    asyncio.run(_async_triage(args.batch_size))
+
+
+async def _async_triage(batch_size: int) -> None:
+    from src.syscall.client import SysAgentClient
+    try:
+        async with SysAgentClient() as client:
+            print("Running file importance triage (LLM decides what's worth summarizing)...")
+            data = await client.triage_files(batch_size)
+            _print_triage_result(data)
+    except (ConnectionRefusedError, FileNotFoundError):
+        print("SysAgent is not running. Start with: agent-sys start")
+
+
+def _print_triage_result(data: dict) -> None:
+    print(f"\n{'='*60}")
+    print(f" File Triage Results")
+    print(f"{'='*60}")
+
+    rule_skipped = data.get("rule_based_skipped", 0)
+    llm_triaged = data.get("llm_triaged", 0)
+    elapsed = data.get("elapsed_seconds", 0)
+    dist = data.get("triage_distribution", {})
+
+    if rule_skipped:
+        print(f"  Rule-based skip:  {rule_skipped:>8} files (obvious noise)")
+    if llm_triaged:
+        print(f"  LLM classified:   {llm_triaged:>8} files")
+    print(f"  Elapsed:          {elapsed:.1f}s")
+    print()
+
+    if dist:
+        print("  Current distribution:")
+        for status, count in sorted(dist.items(), key=lambda x: -x[1]):
+            bar_len = min(int(count / max(dist.values()) * 30), 30)
+            bar = "#" * bar_len
+            print(f"    {status:<12} {count:>8}  {bar}")
+    print()
+
+
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    """Launch the web dashboard for visual debugging."""
+    try:
+        from src.web.dashboard import run_dashboard
+        run_dashboard(port=args.port)
+    except ImportError as e:
+        print(f"Error: {e}")
+        print("Install aiohttp to use the dashboard: pip install aiohttp")
 
 
 def cmd_classify(args: argparse.Namespace) -> None:
@@ -253,13 +392,64 @@ async def _async_classify() -> None:
         print("SysAgent is not running.")
 
 
+_LLM_CONFIG_PATH = Path.home() / ".agent_sys" / "llm_config.yaml"
+
+
+def _load_saved_llm_config(config) -> object:
+    """Load persisted LLM config from ~/.agent_sys/llm_config.yaml if it exists."""
+    import yaml
+
+    if not _LLM_CONFIG_PATH.exists():
+        return config
+
+    try:
+        with open(_LLM_CONFIG_PATH) as f:
+            saved = yaml.safe_load(f) or {}
+
+        if saved.get("default_provider"):
+            config.llm.default_provider = saved["default_provider"]
+        if saved.get("providers"):
+            config.llm.providers.update(saved["providers"])
+
+        for env_var, value in saved.get("env_vars", {}).items():
+            os.environ.setdefault(env_var, value)
+
+        logging.getLogger("agent_sys.cli").info(
+            "Loaded saved LLM config: provider=%s", saved.get("default_provider")
+        )
+    except Exception as e:
+        logging.getLogger("agent_sys.cli").warning("Failed to load saved LLM config: %s", e)
+
+    return config
+
+
+def _save_llm_config(config, env_vars: dict[str, str] | None = None) -> None:
+    """Persist LLM provider config so it survives restarts."""
+    import yaml
+
+    _LLM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "default_provider": config.llm.default_provider,
+        "providers": config.llm.providers,
+        "env_vars": env_vars or {},
+    }
+
+    with open(_LLM_CONFIG_PATH, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+    os.chmod(_LLM_CONFIG_PATH, 0o600)
+
+
 def _check_llm_and_prompt(config) -> object:
     """
-    Pre-boot LLM check.  If no provider is available, interactively ask the
-    user whether to use a local Ollama instance or a remote API key.
+    Pre-boot LLM check.  First try to load saved config from disk.
+    If still no provider available, interactively prompt the user.
     Returns the (possibly mutated) config.
     """
     from src.llm.router import check_llm_availability
+
+    config = _load_saved_llm_config(config)
 
     llm_cfg = {
         "default_provider": config.llm.default_provider,
@@ -295,67 +485,91 @@ def _check_llm_and_prompt(config) -> object:
 
 
 def _setup_ollama(config) -> object:
-    """Configure the compatible adapter to point at a local Ollama instance."""
+    """Configure the openai_compatible adapter to point at a local Ollama instance."""
     default_url = "http://localhost:11434/v1"
     url = input(f"   Ollama base URL [{default_url}]: ").strip() or default_url
 
     print("\n   Common Ollama models: llama3, mistral, gemma2, phi3, qwen2")
     model = input("   Model name [llama3]: ").strip() or "llama3"
 
-    config.llm.default_provider = "compatible"
-    config.llm.providers["compatible"] = {
+    config.llm.default_provider = "openai_compatible"
+    config.llm.providers["openai_compatible"] = {
         "base_url": url,
-        "api_key_env": "COMPATIBLE_API_KEY",
+        "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
         "models": {"fast": model, "strong": model},
     }
-    # Ollama doesn't require a real key, but the adapter checks for one
-    os.environ.setdefault("COMPATIBLE_API_KEY", "ollama")
+    os.environ.setdefault("OPENAI_COMPATIBLE_API_KEY", "ollama")
+
+    _save_llm_config(config, env_vars={"OPENAI_COMPATIBLE_API_KEY": "ollama"})
 
     print(f"\n   ✓ Configured Ollama at {url} with model '{model}'")
-    print("   NOTE: Ollama integration is experimental — make sure 'ollama serve' is running.\n")
+    print("   ✓ Config saved to ~/.agent_sys/llm_config.yaml (will persist across restarts)\n")
     return config
 
 
 def _setup_api_key(config) -> object:
-    """Prompt for an API key and set it in the environment."""
+    """Prompt for an API key, set it in the environment, and persist to disk."""
     print("\n   Which provider?\n")
-    print("     [1] OpenAI      (GPT-4o / GPT-4o-mini)")
-    print("     [2] Anthropic   (Claude Sonnet / Opus)")
-    print("     [3] Other       (any OpenAI-compatible API)\n")
+    print("     [1] OpenAI              (GPT-4o / GPT-4o-mini)")
+    print("     [2] OpenAI Compatible   (DeepSeek, Groq, any OpenAI-format API)")
+    print("     [3] Anthropic           (Claude Sonnet / Opus)")
+    print("     [4] Anthropic Compatible (MiniMax, custom Anthropic API endpoint)\n")
 
     provider = ""
-    while provider not in ("1", "2", "3"):
-        provider = input("   Enter choice [1/2/3]: ").strip()
+    while provider not in ("1", "2", "3", "4"):
+        provider = input("   Enter choice [1/2/3/4]: ").strip()
+
+    env_vars: dict[str, str] = {}
 
     if provider == "1":
         key = input("   OPENAI_API_KEY: ").strip()
         if key:
             os.environ["OPENAI_API_KEY"] = key
             config.llm.default_provider = "openai"
-            print("\n   ✓ OpenAI API key set for this session.")
-            print("   To persist, add to your shell profile:")
-            print(f'     export OPENAI_API_KEY="{key}"\n')
+            env_vars["OPENAI_API_KEY"] = key
+            _save_llm_config(config, env_vars=env_vars)
+            print("\n   ✓ OpenAI API key configured and saved to ~/.agent_sys/llm_config.yaml\n")
     elif provider == "2":
+        base_url = input("   Base URL (e.g. https://api.deepseek.com/v1): ").strip()
+        key = input("   OPENAI_COMPATIBLE_API_KEY: ").strip()
+        model = input("   Model name [deepseek-chat]: ").strip() or "deepseek-chat"
+        if base_url:
+            os.environ["OPENAI_COMPATIBLE_API_KEY"] = key or "none"
+            config.llm.default_provider = "openai_compatible"
+            config.llm.providers["openai_compatible"] = {
+                "base_url": base_url,
+                "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
+                "models": {"fast": model, "strong": model},
+            }
+            env_vars["OPENAI_COMPATIBLE_API_KEY"] = key or "none"
+            _save_llm_config(config, env_vars=env_vars)
+            print(f"\n   ✓ Configured OpenAI Compatible at {base_url} with model '{model}'.")
+            print("   ✓ Config saved to ~/.agent_sys/llm_config.yaml\n")
+    elif provider == "3":
         key = input("   ANTHROPIC_API_KEY: ").strip()
         if key:
             os.environ["ANTHROPIC_API_KEY"] = key
-            config.llm.default_provider = "claude"
-            print("\n   ✓ Anthropic API key set for this session.")
-            print("   To persist, add to your shell profile:")
-            print(f'     export ANTHROPIC_API_KEY="{key}"\n')
+            config.llm.default_provider = "anthropic"
+            env_vars["ANTHROPIC_API_KEY"] = key
+            _save_llm_config(config, env_vars=env_vars)
+            print("\n   ✓ Anthropic API key configured and saved to ~/.agent_sys/llm_config.yaml\n")
     else:
-        base_url = input("   Base URL (e.g. https://api.deepseek.com/v1): ").strip()
-        key = input("   API key: ").strip()
-        model = input("   Model name [deepseek-chat]: ").strip() or "deepseek-chat"
-        if base_url:
-            os.environ["COMPATIBLE_API_KEY"] = key or "none"
-            config.llm.default_provider = "compatible"
-            config.llm.providers["compatible"] = {
+        default_url = "https://api.minimaxi.com/anthropic"
+        base_url = input(f"   Anthropic-compatible Base URL [{default_url}]: ").strip() or default_url
+        key = input("   ANTHROPIC_COMPATIBLE_API_KEY: ").strip()
+        model = input("   Model name [MiniMax-M2.7]: ").strip() or "MiniMax-M2.7"
+        if key:
+            os.environ["ANTHROPIC_COMPATIBLE_API_KEY"] = key
+            config.llm.default_provider = "anthropic_compatible"
+            config.llm.providers["anthropic_compatible"] = {
                 "base_url": base_url,
-                "api_key_env": "COMPATIBLE_API_KEY",
+                "api_key_env": "ANTHROPIC_COMPATIBLE_API_KEY",
                 "models": {"fast": model, "strong": model},
             }
-            print(f"\n   ✓ Configured {base_url} with model '{model}'.\n")
+            env_vars["ANTHROPIC_COMPATIBLE_API_KEY"] = key
+            _save_llm_config(config, env_vars=env_vars)
+            print(f"\n   ✓ Configured Anthropic Compatible at {base_url} with model '{model}'.")
+            print("   ✓ Config saved to ~/.agent_sys/llm_config.yaml\n")
 
     return config
 
@@ -427,6 +641,14 @@ def main() -> None:
 
     p_classify = sub.add_parser("classify", help="Run file priority classification")
     p_classify.set_defaults(func=cmd_classify)
+
+    p_triage = sub.add_parser("triage", help="Run LLM-based file importance triage")
+    p_triage.add_argument("--batch-size", type=int, default=500, help="Files per triage batch")
+    p_triage.set_defaults(func=cmd_triage)
+
+    p_dashboard = sub.add_parser("dashboard", help="Launch web dashboard for visual debugging")
+    p_dashboard.add_argument("--port", "-p", type=int, default=7438, help="Dashboard port (default 7438)")
+    p_dashboard.set_defaults(func=cmd_dashboard)
 
     args = parser.parse_args()
     if not args.command:
