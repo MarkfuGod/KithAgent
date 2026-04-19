@@ -1,7 +1,11 @@
+<p align="center">
+  <img src="assets/kith-logo.png" alt="Kith" width="140" />
+</p>
+
 # agent-sys
 
-*codename: **Kith / 契***  
-— a quiet familiar your agents can lean on · 一个熟稔到懂你的后台守护
+<p align="center"><em>codename: <strong>Kith / 契</strong></em><br/>
+<sub>— a quiet familiar your agents can lean on · 一个熟稔到懂你的后台守护</sub></p>
 
 **Languages / 语言:** [English](#english) · [中文](#chinese)
 
