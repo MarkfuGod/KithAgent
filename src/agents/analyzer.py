@@ -116,7 +116,7 @@ class BehaviorAnalyzerAgent(BaseAgent):
             )
 
         await memory.store_knowledge(
-            kid=f"behavior_insight_{int(time.time())}",
+            knowledge_id=f"behavior_insight_{int(time.time())}",
             category="behavior_insight",
             content=json.dumps(analysis, ensure_ascii=False),
             metadata={"generated_at": time.time(), "hours_analyzed": hours},

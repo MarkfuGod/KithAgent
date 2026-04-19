@@ -367,6 +367,18 @@ class CronScheduler:
 
         return self._default_decision(snapshot)
 
+    # Which agents require a working LLM to make meaningful progress.
+    # When no LLM is available we silently drop these from the fallback
+    # schedule so we don't busy-loop dispatching tasks that will return
+    # `{"skipped_reason": "no_llm"}`.
+    _LLM_REQUIRED_AGENTS = frozenset({
+        "summarizer",
+        "behavior_analyzer",
+        "report_generator",
+        "profile_builder",
+        "triage",  # still runs (rule-based), but gets lower priority
+    })
+
     def _default_decision(self, snapshot: dict) -> dict:
         """Rule-based fallback when no LLM is available.
 
@@ -379,6 +391,10 @@ class CronScheduler:
         deep_hour = self.config.adaptive.deep_analysis_hour
         strategy_name = getattr(self.config.adaptive, "strategy", "balanced")
         strat = SCHEDULING_STRATEGIES.get(strategy_name, SCHEDULING_STRATEGIES["balanced"])
+
+        # Is there any working LLM backend at all?
+        llm = self.kernel.get_llm()
+        llm_available = bool(llm and llm.available_providers())
 
         is_deep_hour = (hour == deep_hour)
         is_active = (mod_rate > 3)
@@ -404,30 +420,48 @@ class CronScheduler:
 
         agents: list[dict] = []
 
+        def _maybe_add(agent_name: str, spec: dict) -> None:
+            if not llm_available and agent_name in self._LLM_REQUIRED_AGENTS and agent_name != "triage":
+                return
+            agents.append({"name": agent_name, "input_data": spec})
+
         if _should_run(strat.get("triage", "always")):
             budget = 180 if is_deep_hour else (60 if is_active else 120)
-            agents.append({"name": "triage", "input_data": {"time_budget": budget, "timeout": 300}})
+            # Triage runs even without an LLM (rule-based pass marks the
+            # obvious noise and stamps the rest as 'unknown').
+            _maybe_add("triage", {"time_budget": budget, "timeout": 300})
 
         if _should_run(strat.get("summarize", "active_only")):
             if is_active and not is_deep_hour:
-                agents.append({"name": "summarizer", "input_data": {"mode": "light", "batch_size": 50, "time_budget": 60, "timeout": 120}})
+                _maybe_add("summarizer", {"mode": "light", "batch_size": 50, "time_budget": 60, "timeout": 120})
             else:
-                agents.append({"name": "summarizer", "input_data": {"mode": "deep", "time_budget": 240, "timeout": 300}})
+                _maybe_add("summarizer", {"mode": "deep", "time_budget": 240, "timeout": 300})
 
         if _should_run(strat.get("behavior", "daily")):
-            agents.append({"name": "behavior_analyzer", "input_data": {"timeout": 300}})
+            _maybe_add("behavior_analyzer", {"timeout": 300})
 
         if _should_run(strat.get("priority", "after_behavior")):
+            # priority_classifier is rule-based (date buckets), runs without LLM.
             agents.append({"name": "priority_classifier", "input_data": {}})
 
         if _should_run(strat.get("profile", "weekly")):
-            agents.append({"name": "profile_builder", "input_data": {"timeout": 300}})
+            _maybe_add("profile_builder", {"timeout": 300})
 
         if _should_run(strat.get("report", "daily_only")):
             rtype = "daily" if is_deep_hour else ("quick" if is_active else "daily")
-            agents.append({"name": "report_generator", "input_data": {"report_type": rtype, "timeout": 300}})
+            _maybe_add("report_generator", {"report_type": rtype, "timeout": 300})
 
-        if is_deep_hour:
+        if not llm_available:
+            # No LLM configured → back off aggressively. The only useful
+            # work we can do is rule-based triage + priority classification,
+            # and doing that every 10 minutes is wasteful.
+            mode = "rules_only"
+            interval = self.config.adaptive.max_interval_minutes
+            reason = (
+                f"No LLM configured (rules_only mode), "
+                f"strategy={strategy_name}, backing off to {interval}m"
+            )
+        elif is_deep_hour:
             mode = "deep"
             interval = self.config.adaptive.max_interval_minutes
             reason = f"Deep hour ({deep_hour}:00), strategy={strategy_name}"
@@ -467,7 +501,7 @@ class CronScheduler:
         }
 
         await memory.store_knowledge(
-            kid=f"scheduling_decision_{int(time.time())}",
+            knowledge_id=f"scheduling_decision_{int(time.time())}",
             category="scheduling_decision",
             content=json.dumps(record, ensure_ascii=False),
             metadata={"mode": decision.get("mode")},
@@ -514,6 +548,11 @@ class CronScheduler:
         }
         while self._running:
             await asyncio.sleep(10)
+            # Skip LLM-dependent agents entirely if no LLM is configured.
+            if agent_name in self._LLM_REQUIRED_AGENTS and agent_name != "triage":
+                llm = self.kernel.get_llm()
+                if not llm or not llm.available_providers():
+                    continue
             fs = self.kernel.get_filesystem()
             if fs and hasattr(fs, "_stats"):
                 current_scan = fs._stats.get("last_scan", 0.0)

@@ -104,7 +104,7 @@ class ProfileBuilderAgent(BaseAgent):
             )
 
         await memory.store_knowledge(
-            kid="user_profile_current",
+            knowledge_id="user_profile_current",
             category="user_profile",
             content=json.dumps(profile, ensure_ascii=False),
             metadata={"generated_at": time.time(), "indexed_files": mem_stats.get("indexed_files", 0)},

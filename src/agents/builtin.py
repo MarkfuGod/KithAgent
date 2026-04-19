@@ -58,7 +58,7 @@ class KnowledgeStoreAgent(BaseAgent):
     async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
         memory = context["memory"]
         await memory.store_knowledge(
-            kid=task.input_data.get("id", task.task_id),
+            knowledge_id=task.input_data.get("id", task.task_id),
             category=task.input_data["category"],
             content=task.input_data["content"],
             source_path=task.input_data.get("source", ""),

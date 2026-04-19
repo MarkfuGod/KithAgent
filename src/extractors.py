@@ -99,6 +99,65 @@ def extract_text_from_docx(path: str, max_chars: int = 4000) -> str | None:
         return None
 
 
+def extract_text_from_pptx(path: str, max_chars: int = 4000) -> str | None:
+    """Extract text content from a PowerPoint .pptx file (best-effort)."""
+    try:
+        from pptx import Presentation
+        prs = Presentation(path)
+        text_parts: list[str] = []
+        total = 0
+        for slide_idx, slide in enumerate(prs.slides, 1):
+            text_parts.append(f"[slide {slide_idx}]")
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    text_parts.append(shape.text)
+                    total += len(shape.text)
+            if total >= max_chars:
+                break
+        text = "\n".join(text_parts)
+        return text[:max_chars] if text.strip() else None
+    except ImportError:
+        logger.debug("python-pptx not installed — cannot extract .pptx")
+        return None
+    except Exception as e:
+        logger.debug("PPTX extraction failed for %s: %s", path, e)
+        return None
+
+
+def extract_text_from_xlsx(path: str, max_chars: int = 4000, max_rows_per_sheet: int = 50) -> str | None:
+    """Extract text content from an Excel .xlsx file as header + sample rows.
+
+    We don't want to serialize a 100k-row sheet, so we just sample.
+    """
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        text_parts: list[str] = []
+        total = 0
+        for sheet in wb.worksheets:
+            text_parts.append(f"[sheet: {sheet.title}]")
+            for i, row in enumerate(sheet.iter_rows(values_only=True)):
+                if i >= max_rows_per_sheet:
+                    text_parts.append(f"... ({sheet.max_row} total rows)")
+                    break
+                line = " | ".join(str(c) if c is not None else "" for c in row)
+                text_parts.append(line)
+                total += len(line)
+                if total >= max_chars:
+                    break
+            if total >= max_chars:
+                break
+        wb.close()
+        text = "\n".join(text_parts)
+        return text[:max_chars] if text.strip() else None
+    except ImportError:
+        logger.debug("openpyxl not installed — cannot extract .xlsx")
+        return None
+    except Exception as e:
+        logger.debug("XLSX extraction failed for %s: %s", path, e)
+        return None
+
+
 def encode_image_base64(path: str, max_bytes: int = 5 * 1024 * 1024) -> str | None:
     """Read an image file and return its base64-encoded data URI."""
     try:
@@ -151,9 +210,19 @@ def extract_content(path: str, max_chars: int = 4000) -> dict | None:
             text = extract_text_from_docx(path, max_chars)
             if text:
                 return {"type": "text", "content": text}
+        # .doc (old binary Word) isn't supported — skip cleanly.
         return None
 
-    if ext in (".pptx", ".xlsx"):
+    if ext == ".pptx":
+        text = extract_text_from_pptx(path, max_chars)
+        if text:
+            return {"type": "text", "content": text}
+        return None
+
+    if ext == ".xlsx":
+        text = extract_text_from_xlsx(path, max_chars)
+        if text:
+            return {"type": "text", "content": text}
         return None
 
     if is_image(ext):

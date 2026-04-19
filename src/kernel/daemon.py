@@ -56,6 +56,19 @@ class SysAgentKernel:
         self._subsystems["memory"] = memory
         logger.info("[boot] Memory store ready")
 
+        # Scope hygiene: if the user narrowed watch_paths since the last run,
+        # old file_index rows from a wider scan would otherwise be picked up
+        # by summarizer/triage. Mark them as 'skip' once, up front, so the
+        # working set stays in line with the current config.
+        pruned = await memory.prune_out_of_scope(list(self.config.filesystem.watch_paths))
+        if pruned:
+            logger.warning(
+                "[boot] Pruned %d file_index rows outside current watch_paths "
+                "(marked as 'skip'). Narrow your scan scope? Those rows will "
+                "no longer be summarized.",
+                pruned,
+            )
+
         from src.memory import embeddings as emb_module
         emb_cfg = self.config.memory.embedding
         emb_module.configure(

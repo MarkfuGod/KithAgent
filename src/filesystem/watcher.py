@@ -186,12 +186,23 @@ class FileSystemWatcher:
             if needle in full:
                 return True
 
-        # Skip hidden directories under home (except .cursor, where users keep
-        # hand-written rules, settings, etc.). Specific third-party subtrees
-        # under .cursor are pruned via ignore_subpaths above.
+        # Privacy guard: never traverse hidden dot-directories directly under
+        # $HOME (e.g. ~/.ssh, ~/.gnupg, ~/.aws) UNLESS the directory name is
+        # in `filesystem.allowed_hidden_home_dirs` from config. Defaults there
+        # cover common AI-tool config dirs (.cursor / .claude / .codex /
+        # .continue / .aider) so their user-authored rules & memory files
+        # get indexed; Linux users who keep personal configs under ~/.config
+        # or ~/.local/share can opt those in explicitly.
+        #
+        # Semantic noise that lives INSIDE an allowed dir (e.g.
+        # .cursor/extensions/<plugin>/) is NOT pruned here — it's indexed
+        # and then skipped by the triage agent's rule-based pass, so the
+        # dashboard can show what was filtered and why.
         home = str(Path.home())
-        if parent == home and dirname.startswith(".") and dirname not in (".cursor",):
-            return True
+        if parent == home and dirname.startswith("."):
+            allowed = getattr(self.config, "allowed_hidden_home_dirs", None) or []
+            if dirname not in allowed:
+                return True
 
         return False
 

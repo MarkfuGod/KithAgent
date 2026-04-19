@@ -32,6 +32,11 @@ class FilesystemConfig:
     index_extensions: list[str] = field(default_factory=lambda: [".py", ".md", ".txt", ".json"])
     scan_interval_seconds: int = 300
     max_file_size_mb: int = 10
+    # Which hidden dot-directories directly under $HOME are allowed to be
+    # walked. Everything else under ~/.* is pruned by default as a privacy
+    # guard (ssh keys, cloud creds, cache). Each entry is a directory name
+    # (with leading dot). Empty list = prune ALL ~/.* dirs.
+    allowed_hidden_home_dirs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -65,7 +70,15 @@ class SyscallConfig:
     transport: str = "unix_socket"
     http_port: int = 7437
     auth_token_path: Path = Path("~/.agent_sys/auth_token")
-    allowed_callers: list[str] = field(default_factory=lambda: ["cursor", "claude_code", "cli"])
+    allowed_callers: list[str] = field(default_factory=lambda: ["cursor", "claude_code", "cli", "dashboard"])
+    # When `require_auth` is True, HTTP callers MUST provide
+    # `X-Agent-Token: <token>` matching the contents of auth_token_path,
+    # AND their `caller` field must be in allowed_callers.
+    # Unix socket peers are trusted (600 perms + local socket), but we
+    # still enforce allowed_callers there unless `allow_unix_anonymous`
+    # is True.
+    require_auth: bool = True
+    allow_unix_anonymous: bool = True
 
 
 @dataclass
@@ -221,12 +234,20 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
         hints=triage_raw.get("hints", []) or [],
     )
 
+    syscall_raw = raw.get("syscall") or {}
+    syscall_cfg = _build_section(SyscallConfig, syscall_raw)
+    # Explicit booleans from YAML override defaults.
+    if "require_auth" in syscall_raw:
+        syscall_cfg.require_auth = bool(syscall_raw["require_auth"])
+    if "allow_unix_anonymous" in syscall_raw:
+        syscall_cfg.allow_unix_anonymous = bool(syscall_raw["allow_unix_anonymous"])
+
     return AgentOSConfig(
         kernel=_build_section(KernelConfig, raw.get("kernel")),
         filesystem=_build_section(FilesystemConfig, raw.get("filesystem")),
         memory=memory_config,
         scheduler=_build_section(SchedulerConfig, raw.get("scheduler")),
-        syscall=_build_section(SyscallConfig, raw.get("syscall")),
+        syscall=syscall_cfg,
         llm=llm_config,
         cron=cron_config,
         triage=triage_config,

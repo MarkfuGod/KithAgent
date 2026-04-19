@@ -15,9 +15,11 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
+import secrets
 import struct
 import time
 from pathlib import Path
@@ -31,6 +33,10 @@ from src.syscall.protocol import (
     SyscallResponse,
     SyscallType,
 )
+
+# Syscalls that are always safe to call without auth — they're used by
+# the setup wizard / health probe and leak no privileged information.
+_PUBLIC_SYSCALLS = frozenset({SyscallType.SYS_PING, SyscallType.SYS_STATUS})
 
 if TYPE_CHECKING:
     from src.kernel.daemon import SysAgentKernel
@@ -46,13 +52,15 @@ class SyscallServer:
         self.kernel = kernel
         self._unix_server: asyncio.Server | None = None
         self._http_runner = None
+        self._auth_token: str | None = None
 
     async def start(self) -> None:
-        socket_path = Path(str(self.config.auth_token_path)).parent.parent / "agent_sys.sock"
         actual_socket = str(self.kernel.config.kernel.socket_path)
 
         if os.path.exists(actual_socket):
             os.unlink(actual_socket)
+
+        self._auth_token = self._load_or_create_token()
 
         self._unix_server = await asyncio.start_unix_server(
             self._handle_connection, path=actual_socket,
@@ -62,6 +70,68 @@ class SyscallServer:
 
         if self.config.transport == "http" or self.config.http_port:
             asyncio.create_task(self._start_http())
+
+    # ── Auth helpers ──────────────────────────────────────────
+
+    def _load_or_create_token(self) -> str | None:
+        """Load the auth token from disk, or generate and persist one
+        on first boot. Returns None if the path is unset."""
+        token_path = Path(os.path.expanduser(str(self.config.auth_token_path)))
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            if token_path.exists():
+                token = token_path.read_text().strip()
+                if token:
+                    return token
+            token = secrets.token_urlsafe(32)
+            token_path.write_text(token)
+            os.chmod(token_path, 0o600)
+            logger.info("Generated new syscall auth token at %s (chmod 0600)", token_path)
+            return token
+        except Exception as e:
+            logger.warning("Failed to initialize auth token at %s: %s", token_path, e)
+            return None
+
+    def _check_auth(
+        self,
+        request: SyscallRequest,
+        *,
+        transport: str,
+        http_token: str | None = None,
+    ) -> str | None:
+        """Return an error string if auth fails, or None if OK."""
+        call_type = request.call_type
+        if call_type in _PUBLIC_SYSCALLS:
+            return None
+
+        caller = (request.caller or "unknown").lower()
+        allowed = {c.lower() for c in self.config.allowed_callers}
+        # Empty allowed_callers = allow anyone (back-compat).
+        if allowed and caller not in allowed:
+            logger.warning(
+                "Syscall auth: caller=%r not in allowed_callers (transport=%s)",
+                caller, transport,
+            )
+            return f"caller '{request.caller}' not allowed"
+
+        if transport == "http":
+            if self.config.require_auth:
+                if not self._auth_token:
+                    return "auth token not configured on server"
+                if not http_token or not hmac.compare_digest(http_token, self._auth_token):
+                    logger.warning("Syscall auth: bad/missing HTTP token for caller=%r", caller)
+                    return "invalid or missing X-Agent-Token"
+            return None
+
+        # Unix socket: local process with mode-600 socket. Trust by default
+        # unless the operator explicitly opts out of anonymous unix calls.
+        if not self.config.allow_unix_anonymous:
+            if self.config.require_auth:
+                sock_token = request.params.get("_auth_token") if isinstance(request.params, dict) else None
+                if not self._auth_token or not sock_token or \
+                   not hmac.compare_digest(str(sock_token), self._auth_token):
+                    return "unix socket auth required"
+        return None
 
     async def stop(self) -> None:
         if self._unix_server:
@@ -97,7 +167,15 @@ class SyscallServer:
                     break
                 payload = await reader.readexactly(length)
                 request = SyscallRequest.from_json(payload)
-                response = await self._dispatch(request)
+                auth_err = self._check_auth(request, transport="unix")
+                if auth_err:
+                    response = SyscallResponse(
+                        request_id=request.request_id,
+                        success=False,
+                        error=f"auth failed: {auth_err}",
+                    )
+                else:
+                    response = await self._dispatch(request)
                 resp_bytes = response.to_json().encode()
                 writer.write(struct.pack(">I", len(resp_bytes)) + resp_bytes)
                 await writer.drain()
@@ -136,6 +214,12 @@ class SyscallServer:
         try:
             body = await request.json()
             req = SyscallRequest(**body)
+            http_token = request.headers.get("X-Agent-Token")
+            auth_err = self._check_auth(req, transport="http", http_token=http_token)
+            if auth_err:
+                return web.json_response(
+                    {"error": f"auth failed: {auth_err}"}, status=401,
+                )
             response = await self._dispatch(req)
             return web.json_response(json.loads(response.to_json()))
         except Exception as e:
@@ -152,6 +236,13 @@ class SyscallServer:
     async def _http_reload(self, request) -> Any:
         """Hot-reload config without restarting the daemon."""
         from aiohttp import web
+        http_token = request.headers.get("X-Agent-Token")
+        if self.config.require_auth and self._auth_token:
+            if not http_token or not hmac.compare_digest(http_token, self._auth_token):
+                return web.json_response(
+                    {"error": "auth failed: invalid or missing X-Agent-Token"},
+                    status=401,
+                )
         try:
             result = await self.kernel.reload_config()
             return web.json_response(result)

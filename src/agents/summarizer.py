@@ -405,7 +405,7 @@ class SummarizerAgent(BaseAgent):
                 )
 
                 await memory.store_knowledge(
-                    kid=f"project_summary_{directory.replace('/', '_')[:60]}",
+                    knowledge_id=f"project_summary_{directory.replace('/', '_')[:60]}",
                     category="project_summary",
                     content=json.dumps({
                         "directory": directory,

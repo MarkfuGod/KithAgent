@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-sys"
-version = "0.2.0"
-description = "AgentOS — A system-level agent daemon that maps traditional OS concepts to LLM agent architecture"
+version = "0.7.0"
+description = "A long-running agent daemon that indexes user files and exposes an LLM-powered RPC surface for external agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -16,14 +16,25 @@ dependencies = [
 
 [project.optional-dependencies]
 full = [
-    "watchdog>=4.0",       # real-time file system events
-    "aiohttp>=3.9",        # HTTP API transport
-    "openai>=1.0",         # OpenAI API
-    "anthropic>=0.30",     # Anthropic Claude API
+    "watchdog>=4.0",
+    "aiohttp>=3.9",
+    "openai>=1.0",
+    "anthropic>=0.30",
 ]
 lite = [
     "watchdog>=4.0",
     "aiohttp>=3.9",
+]
+docs = [
+    "PyMuPDF>=1.24",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+]
+embeddings = [
+    "sentence-transformers>=2.7",
+    "numpy>=1.26,<2.3",
+    "httpx>=0.27",
 ]
 dev = [
     "pytest>=8.0",
@@ -34,4 +45,9 @@ dev = [
 agent-sys = "src.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["src*", "agent_sys*"]
+
+[tool.pytest.ini_options]
+# Tests avoid pytest-asyncio on purpose — each async case is wrapped in
+# `asyncio.run` so the suite runs with a bare pytest install.
+testpaths = ["tests"]

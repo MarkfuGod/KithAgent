@@ -188,7 +188,7 @@ agent_sys/
 │   │   └── client.py                # Async + Sync 客户端 SDK（含 triage）
 │   ├── agents/
 │   │   ├── base.py                  # AgentTask + BaseAgent
-│   │   ├── builtin.py               # 注册全部 12 个 Agent
+│   │   ├── builtin.py               # 注册全部 15 个 Agent
 │   │   ├── triage.py                # LLM 智能分诊（规则 + LLM 两阶段）
 │   │   ├── summarizer.py            # 多模态文件摘要（尊重 triage 结果）
 │   │   ├── analyzer.py              # 全人行为分析（work / study / personal）

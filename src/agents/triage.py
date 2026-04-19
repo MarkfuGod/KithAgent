@@ -130,9 +130,13 @@ _FALLBACK_SKIP_PATTERNS = [
     "/.vscode/extensions/",
 ]
 
-_BATCH_SIZE = 500
-_LLM_BATCH_SIZE = 200
+_DB_FETCH_BATCH = 500        # how many untriaged rows to pull from SQLite per round
+_LLM_GROUP_BATCH = 200       # how many files per single LLM call (per directory group)
 _DEFAULT_TIME_BUDGET = 300
+
+# Back-compat aliases — older code/tests may reference the old names.
+_BATCH_SIZE = _DB_FETCH_BATCH
+_LLM_BATCH_SIZE = _LLM_GROUP_BATCH
 
 
 def _build_triage_prompt(hints: list[str] | None, type_priority: dict[str, int] | None) -> str:
@@ -168,16 +172,36 @@ class TriageAgent(BaseAgent):
         type_priority = triage_cfg.get("file_type_priority") or {}
         hints = triage_cfg.get("hints") or []
 
-        batch_size = task.input_data.get("batch_size", _BATCH_SIZE)
+        batch_size = task.input_data.get("batch_size", _DB_FETCH_BATCH)
         time_budget = task.input_data.get("time_budget", _DEFAULT_TIME_BUDGET)
         start_time = time.time()
 
         # Phase 1: rule-based fast triage using config-driven skip patterns.
         rule_results = await self._rule_based_pass(memory, skip_patterns)
 
+        # If an LLM just became available, re-open any files we previously
+        # parked as 'unknown' so they get a real classification this run.
+        if llm and llm.available_providers():
+            reopened = await self._reopen_unknown(memory)
+            if reopened:
+                logger.info("Reopened %d previously 'unknown' files for LLM triage", reopened)
+
         if not llm or not llm.available_providers():
-            logger.warning("No LLM available — triage used rules only")
-            return {**rule_results, "llm_triaged": 0, "mode": "rules_only"}
+            # Without an LLM we can't make per-file importance calls. Mark
+            # whatever wasn't rule-skipped as "unknown" so downstream agents
+            # (summarizer, cron scheduler) don't keep re-picking them up as
+            # "needs triage" every cycle and livelocking the system.
+            unknown_marked = await self._mark_remaining_as_unknown(memory)
+            logger.warning(
+                "No LLM available — rules marked %d as skip, %d as unknown",
+                rule_results.get("rule_based_skipped", 0), unknown_marked,
+            )
+            return {
+                **rule_results,
+                "llm_triaged": 0,
+                "unknown_marked": unknown_marked,
+                "mode": "rules_only",
+            }
 
         # Compose system prompt once per run (cheap, but keeps logic out of hot loop).
         system_prompt = _build_triage_prompt(hints, type_priority)
@@ -296,7 +320,7 @@ class TriageAgent(BaseAgent):
         """Ask LLM to triage a batch of files from the same directory context."""
         home = str(Path.home())
         file_lines = []
-        for f in files[:_LLM_BATCH_SIZE]:
+        for f in files[:_LLM_GROUP_BATCH]:
             rel = f["path"][len(home):] if f["path"].startswith(home) else f["path"]
             size_kb = (f.get("size_bytes") or 0) / 1024
             file_lines.append(f"  {rel}  ({f.get('file_type', '?')}, {size_kb:.0f}KB)")
@@ -403,3 +427,17 @@ class TriageAgent(BaseAgent):
             await memory.batch_update_triage(updates)
 
         return len(updates)
+
+    async def _reopen_unknown(self, memory) -> int:
+        """Reset any files parked as 'unknown' back to untriaged, so this
+        (now LLM-backed) run can classify them properly."""
+        return await memory.reopen_unknown()
+
+    async def _mark_remaining_as_unknown(self, memory) -> int:
+        """Mark every still-untriaged file as 'unknown' so the system stops
+        re-queueing them on every cycle when no LLM is configured.
+
+        `unknown` is cleared automatically the next time triage runs with
+        an LLM available (see `MemoryStore.reopen_unknown`).
+        """
+        return await memory.park_remaining_as_unknown()

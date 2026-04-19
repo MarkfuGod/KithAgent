@@ -169,7 +169,7 @@ class ReportGeneratorAgent(BaseAgent):
             report = self._fallback_quick(recent, dir_activity, mod_rate, breakdown)
 
         await memory.store_knowledge(
-            kid=f"quick_report_{int(time.time())}",
+            knowledge_id=f"quick_report_{int(time.time())}",
             category="quick_report",
             content=json.dumps(report, ensure_ascii=False),
             metadata={"generated_at": time.time()},
@@ -286,7 +286,7 @@ class ReportGeneratorAgent(BaseAgent):
             report = self._fallback_daily(recent, dir_activity, breakdown)
 
         await memory.store_knowledge(
-            kid=f"daily_report_{datetime.now().strftime('%Y%m%d')}",
+            knowledge_id=f"daily_report_{datetime.now().strftime('%Y%m%d')}",
             category="daily_report",
             content=json.dumps(report, ensure_ascii=False),
             metadata={"generated_at": time.time()},
@@ -360,7 +360,7 @@ class ReportGeneratorAgent(BaseAgent):
                 logger.warning("LLM project profile failed: %s", e)
 
         await memory.store_knowledge(
-            kid=f"project_profile_{project_dir.replace('/', '_')[:50]}",
+            knowledge_id=f"project_profile_{project_dir.replace('/', '_')[:50]}",
             category="project_profile",
             content=json.dumps(profile, ensure_ascii=False),
             source_path=project_dir,
@@ -408,7 +408,7 @@ class ReportGeneratorAgent(BaseAgent):
             }
 
         await memory.store_knowledge(
-            kid=f"context_brief_{int(time.time())}",
+            knowledge_id=f"context_brief_{int(time.time())}",
             category="context_brief",
             content=json.dumps(brief, ensure_ascii=False),
             metadata={"generated_at": time.time()},

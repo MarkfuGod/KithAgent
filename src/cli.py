@@ -1,14 +1,8 @@
 """
-CLI Entry Point — the 'shell' of AgentOS.
+agent-sys CLI entry point.
 
-Commands:
-    agent-sys start      Start the SysAgent daemon (foreground)
-    agent-sys start -d   Start as background daemon
-    agent-sys stop       Stop the running daemon
-    agent-sys status     Show system status
-    agent-sys search     Search indexed files
-    agent-sys query      Query knowledge base
-    agent-sys ping       Check if daemon is alive
+See `agent-sys --help` for the full command list. Commands are grouped by
+purpose (daemon lifecycle / query / manual runs / UI).
 """
 
 from __future__ import annotations
@@ -85,8 +79,12 @@ def cmd_start(args: argparse.Namespace) -> None:
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
 
-    # Check LLM availability before boot — prompt user if none found
+    # Load any persisted scan-scope preferences from a previous first-run.
+    config = _load_saved_scan_config(config)
+
+    # First-run UX: ask about scan scope + LLM before we actually boot.
     if not args.daemon:
+        config = _prompt_scan_paths(config)
         config = _check_llm_and_prompt(config)
 
     if args.daemon:
@@ -96,19 +94,15 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     print(f"""
 ╔══════════════════════════════════════════╗
-║          AgentOS — SysAgent v{config.kernel.version}        ║
+║         agent-sys v{config.kernel.version}                   ║
 ║                                          ║
-║  Kernel:     PID {os.getpid():<24}║
+║  PID:        {os.getpid():<28}║
 ║  Socket:     {str(config.kernel.socket_path):<27}║
-║  HTTP:       http://127.0.0.1:{config.syscall.http_port:<11}║
-║  Log:        ~/.agent_sys/logs/          ║
+║  HTTP API:   http://127.0.0.1:{config.syscall.http_port:<11}║
+║  Logs:       ~/.agent_sys/logs/          ║
 ║                                          ║
-║  Traditional OS → Agent OS mapping:      ║
-║    CPU Thread  → Agent Worker            ║
-║    FileSystem  → Knowledge Index         ║
-║    Scheduler   → Task Dispatcher         ║
-║    Syscall     → Agent API               ║
-║    Memory      → Context Cache           ║
+║  Local file indexer + RPC surface for    ║
+║  LLM-powered agents. Ctrl-C to stop.     ║
 ╚══════════════════════════════════════════╝
     """)
 
@@ -223,10 +217,10 @@ async def _async_query(category: str | None) -> None:
             print(f" Knowledge entries: {len(entries)}" + (f" (category: {category})" if category else ""))
             print(f"{'='*60}")
             for e in entries:
-                kid = e.get("id", "?")
+                entry_id = e.get("id", "?")
                 cat = e.get("category", "?")
                 content_raw = e.get("content", "")
-                print(f"\n--- [{cat}] {kid} ---")
+                print(f"\n--- [{cat}] {entry_id} ---")
                 try:
                     parsed = json.loads(content_raw)
                     print(json.dumps(parsed, indent=2, ensure_ascii=False))
@@ -406,6 +400,120 @@ async def _async_classify() -> None:
 
 
 _LLM_CONFIG_PATH = Path.home() / ".agent_sys" / "llm_config.yaml"
+_SCAN_CONFIG_PATH = Path.home() / ".agent_sys" / "scan_config.yaml"
+_FIRSTRUN_MARKER = Path.home() / ".agent_sys" / ".firstrun_done"
+
+
+def _load_saved_scan_config(config) -> object:
+    """Apply any persisted watch_paths override from the first-run wizard."""
+    import yaml
+
+    if not _SCAN_CONFIG_PATH.exists():
+        return config
+
+    try:
+        with open(_SCAN_CONFIG_PATH) as f:
+            saved = yaml.safe_load(f) or {}
+        paths = saved.get("watch_paths") or []
+        if paths:
+            config.filesystem.watch_paths = [
+                Path(os.path.expanduser(p)).expanduser().resolve()
+                for p in paths
+            ]
+    except Exception as e:
+        logging.getLogger("agent_sys.cli").warning(
+            "Failed to load saved scan config: %s", e,
+        )
+    return config
+
+
+def _save_scan_config(watch_paths: list[str]) -> None:
+    import yaml
+    _SCAN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_SCAN_CONFIG_PATH, "w") as f:
+        yaml.dump({"watch_paths": watch_paths}, f, default_flow_style=False)
+
+
+def _prompt_scan_paths(config) -> object:
+    """First-run interactive prompt: which directories should agent-sys index?
+
+    Skipped if the user has already answered (marker file exists) or if
+    input is not a TTY (daemonized / scripted start).
+    """
+    if _FIRSTRUN_MARKER.exists():
+        return config
+    if not sys.stdin.isatty():
+        return config
+
+    home = str(Path.home())
+    default_paths = [p for p in ["~/Documents", "~/Desktop"]]
+
+    print(
+        "\nAgentOS will index files under the paths you choose and may send\n"
+        "their contents to your configured LLM provider. Pick a scope:\n"
+    )
+    print("     [1] Conservative: ~/Documents + ~/Desktop  (recommended)")
+    print("     [2] Projects:     ~/Documents + ~/Desktop + ~/Projects")
+    print("     [3] Everything:   ~/  (entire home directory — more data, more bandwidth)")
+    print("     [4] Custom:       enter paths manually")
+    print("     [5] Skip:         don't change config (use default.yaml)\n")
+
+    choice = ""
+    while choice not in ("1", "2", "3", "4", "5"):
+        choice = input("   Enter choice [1-5]: ").strip() or "1"
+
+    if choice == "1":
+        paths = default_paths
+    elif choice == "2":
+        paths = default_paths + ["~/Projects"]
+    elif choice == "3":
+        print(
+            "\n   ⚠  Indexing ~/ can include sensitive files (tax returns, SSH keys, etc.)\n"
+            "      even with the default ignore patterns. Continuing in 3s —\n"
+            "      Ctrl-C to abort.\n"
+        )
+        import time as _t
+        _t.sleep(3)
+        paths = ["~"]
+    elif choice == "4":
+        print("   Enter one path per line. Empty line to finish:")
+        paths = []
+        while True:
+            p = input("     path> ").strip()
+            if not p:
+                break
+            paths.append(p)
+        if not paths:
+            paths = default_paths
+    else:
+        _FIRSTRUN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _FIRSTRUN_MARKER.touch()
+        return config
+
+    _save_scan_config(paths)
+    config.filesystem.watch_paths = [
+        Path(os.path.expanduser(p)).expanduser().resolve()
+        for p in paths
+    ]
+    _FIRSTRUN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    _FIRSTRUN_MARKER.touch()
+    print(f"\n   ✓ Will index: {', '.join(paths)}")
+    print(f"   ✓ Saved to {_SCAN_CONFIG_PATH}\n")
+    return config
+
+
+def _detect_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
+    """Query a local Ollama instance for the list of installed models.
+    Returns [] if Ollama isn't reachable."""
+    try:
+        import urllib.request
+        import json as _json
+        req = urllib.request.Request(f"{base_url}/api/tags")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = _json.loads(resp.read())
+        return [m.get("name") for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return []
 
 
 def _load_saved_llm_config(config) -> object:
@@ -477,15 +585,23 @@ def _check_llm_and_prompt(config) -> object:
         "\n⚠  No LLM provider detected (no API keys set).\n"
         "   Smart agents (summarize, analyze, report…) need an LLM backend.\n"
     )
+
+    # Proactively detect a running local Ollama and mention it in the prompt.
+    local_models = _detect_ollama_models()
+    if local_models:
+        print(f"   ✓ Detected running Ollama with {len(local_models)} model(s) installed\n")
+
     print("   Choose how to proceed:\n")
-    print("     [1] Local Ollama   — use a model running on your machine")
-    print("                          (requires Ollama to be running at localhost:11434)")
+    ollama_hint = f" ({len(local_models)} models available)" if local_models else ""
+    print(f"     [1] Local Ollama{ollama_hint}")
+    print("                          (recommended: no API key, stays on your machine)")
     print("     [2] Remote API     — enter an OpenAI or Anthropic API key")
     print("     [3] Skip           — continue without LLM (rule-based mode only)\n")
 
+    default_choice = "1" if local_models else "2"
     choice = ""
     while choice not in ("1", "2", "3"):
-        choice = input("   Enter choice [1/2/3]: ").strip()
+        choice = input(f"   Enter choice [1/2/3, default={default_choice}]: ").strip() or default_choice
 
     if choice == "1":
         config = _setup_ollama(config)
@@ -498,12 +614,34 @@ def _check_llm_and_prompt(config) -> object:
 
 
 def _setup_ollama(config) -> object:
-    """Configure the openai_compatible adapter to point at a local Ollama instance."""
-    default_url = "http://localhost:11434/v1"
-    url = input(f"   Ollama base URL [{default_url}]: ").strip() or default_url
+    """Configure the openai_compatible adapter to point at a local Ollama instance.
 
-    print("\n   Common Ollama models: llama3, mistral, gemma2, phi3, qwen2")
-    model = input("   Model name [llama3]: ").strip() or "llama3"
+    Tries to auto-detect a running Ollama at localhost:11434 and lists the
+    locally installed models so the user can pick one directly.
+    """
+    default_host = "http://localhost:11434"
+    default_url = f"{default_host}/v1"
+
+    installed = _detect_ollama_models(default_host)
+    if installed:
+        print(f"\n   Detected running Ollama at {default_host}. Installed models:")
+        for i, name in enumerate(installed, 1):
+            print(f"     [{i}] {name}")
+        print("     [c] Custom model name\n")
+        choice = input(f"   Pick a model [1-{len(installed)}/c, default=1]: ").strip() or "1"
+        if choice.isdigit() and 1 <= int(choice) <= len(installed):
+            model = installed[int(choice) - 1]
+        else:
+            model = input("   Model name: ").strip() or installed[0]
+        url = default_url
+    else:
+        print(
+            "\n   ⚠  Couldn't reach Ollama at localhost:11434. Is `ollama serve` running?\n"
+            "      You can still configure it manually — we'll save the config for later.\n"
+        )
+        url = input(f"   Ollama base URL [{default_url}]: ").strip() or default_url
+        print("\n   Common Ollama models: llama3, llama3.1, mistral, gemma2, qwen2.5")
+        model = input("   Model name [llama3.1]: ").strip() or "llama3.1"
 
     config.llm.default_provider = "openai_compatible"
     config.llm.providers["openai_compatible"] = {
@@ -599,72 +737,106 @@ def _daemonize() -> None:
     sys.stderr = open(os.devnull, "w")
 
 
+_EPILOG = """\
+command groups:
+  daemon lifecycle:  start, stop, status, ping
+  query/browse:      search, query, profile, report
+  manual runs:       triage, summarize, analyze, classify
+  ui:                dashboard
+
+examples:
+  agent-sys start                  # start the daemon (first run will prompt)
+  agent-sys start -d               # detach into background
+  agent-sys search "redis config"  # search indexed files semantically
+  agent-sys report daily           # generate today's report
+  agent-sys dashboard              # launch the web UI
+"""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agent-sys",
-        description="AgentOS — System-level Agent daemon that maps OS concepts to LLM agents",
+        description=(
+            "agent-sys — a long-running local agent daemon that indexes your "
+            "files and exposes an LLM-powered RPC surface to other agents."
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config", "-c", help="Path to config YAML file")
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(
+        dest="command",
+        metavar="{start,stop,status,ping,search,query,profile,report,"
+                "triage,summarize,analyze,classify,dashboard}",
+    )
 
-    # start
-    p_start = sub.add_parser("start", help="Start the SysAgent daemon")
+    # ── Daemon lifecycle ──
+    p_start = sub.add_parser(
+        "start",
+        help="Start the daemon (interactive on first run)",
+        description=(
+            "Start the agent-sys daemon. On first run you'll be asked which "
+            "directories to index and which LLM provider to use; later runs "
+            "reuse ~/.agent_sys/{scan,llm}_config.yaml without prompting."
+        ),
+    )
     p_start.add_argument("-d", "--daemon", action="store_true", help="Run as background daemon")
     p_start.add_argument(
         "-f", "--force", action="store_true",
-        help="Kill any existing agent-sys instance before starting (default: refuse to start)",
+        help="Terminate any existing agent-sys instance before starting",
     )
     p_start.set_defaults(func=cmd_start)
 
-    # stop
-    p_stop = sub.add_parser("stop", help="Stop the SysAgent daemon")
+    p_stop = sub.add_parser("stop", help="Stop the running daemon")
     p_stop.set_defaults(func=cmd_stop)
 
-    # status
-    p_status = sub.add_parser("status", help="Show system status")
+    p_status = sub.add_parser("status", help="Show kernel/scheduler/memory status")
     p_status.set_defaults(func=cmd_status)
 
-    # ping
-    p_ping = sub.add_parser("ping", help="Ping the daemon")
+    p_ping = sub.add_parser("ping", help="Check if the daemon is alive")
     p_ping.set_defaults(func=cmd_ping)
 
-    # search
-    p_search = sub.add_parser("search", help="Search indexed files")
+    # ── Query / browse ──
+    p_search = sub.add_parser(
+        "search", help="Search indexed files (vector + SQL fallback)",
+    )
     p_search.add_argument("query", help="Search query")
     p_search.add_argument("--type", "-t", help="Filter by file extension (e.g. .py)")
     p_search.set_defaults(func=cmd_search)
 
-    # query
-    p_query = sub.add_parser("query", help="Query knowledge base")
+    p_query = sub.add_parser("query", help="List entries in the knowledge base")
     p_query.add_argument("--category", "-cat", help="Filter by category")
     p_query.set_defaults(func=cmd_query)
 
-    # v0.2 smart agent commands
+    p_profile = sub.add_parser("profile", help="Show current user profile")
+    p_profile.set_defaults(func=cmd_profile)
+
     p_report = sub.add_parser("report", help="Generate or fetch a report")
     p_report.add_argument("type", choices=["daily", "project", "brief"], help="Report type")
     p_report.add_argument("--project-dir", help="Project directory (for project report)")
     p_report.set_defaults(func=cmd_report)
 
-    p_profile = sub.add_parser("profile", help="Show user profile")
-    p_profile.set_defaults(func=cmd_profile)
+    # ── Manual agent runs ──
+    p_triage = sub.add_parser("triage", help="Run file importance triage manually")
+    p_triage.add_argument("--batch-size", type=int, default=500, help="Files per triage batch")
+    p_triage.set_defaults(func=cmd_triage)
 
     p_summarize = sub.add_parser("summarize", help="Run LLM summarization on unsummarized files")
     p_summarize.add_argument("--batch-size", type=int, default=30, help="Number of files per batch")
     p_summarize.set_defaults(func=cmd_summarize)
 
-    p_analyze = sub.add_parser("analyze", help="Run behavior analysis")
+    p_analyze = sub.add_parser("analyze", help="Run behavior analysis manually")
     p_analyze.add_argument("--hours", type=float, default=168, help="Hours of history to analyze")
     p_analyze.set_defaults(func=cmd_analyze)
 
-    p_classify = sub.add_parser("classify", help="Run file priority classification")
+    p_classify = sub.add_parser("classify", help="Recompute file priority (hot/warm/cold)")
     p_classify.set_defaults(func=cmd_classify)
 
-    p_triage = sub.add_parser("triage", help="Run LLM-based file importance triage")
-    p_triage.add_argument("--batch-size", type=int, default=500, help="Files per triage batch")
-    p_triage.set_defaults(func=cmd_triage)
-
-    p_dashboard = sub.add_parser("dashboard", help="Launch web dashboard for visual debugging")
-    p_dashboard.add_argument("--port", "-p", type=int, default=7438, help="Dashboard port (default 7438)")
+    # ── UI ──
+    p_dashboard = sub.add_parser("dashboard", help="Launch the web dashboard")
+    p_dashboard.add_argument(
+        "--port", "-p", type=int, default=7438, help="Dashboard port (default 7438)",
+    )
     p_dashboard.set_defaults(func=cmd_dashboard)
 
     args = parser.parse_args()

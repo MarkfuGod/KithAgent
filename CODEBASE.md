@@ -1,7 +1,24 @@
-# AgentOS — Complete Codebase Reference
+# agent-sys — Complete Codebase Reference
 
-> A system-level agent daemon that maps traditional OS architecture to an LLM-Agent runtime.
-> Version 0.2.0 | Python 3.11+ | MIT License
+> A long-running local agent daemon that indexes the user's files and
+> exposes an LLM-powered RPC surface to external agents.
+> Version 0.7.0 | Python 3.11+ | MIT License
+
+> **A note on the OS vocabulary.** The code uses OS-flavoured names
+> (`Kernel`, `Scheduler`, `Syscall`, `Cron`, `Memory`) as a design
+> narrative, because the subsystems happen to line up neatly with that
+> mental model. Under the hood they are ordinary building blocks:
+>
+> - `AgentScheduler` is a priority task queue with a semaphore.
+> - `SyscallServer` is an RPC server (Unix socket + HTTP; for most
+>   external integrations HTTP is the easier surface).
+> - `CronScheduler` is an LLM-driven policy engine with a rule-based
+>   fallback, not a `crontab`.
+> - `MemoryStore` is an LRU cache over a SQLite DB.
+>
+> Don't read the metaphor as a hard architectural constraint — if we
+> ever need to run across hosts or inside Kubernetes, these names will
+> be the first thing to go.
 
 ---
 
@@ -27,18 +44,19 @@
 
 ## Architecture Overview
 
-AgentOS maps traditional operating system concepts onto an LLM-agent architecture:
+The subsystems and the OS concept they echo (in parentheses, as a
+reading aid — not an API contract):
 
-| Traditional OS | AgentOS Equivalent | Module |
+| Module | What it actually is | OS analogue |
 |---|---|---|
-| Kernel / init | `SysAgentKernel` | `src/kernel/daemon.py` |
-| Thread | `AgentTask` | `src/agents/base.py` |
-| Process Scheduler | `AgentScheduler` | `src/scheduler/pool.py` |
-| VFS / Filesystem | `FileSystemWatcher` | `src/filesystem/watcher.py` |
-| RAM + Disk | `MemoryStore` (LRU + SQLite) | `src/memory/store.py` |
-| System Calls | `SyscallServer` (Unix socket + HTTP) | `src/syscall/server.py` |
-| Cron | `CronScheduler` (LLM-adaptive) | `src/kernel/cron.py` |
-| Event Bus / dmesg | `EventBus` (pub/sub + ring buffer) | `src/kernel/event_bus.py` |
+| `SysAgentKernel` (`src/kernel/daemon.py`) | Orchestrator / entry point | Kernel / init |
+| `AgentTask` (`src/agents/base.py`) | The unit of work fed to the scheduler | Thread |
+| `AgentScheduler` (`src/scheduler/pool.py`) | Priority task queue + semaphore | Process scheduler |
+| `FileSystemWatcher` (`src/filesystem/watcher.py`) | `watchdog`-based fs observer + bulk scanner | VFS |
+| `MemoryStore` (`src/memory/store.py`) | LRU cache over SQLite | RAM + disk |
+| `SyscallServer` (`src/syscall/server.py`) | RPC server (Unix socket + HTTP) | System calls |
+| `CronScheduler` (`src/kernel/cron.py`) | LLM-driven policy engine + rule-based fallback | Cron |
+| `EventBus` (`src/kernel/event_bus.py`) | In-proc pub/sub + ring buffer | dmesg |
 
 ```
 External Agents (Cursor / Claude Code / OpenClaw)
@@ -56,7 +74,7 @@ External Agents (Cursor / Claude Code / OpenClaw)
 │   Scheduler ← CronScheduler ← SyscallServer     │
 │       │                                          │
 │  ┌────▼──────────────────────────────────────┐   │
-│  │         Smart Agent Pool (12 agents)      │   │
+│  │         Smart Agent Pool (15 agents)      │   │
 │  │  Triage · Summarizer · Analyzer           │   │
 │  │  Reporter · ProfileBuilder · Prioritizer  │   │
 │  │  FileSearch · FileRead · FileList         │   │
@@ -117,7 +135,7 @@ agent_sys/
 │   ├── agents/
 │   │   ├── __init__.py
 │   │   ├── base.py               # AgentState, AgentTask, BaseAgent ABC
-│   │   ├── builtin.py            # 14 built-in agents + BUILTIN_AGENTS registry
+│   │   ├── builtin.py            # 15 built-in agents + BUILTIN_AGENTS registry
 │   │   ├── triage.py             # TriageAgent — LLM file importance classification
 │   │   ├── summarizer.py         # SummarizerAgent — multimodal file summaries
 │   │   ├── analyzer.py           # BehaviorAnalyzerAgent — holistic user analysis
@@ -159,7 +177,7 @@ kernel:
 
 #### Filesystem
 
-Watches the entire home directory with extensive ignore patterns. Indexes 28 file extensions covering code, documents, images, and data formats.
+Watches a user-chosen set of directories (defaults to `~/Documents` and `~/Desktop`; the full home directory is available as an opt-in via the first-run wizard or by editing `config/default.yaml`). Indexes 28 file extensions covering code, documents, images, and data formats; skip patterns from `config/default.yaml` filter out third-party source trees (`site-packages/`, `node_modules/`, etc.) before anything reaches the LLM.
 
 Two kinds of ignore:
 - `ignore_patterns` — matches single directory/file **names** via `fnmatch` (e.g. `node_modules` matches any directory anywhere named `node_modules`)
@@ -424,7 +442,7 @@ Dual scheduling model combining predictable triggers with intelligent adaptation
 
 ### `src/agents/builtin.py` — Built-in Agents Registry
 
-14 agents registered in `BUILTIN_AGENTS` list:
+15 agents registered in `BUILTIN_AGENTS` list:
 
 **v0.1 — Rule-based (no LLM):**
 | Agent | Name | Purpose |

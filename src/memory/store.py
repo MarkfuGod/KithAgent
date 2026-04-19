@@ -202,8 +202,13 @@ class MemoryStore:
                             results = [r for r in results if r.get("file_type") == file_type]
                         if results:
                             return results
-            except Exception:
-                pass
+            except Exception as e:
+                # Vector search is best-effort — fall through to SQL LIKE
+                # but log so operators can diagnose silent search degradation.
+                logger.warning(
+                    "Vector search failed, falling back to SQL LIKE (query=%r): %s",
+                    query[:60], e,
+                )
 
         sql = """SELECT path, file_type, summary, size_bytes, priority,
                         COALESCE(semantic_summary, '') as semantic_summary
@@ -225,9 +230,14 @@ class MemoryStore:
     async def get_files_needing_summary(self, limit: int = 50) -> list[dict]:
         """Return files that need summarization, prioritized by triage importance.
 
-        Order: triage_status='high' first, then 'medium', then untriaged.
-        Files marked 'skip' or 'low' are excluded.
-        Within each tier, diversify across code/doc/image categories.
+        Order:
+          1. triage_status='high' (most important)
+          2. triage_status='medium'
+          3. untriaged ('' / NULL only — NOT 'unknown', those are
+             intentionally parked until an LLM becomes available)
+        Files marked 'skip', 'low', or 'unknown' are excluded entirely.
+        Within each tier, we diversify across code / doc / image categories
+        so a single huge code tree doesn't starve documents and images.
         """
         assert self._db
 
@@ -240,8 +250,7 @@ class MemoryStore:
         doc_limit = max(limit // 4, 1)
         img_limit = max(limit // 4, 1)
 
-        # triage_rank: 'high'=0, 'medium'=1, untriaged=2 (skip/low excluded)
-        triage_filter = "AND triage_status NOT IN ('skip', 'low')"
+        triage_filter = "AND triage_status NOT IN ('skip', 'low', 'unknown')"
         triage_order = """CASE triage_status
             WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2
         END"""
@@ -254,7 +263,8 @@ class MemoryStore:
         ]:
             ext_list = ",".join(ext_group)
             rows = self._db.execute(
-                f"""SELECT path, hash, file_type, size_bytes, summary, modified_at
+                f"""SELECT path, hash, file_type, size_bytes, summary, modified_at,
+                           triage_status
                     FROM file_index
                     WHERE (semantic_summary = '' OR semantic_summary IS NULL)
                       AND file_type IN ({ext_list})
@@ -265,11 +275,17 @@ class MemoryStore:
             ).fetchall()
             results.extend(rows)
 
-        results.sort(key=lambda r: (r[3] or 0), reverse=True)
+        # Preserve the triage-aware order from SQL (was previously clobbered
+        # by a Python-side `sort(key=size_bytes, reverse=True)` that made
+        # large-untriaged files cut in front of small high-priority ones).
+        # We do want a stable tier ordering across ext groups, so re-sort
+        # by the SQL triage_rank only.
+        _rank = {"high": 0, "medium": 1}
+        results.sort(key=lambda r: (_rank.get(r[6], 2), -(r[5] or 0)))
 
         return [
             {"path": r[0], "hash": r[1], "file_type": r[2], "size_bytes": r[3],
-             "summary": r[4], "modified_at": r[5]}
+             "summary": r[4], "modified_at": r[5], "triage_status": r[6]}
             for r in results[:limit]
         ]
 
@@ -293,13 +309,21 @@ class MemoryStore:
 
     async def batch_update_embeddings(self, updates: list[tuple[str, bytes, str]]) -> None:
         """Bulk update embeddings: [(path, embedding_bytes, model_name), ...]"""
-        async with self._lock:
-            assert self._db
-            self._db.executemany(
+        if not updates:
+            return
+        db = self._db
+        assert db
+        payload = [(emb, model, path) for path, emb, model in updates]
+
+        def _run() -> None:
+            db.executemany(
                 "UPDATE file_index SET embedding = ?, embedding_model = ? WHERE path = ?",
-                [(emb, model, path) for path, emb, model in updates],
+                payload,
             )
-            self._db.commit()
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
 
     async def get_files_needing_embedding(self, limit: int = 200) -> list[dict]:
         """Return files that have summaries but no embeddings yet (high/medium triage only)."""
@@ -319,33 +343,87 @@ class MemoryStore:
         return [{"path": r[0], "semantic_summary": r[1]} for r in rows]
 
     async def vector_search(self, query_embedding: bytes, limit: int = 20) -> list[dict]:
-        """Find files by cosine similarity to query embedding."""
+        """Find files by cosine similarity to the query embedding.
+
+        Runs the DB read + numerical compute in a worker thread so we
+        don't block the event loop. Uses numpy for a single batched
+        dot product when available, falling back to a per-row loop
+        using embeddings.cosine_similarity otherwise.
+        """
         assert self._db
-        from src.memory.embeddings import cosine_similarity
+        db = self._db
 
-        rows = self._db.execute(
-            """SELECT path, file_type, semantic_summary, size_bytes, priority, embedding
-               FROM file_index
-               WHERE embedding IS NOT NULL AND embedding != ''"""
-        ).fetchall()
+        def _do_search() -> list[dict]:
+            rows = db.execute(
+                """SELECT path, file_type, semantic_summary, size_bytes, priority, embedding
+                   FROM file_index
+                   WHERE embedding IS NOT NULL AND length(embedding) > 0"""
+            ).fetchall()
+            if not rows:
+                return []
 
-        scored = []
-        for r in rows:
             try:
-                score = cosine_similarity(query_embedding, r[5])
-                scored.append((score, r))
-            except Exception:
-                continue
+                import numpy as np
+                q = np.frombuffer(query_embedding, dtype=np.float32)
+                q_norm = float(np.linalg.norm(q)) + 1e-9
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+                paths, ftypes, summaries, sizes, prios, scores = [], [], [], [], [], []
+                # Process in chunks so a single giant matrix doesn't blow memory
+                chunk_size = 4096
+                for start in range(0, len(rows), chunk_size):
+                    chunk = rows[start:start + chunk_size]
+                    try:
+                        mat = np.stack([
+                            np.frombuffer(r[5], dtype=np.float32) for r in chunk
+                        ])
+                    except ValueError:
+                        # Mismatched dimensions across rows — fall back to per-row
+                        from src.memory.embeddings import cosine_similarity as _cs
+                        for r in chunk:
+                            try:
+                                s = _cs(query_embedding, r[5])
+                            except Exception:
+                                continue
+                            paths.append(r[0]); ftypes.append(r[1])
+                            summaries.append(r[2]); sizes.append(r[3])
+                            prios.append(r[4]); scores.append(float(s))
+                        continue
+                    norms = np.linalg.norm(mat, axis=1) + 1e-9
+                    sims = (mat @ q) / (norms * q_norm)
+                    for r, s in zip(chunk, sims):
+                        paths.append(r[0]); ftypes.append(r[1])
+                        summaries.append(r[2]); sizes.append(r[3])
+                        prios.append(r[4]); scores.append(float(s))
 
-        return [
-            {
-                "path": r[0], "file_type": r[1], "semantic_summary": r[2],
-                "size_bytes": r[3], "priority": r[4], "score": round(score, 4),
-            }
-            for score, r in scored[:limit]
-        ]
+                idx_sorted = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:limit]
+                return [
+                    {
+                        "path": paths[i], "file_type": ftypes[i],
+                        "semantic_summary": summaries[i], "size_bytes": sizes[i],
+                        "priority": prios[i], "score": round(scores[i], 4),
+                    }
+                    for i in idx_sorted
+                ]
+            except ImportError:
+                # numpy not installed — fall back to per-row Python loop.
+                from src.memory.embeddings import cosine_similarity
+                scored = []
+                for r in rows:
+                    try:
+                        score = cosine_similarity(query_embedding, r[5])
+                        scored.append((score, r))
+                    except Exception:
+                        continue
+                scored.sort(key=lambda x: x[0], reverse=True)
+                return [
+                    {
+                        "path": r[0], "file_type": r[1], "semantic_summary": r[2],
+                        "size_bytes": r[3], "priority": r[4], "score": round(score, 4),
+                    }
+                    for score, r in scored[:limit]
+                ]
+
+        return await asyncio.to_thread(_do_search)
 
     async def update_file_priority(self, path: str, priority: int) -> None:
         async with self._lock:
@@ -358,13 +436,21 @@ class MemoryStore:
 
     async def batch_update_priorities(self, updates: list[tuple[str, int]]) -> None:
         """Bulk update priorities: [(path, priority), ...]"""
-        async with self._lock:
-            assert self._db
-            self._db.executemany(
+        if not updates:
+            return
+        db = self._db
+        assert db
+        payload = [(p, path) for path, p in updates]
+
+        def _run() -> None:
+            db.executemany(
                 "UPDATE file_index SET priority = ? WHERE path = ?",
-                [(p, path) for path, p in updates],
+                payload,
             )
-            self._db.commit()
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
 
     async def get_file_modification_stats(self) -> list[dict]:
         """Aggregate file modification data for behavior analysis."""
@@ -626,25 +712,117 @@ class MemoryStore:
 
     async def batch_update_triage(self, updates: list[tuple[str, str]]) -> None:
         """Bulk update triage status: [(path, status), ...]"""
-        async with self._lock:
-            assert self._db
-            self._db.executemany(
+        if not updates:
+            return
+        db = self._db
+        assert db
+        payload = [(status, path) for path, status in updates]
+
+        def _run() -> None:
+            db.executemany(
                 "UPDATE file_index SET triage_status = ? WHERE path = ?",
-                [(status, path) for path, status in updates],
+                payload,
             )
-            self._db.commit()
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
 
     async def batch_update_triage_by_prefix(self, prefix: str, status: str) -> int:
         """Mark all files under a directory prefix with the given triage status.
         Returns the number of rows affected."""
-        async with self._lock:
-            assert self._db
-            cursor = self._db.execute(
-                "UPDATE file_index SET triage_status = ? WHERE path LIKE ? AND (triage_status = '' OR triage_status IS NULL)",
+        db = self._db
+        assert db
+
+        def _run() -> int:
+            cursor = db.execute(
+                "UPDATE file_index SET triage_status = ? WHERE path LIKE ? "
+                "AND (triage_status = '' OR triage_status IS NULL)",
                 (status, f"{prefix}%"),
             )
-            self._db.commit()
-            return cursor.rowcount
+            db.commit()
+            return cursor.rowcount or 0
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
+    async def park_remaining_as_unknown(self) -> int:
+        """Mark every still-untriaged row as 'unknown' so downstream
+        agents don't keep re-queueing them when no LLM is available.
+        Returns the number of rows changed."""
+        db = self._db
+        assert db
+
+        def _run() -> int:
+            cursor = db.execute(
+                "UPDATE file_index SET triage_status = 'unknown' "
+                "WHERE (triage_status = '' OR triage_status IS NULL)"
+            )
+            db.commit()
+            return cursor.rowcount or 0
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
+    async def reopen_unknown(self) -> int:
+        """Reset 'unknown'-parked rows back to untriaged so a fresh
+        LLM-powered triage run reclassifies them."""
+        db = self._db
+        assert db
+
+        def _run() -> int:
+            cursor = db.execute(
+                "UPDATE file_index SET triage_status = '' WHERE triage_status = 'unknown'"
+            )
+            db.commit()
+            return cursor.rowcount or 0
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
+    async def prune_out_of_scope(self, watch_paths: list[str]) -> int:
+        """Mark rows whose path is outside any of `watch_paths` as 'skip'.
+
+        Meant for startup hygiene: if the user narrows their scan scope
+        (e.g. from ~/ down to ~/Documents + ~/Desktop), file_index still
+        contains 100k+ rows from the old scan — downstream agents would
+        happily keep summarizing them. This flips them to 'skip' so the
+        summarizer/triage queries skip them without needing a full wipe.
+
+        Rows already marked 'skip' are left alone. Returns the count of
+        rows changed.
+        """
+        expanded: list[str] = []
+        for p in watch_paths or []:
+            if not p:
+                continue
+            try:
+                expanded.append(str(Path(p).expanduser().resolve()))
+            except Exception:
+                continue
+        if not expanded:
+            return 0
+
+        db = self._db
+        assert db
+
+        def _run() -> int:
+            where_out = " AND ".join(["path NOT LIKE ?"] * len(expanded))
+            params = [f"{p}%" for p in expanded]
+            cursor = db.execute(
+                f"UPDATE file_index SET triage_status = 'skip' "
+                f"WHERE (triage_status IS NULL OR triage_status != 'skip') "
+                f"AND ({where_out})",
+                params,
+            )
+            db.commit()
+            return cursor.rowcount or 0
+
+        async with self._lock:
+            changed = await asyncio.to_thread(_run)
+            if changed:
+                self._cache.clear()
+            return changed
 
     async def remove_file(self, path: str) -> None:
         async with self._lock:
@@ -656,9 +834,24 @@ class MemoryStore:
     # ── Knowledge operations ──────────────────────────────────
 
     async def store_knowledge(
-        self, kid: str, category: str, content: str,
-        source_path: str = "", metadata: dict | None = None,
+        self,
+        knowledge_id: str | None = None,
+        category: str = "",
+        content: str = "",
+        source_path: str = "",
+        metadata: dict | None = None,
+        *,
+        kid: str | None = None,  # deprecated alias, kept for internal back-compat
     ) -> None:
+        """Persist a knowledge entry.
+
+        `knowledge_id` is the primary key. The old parameter name `kid`
+        is still accepted as a keyword for a deprecation window.
+        """
+        if knowledge_id is None:
+            knowledge_id = kid
+        if knowledge_id is None:
+            raise TypeError("store_knowledge requires 'knowledge_id'")
         async with self._lock:
             now = time.time()
             assert self._db
@@ -666,7 +859,7 @@ class MemoryStore:
                 """INSERT OR REPLACE INTO knowledge
                    (id, category, content, source_path, created_at, updated_at, metadata)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (kid, category, content, source_path, now, now, json.dumps(metadata or {})),
+                (knowledge_id, category, content, source_path, now, now, json.dumps(metadata or {})),
             )
             self._db.commit()
 
