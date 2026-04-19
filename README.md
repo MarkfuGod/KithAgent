@@ -1,13 +1,16 @@
 # agent-sys
 
+*codename: **Kith / 契***  
+— a quiet familiar your agents can lean on · 一个熟稔到懂你的后台守护
+
 **Languages / 语言:** [English](#english) · [中文](#chinese)
 
 > **Status: under active development / 正在积极开发中.**
-> Feedback, bug reports and ideas welcome on [GitHub Issues](https://github.com/MarkfuGod/KernelAgent/issues) —— 欢迎到 [Issues](https://github.com/MarkfuGod/KernelAgent/issues) 反馈。APIs / config / CLI may keep changing until 1.0；API、配置、CLI 在 1.0 前都可能继续变化。
+> Feedback, bug reports and ideas welcome on [GitHub Issues](https://github.com/MarkfuGod/KithAgent/issues) —— 欢迎到 [Issues](https://github.com/MarkfuGod/KithAgent/issues) 反馈。APIs / config / CLI may keep changing until 1.0；API、配置、CLI 在 1.0 前都可能继续变化。
 
 ---
 
-<a id="english"></a>
+
 
 ## English
 
@@ -18,8 +21,6 @@
 agent-sys runs in the background, continuously indexing directories you choose (defaults are `~/Documents` and `~/Desktop`; the first launch lets you confirm / edit), uses LLMs to tag, summarize, and extract knowledge from each file, and exposes a query API over Unix socket / HTTP.
 
 When you're using an agent tool like Cursor or Claude Code, it can call agent-sys to get context about your local files and working habits — no need to re-scan from scratch every session.
-
-> The modules below use OS-flavoured names (Kernel / Scheduler / Syscall / Cron / Memory) purely as a design narrative. Under the hood it's ordinary stuff — a task queue, an RPC server, a SQLite store, and an LLM router. Don't read the metaphor as a hard architectural constraint.
 
 ### Architecture at a glance
 
@@ -60,21 +61,25 @@ flowchart TB
     web["Web Dashboard<br/>http://127.0.0.1:7438"] -->|read-only| db
 ```
 
-| Module | What it actually is | OS analogue |
-|---|---|---|
-| `SysAgentKernel` | Daemon entry point, manages subsystem lifecycle | Kernel / init |
-| `AgentTask` | Smallest unit of work the scheduler consumes | Thread |
-| `AgentScheduler` | Priority queue + semaphore + per-task timeout | Process scheduler |
-| `FileSystemWatcher` | `os.walk` bulk scan + `watchdog` incremental | VFS |
-| `MemoryStore` | LRU hot cache + SQLite cold store | RAM / disk |
-| `SyscallServer` | Unix socket / HTTP RPC (19 endpoints; HTTP is easier for external agents) | Syscalls |
-| `CronScheduler` | LLM-driven policy engine with rule-based fallback | Cron |
+
+
+
+| Module              | What it actually is                                                       | OS analogue       |
+| ------------------- | ------------------------------------------------------------------------- | ----------------- |
+| `SysAgentKernel`    | Daemon entry point, manages subsystem lifecycle                           | Kernel / init     |
+| `AgentTask`         | Smallest unit of work the scheduler consumes                              | Thread            |
+| `AgentScheduler`    | Priority queue + semaphore + per-task timeout                             | Process scheduler |
+| `FileSystemWatcher` | `os.walk` bulk scan + `watchdog` incremental                              | VFS               |
+| `MemoryStore`       | LRU hot cache + SQLite cold store                                         | RAM / disk        |
+| `SyscallServer`     | Unix socket / HTTP RPC (19 endpoints; HTTP is easier for external agents) | Syscalls          |
+| `CronScheduler`     | LLM-driven policy engine with rule-based fallback                         | Cron              |
+
 
 ### Quick start
 
 ```bash
 # Clone & install
-git clone https://github.com/MarkfuGod/KernelAgent.git agent_sys
+git clone https://github.com/MarkfuGod/KithAgent.git agent_sys
 cd agent_sys
 pip install -e ".[full]"
 
@@ -98,11 +103,13 @@ The repo root has a `skills/` folder with three skills; each is a single `SKILL.
 
 The three skills:
 
-| Skill | When it triggers | Syscalls it uses |
-|---|---|---|
+
+| Skill                    | When it triggers                                                                   | Syscalls it uses                                    |
+| ------------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
 | `agent-sys-user-context` | "based on what you know about me", "what have I been working on", "do you know me" | `report.brief` / `profile.get` / `analyze.behavior` |
-| `agent-sys-file-search` | "find the notes I wrote about X", "look across my disk for Y" | `file.search` / `file.read` / `knowledge.query` |
-| `agent-sys-admin` | "is the daemon up", "re-run triage manually", "switch models" | `agent-sys` CLI + `/status` |
+| `agent-sys-file-search`  | "find the notes I wrote about X", "look across my disk for Y"                      | `file.search` / `file.read` / `knowledge.query`     |
+| `agent-sys-admin`        | "is the daemon up", "re-run triage manually", "switch models"                      | `agent-sys` CLI + `/status`                         |
+
 
 #### Cursor
 
@@ -320,12 +327,14 @@ curl -X POST http://127.0.0.1:7437/syscall \
 
 Four provider types are supported:
 
-| Provider | Purpose | Config |
-|---|---|---|
-| `openai` | OpenAI official API | `OPENAI_API_KEY` |
-| `claude` | Anthropic Claude API | `ANTHROPIC_API_KEY` |
-| `anthropic_compatible` | Anthropic-compatible API (e.g. MiniMax) | `ANTHROPIC_API_KEY` + `base_url` |
-| `compatible` | OpenAI-compatible API (DeepSeek / Ollama / Qwen / etc.) | `COMPATIBLE_API_KEY` + `base_url` |
+
+| Provider               | Purpose                                                 | Config                            |
+| ---------------------- | ------------------------------------------------------- | --------------------------------- |
+| `openai`               | OpenAI official API                                     | `OPENAI_API_KEY`                  |
+| `claude`               | Anthropic Claude API                                    | `ANTHROPIC_API_KEY`               |
+| `anthropic_compatible` | Anthropic-compatible API (e.g. MiniMax)                 | `ANTHROPIC_API_KEY` + `base_url`  |
+| `compatible`           | OpenAI-compatible API (DeepSeek / Ollama / Qwen / etc.) | `COMPATIBLE_API_KEY` + `base_url` |
+
 
 Pick any of:
 
@@ -420,14 +429,14 @@ Not a replacement for the operating system — an **agent-native runtime layer**
 
 This project is under active development. Issues, bug reports, and pull requests are all welcome:
 
-- Issues: <https://github.com/MarkfuGod/KernelAgent/issues>
-- Repo: <https://github.com/MarkfuGod/KernelAgent>
+- Issues: [https://github.com/MarkfuGod/KithAgent/issues](https://github.com/MarkfuGod/KithAgent/issues)
+- Repo: [https://github.com/MarkfuGod/KithAgent](https://github.com/MarkfuGod/KithAgent)
 
 [↑ back to top](#agent-sys) · [switch to 中文 ↓](#chinese)
 
 ---
 
-<a id="chinese"></a>
+
 
 ## 中文
 
@@ -439,7 +448,7 @@ agent-sys 在后台持续索引你选择的目录（默认 `~/Documents` 和 `~/
 
 当你用 Cursor、Claude Code 这类 Agent 工具时，它们可以直接调用 agent-sys，拿到关于你本地文件和工作习惯的上下文，而不必每次从零开始扫。
 
-> 下面的模块/概念沿用了一些 OS 风格的命名（Kernel / Scheduler / Syscall / Cron / Memory），只是叙事方便——底层是再普通不过的"任务队列 + RPC + SQLite + LLM 路由"。不要把这套比喻当成硬约束。
+
 
 ### 模块速览
 
@@ -480,21 +489,25 @@ flowchart TB
     web["Web Dashboard<br/>http://127.0.0.1:7438"] -->|只读| db
 ```
 
-| 模块 | 实际是什么 | OS 比喻 |
-|---|---|---|
-| `SysAgentKernel` | 守护进程主入口，负责子系统生命周期 | Kernel / init |
-| `AgentTask` | 调度器吃的最小工作单元 | Thread |
-| `AgentScheduler` | 优先级队列 + semaphore + per-task timeout | 进程调度器 |
-| `FileSystemWatcher` | `os.walk` 首次扫描 + `watchdog` 监听增量 | VFS |
-| `MemoryStore` | LRU 热缓存 + SQLite 冷存储 | 内存/磁盘 |
-| `SyscallServer` | Unix Socket / HTTP RPC（19 个端点，外部 agent 通常用 HTTP 更方便） | 系统调用 |
-| `CronScheduler` | LLM 驱动的策略引擎 + 规则 fallback，决定"何时跑哪个 agent" | Cron |
+
+
+
+| 模块                  | 实际是什么                                                | OS 比喻         |
+| ------------------- | ---------------------------------------------------- | ------------- |
+| `SysAgentKernel`    | 守护进程主入口，负责子系统生命周期                                    | Kernel / init |
+| `AgentTask`         | 调度器吃的最小工作单元                                          | Thread        |
+| `AgentScheduler`    | 优先级队列 + semaphore + per-task timeout                 | 进程调度器         |
+| `FileSystemWatcher` | `os.walk` 首次扫描 + `watchdog` 监听增量                     | VFS           |
+| `MemoryStore`       | LRU 热缓存 + SQLite 冷存储                                 | 内存/磁盘         |
+| `SyscallServer`     | Unix Socket / HTTP RPC（19 个端点，外部 agent 通常用 HTTP 更方便） | 系统调用          |
+| `CronScheduler`     | LLM 驱动的策略引擎 + 规则 fallback，决定"何时跑哪个 agent"            | Cron          |
+
 
 ### 快速开始
 
 ```bash
 # 克隆 & 安装
-git clone https://github.com/MarkfuGod/KernelAgent.git agent_sys
+git clone https://github.com/MarkfuGod/KithAgent.git agent_sys
 cd agent_sys
 pip install -e ".[full]"
 
@@ -518,11 +531,13 @@ agent-sys start --force  # → 显式覆盖，SIGTERM 旧进程后启动新的
 
 三个 skill 的分工：
 
-| Skill | 触发场景 | 调用的 syscall |
-|---|---|---|
-| `agent-sys-user-context` | "根据我的情况"/"最近我在做什么"/"你了解我吗" | `report.brief` / `profile.get` / `analyze.behavior` |
-| `agent-sys-file-search` | "找我之前写过的 X"/"硬盘里关于 Y 的笔记" | `file.search` / `file.read` / `knowledge.query` |
-| `agent-sys-admin` | "daemon 挂了吗"/"手动跑一次 triage"/"换模型" | `agent-sys` CLI + `/status` |
+
+| Skill                    | 触发场景                              | 调用的 syscall                                         |
+| ------------------------ | --------------------------------- | --------------------------------------------------- |
+| `agent-sys-user-context` | "根据我的情况"/"最近我在做什么"/"你了解我吗"        | `report.brief` / `profile.get` / `analyze.behavior` |
+| `agent-sys-file-search`  | "找我之前写过的 X"/"硬盘里关于 Y 的笔记"         | `file.search` / `file.read` / `knowledge.query`     |
+| `agent-sys-admin`        | "daemon 挂了吗"/"手动跑一次 triage"/"换模型" | `agent-sys` CLI + `/status`                         |
+
 
 #### Cursor
 
@@ -741,12 +756,14 @@ curl -X POST http://127.0.0.1:7437/syscall \
 
 支持 4 种 provider 类型：
 
-| Provider | 说明 | 配置 |
-|---|---|---|
-| `openai` | OpenAI 官方 API | `OPENAI_API_KEY` |
-| `claude` | Anthropic Claude API | `ANTHROPIC_API_KEY` |
-| `anthropic_compatible` | Anthropic 兼容 API（MiniMax 等） | `ANTHROPIC_API_KEY` + `base_url` |
-| `compatible` | OpenAI 兼容 API（DeepSeek、Ollama、通义千问等） | `COMPATIBLE_API_KEY` + `base_url` |
+
+| Provider               | 说明                                   | 配置                                |
+| ---------------------- | ------------------------------------ | --------------------------------- |
+| `openai`               | OpenAI 官方 API                        | `OPENAI_API_KEY`                  |
+| `claude`               | Anthropic Claude API                 | `ANTHROPIC_API_KEY`               |
+| `anthropic_compatible` | Anthropic 兼容 API（MiniMax 等）          | `ANTHROPIC_API_KEY` + `base_url`  |
+| `compatible`           | OpenAI 兼容 API（DeepSeek、Ollama、通义千问等） | `COMPATIBLE_API_KEY` + `base_url` |
+
 
 配置方式（任选其一）：
 
@@ -841,7 +858,7 @@ agent_sys/
 
 项目正在积极开发中，欢迎提 issue / PR：
 
-- Issues: <https://github.com/MarkfuGod/KernelAgent/issues>
-- 仓库地址: <https://github.com/MarkfuGod/KernelAgent>
+- Issues: [https://github.com/MarkfuGod/KithAgent/issues](https://github.com/MarkfuGod/KithAgent/issues)
+- 仓库地址: [https://github.com/MarkfuGod/KithAgent](https://github.com/MarkfuGod/KithAgent)
 
 [↑ 回到顶部](#agent-sys) · [switch to English ↑](#english)
