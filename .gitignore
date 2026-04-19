@@ -35,6 +35,7 @@ CODEBASE.md
 CONVERSATION_SUMMARY.md
 ROUND_DIALOG_SUMMARY_*.md
 tests/
+docs/
 
 # Test / coverage
 .pytest_cache/
