@@ -298,6 +298,70 @@ agent-sys stop                      # 停止 daemon
 - Adaptive cron 支持 `stages` 格式：阶段间串行，阶段内 agent 并行（DAG 调度）
 - LLM 调度器 prompt 更新：可输出 stages 表达依赖（triage → [summarizer + analyzer]）
 
+### v0.6（第七轮）— 使命驱动的分诊 + 配置化过滤
+
+核心洞察：**过滤和优先级是两件事**。过滤决定"哪些根本不看"，优先级决定"先看谁"。前者靠规则，后者必须结合系统使命 + 用户意愿 + LLM 语义判断。之前的 triage 把这两层混在一起，导致 `.cursor/extensions/` 下的插件源码依然被 LLM 分析浪费 token，而且所有文件按 `modified_at DESC` 一视同仁，完全没有"txt 可能不重要"这种用户偏好的表达入口。
+
+#### 1. `ignore_subpaths` — 路径级黑名单
+
+- `FilesystemConfig` 新增 `ignore_subpaths` 字段：支持 `.cursor/extensions` 这类带斜杠的路径模式
+- `_should_ignore_dir` / `_should_ignore` 同时检查 `ignore_patterns`（单目录名）和 `ignore_subpaths`（子路径）
+- 默认配置加入：`.cursor/extensions`、`.vscode/extensions`、`.cursor-server`、`go/pkg`、`.gradle/caches`、`.m2/repository`
+- 修好了 `.cursor` 目录白名单过宽的 bug（之前为了保留 rules 放行了整个 `.cursor`，导致 `extensions` 下几千个第三方文件也被索引）
+
+#### 2. `TriageConfig` — 使命感 + 用户意愿可配置
+
+- 新增 `config/default.yaml` 的 `triage:` 块，三类配置：
+  - `skip_path_patterns` — 硬过滤路径模式（rule-based，零 LLM 成本），替换之前硬编码在 `triage.py` 里的列表
+  - `file_type_priority` — 文件扩展名 → 1~10 优先级。`.md=9 .docx=9 .py=7 .txt=3 .csv=2` 等，用户可随意调
+  - `hints` — 自然语言偏好列表，注入到 LLM triage prompt
+- `TriageConfig` dataclass 新增到 `config.py`，随 kernel config 一起加载
+
+#### 3. 三层防线重构
+
+过去的数据流是两层混乱：
+```
+config.ignore_patterns → watcher（放行 .cursor） → triage._rule_based_pass（硬编码 skip）→ LLM
+```
+
+现在是三层职责清晰：
+```
+config.ignore_patterns + ignore_subpaths → watcher（精确过滤）
+                 ↓
+           file_index（干净的）
+                 ↓
+config.triage.skip_path_patterns → triage.rule_based_pass（配置化 skip）
+                 ↓
+config.triage.file_type_priority → store.get_untriaged_files（加权排序）
+                 ↓
+config.triage.hints + MISSION → LLM triage（使命感驱动判断）
+```
+
+#### 4. `get_untriaged_files` 支持加权排序
+
+- `store.py` 的 `get_untriaged_files(type_priority=...)` 接受扩展名优先级字典
+- 动态构建 SQL `CASE file_type WHEN '.md' THEN 9 ... ELSE 5 END` 作为主排序键，`modified_at DESC` 作为次排序键
+- 扩展名校验防注入（只允许 `. + alnum/._-`，长度 ≤ 12）
+- 未传 `type_priority` 时回退到纯 recency 行为，保持向后兼容
+- 验证：3 个文件（.txt 最新、.md 最老）在加权下 .md 排第一，在不加权下 .txt 排第一
+
+#### 5. Triage prompt 重构为使命感 + 用户意愿组合
+
+- `_TRIAGE_SYSTEM` 常量改名 `_TRIAGE_MISSION` 并重写，明确声明 AgentOS 的使命："理解用户作为一个人"
+- 新函数 `_build_triage_prompt(hints, type_priority)` 动态组合：
+  - 固定的使命说明 + 分类规则
+  - **USER PREFERENCES** 块注入自然语言 hints
+  - **File-type priority hints** 块注入扩展名偏好
+- prompt 明确告诉 LLM："把用户偏好作为 HINTS 不是 RULES，`.txt` 命名为 `journal.txt` 仍然可以是 high"
+- 每次 triage run 组合一次 prompt（而非每批 LLM 调用），放在 hot loop 外
+
+#### 6. 多 terminal 启动保护
+
+- 旧行为：第二个 terminal 跑 `agent-sys start` 会 SIGTERM 掉第一个 daemon，用户完全不知情
+- 新行为：检测到现有 daemon 存活 → 打印清晰提示（status / stop / start --force 三种选项）→ 退出 1
+- 新增 `-f/--force` 显式覆盖语义，保留强制重启能力
+- stale PID（进程已死但文件还在）仍然自动清理，不影响正常重启
+
 ---
 
 ## 已知问题和待完善
@@ -307,6 +371,7 @@ agent-sys stop                      # 停止 daemon
 1. **Auth 未执行**：`allowed_callers` 和 `auth_token_path` 配了但 server.py 没做校验
 2. **Cron 语义**：adaptive mode 开启后，YAML 里的 interval/weekly 触发器被 LLM 决策接管，不独立运行
 3. **Dashboard 离线**：Chart.js 从 CDN 加载，无网络时图表不可用
+4. **Triage 偏好目前只在 CLI/YAML 可调**：Web Dashboard 的 Triage 标签还没提供偏好编辑 UI（占位 TODO）
 
 ### 下一步可做的
 

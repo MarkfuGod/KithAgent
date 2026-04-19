@@ -28,6 +28,7 @@ class KernelConfig:
 class FilesystemConfig:
     watch_paths: list[Path] = field(default_factory=lambda: [Path("~/Documents")])
     ignore_patterns: list[str] = field(default_factory=lambda: ["node_modules", ".git", "__pycache__"])
+    ignore_subpaths: list[str] = field(default_factory=list)
     index_extensions: list[str] = field(default_factory=lambda: [".py", ".md", ".txt", ".json"])
     scan_interval_seconds: int = 300
     max_file_size_mb: int = 10
@@ -120,6 +121,19 @@ class CronConfig:
 
 
 @dataclass
+class TriageConfig:
+    """User-tunable knobs for the triage agent.
+
+    `skip_path_patterns` is a hard filter (bypasses LLM). `file_type_priority`
+    and `hints` influence ordering and LLM decisions but do not override
+    per-file semantic judgment.
+    """
+    skip_path_patterns: list[str] = field(default_factory=list)
+    file_type_priority: dict[str, int] = field(default_factory=dict)
+    hints: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentOSConfig:
     kernel: KernelConfig = field(default_factory=KernelConfig)
     filesystem: FilesystemConfig = field(default_factory=FilesystemConfig)
@@ -128,6 +142,7 @@ class AgentOSConfig:
     syscall: SyscallConfig = field(default_factory=SyscallConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     cron: CronConfig = field(default_factory=CronConfig)
+    triage: TriageConfig = field(default_factory=TriageConfig)
 
 
 def _build_section(cls: type, data: dict[str, Any] | None):
@@ -199,6 +214,13 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
     memory_config = _build_section(MemoryConfig, raw.get("memory"))
     memory_config.embedding = embedding_config
 
+    triage_raw = raw.get("triage", {}) or {}
+    triage_config = TriageConfig(
+        skip_path_patterns=triage_raw.get("skip_path_patterns", []) or [],
+        file_type_priority=triage_raw.get("file_type_priority", {}) or {},
+        hints=triage_raw.get("hints", []) or [],
+    )
+
     return AgentOSConfig(
         kernel=_build_section(KernelConfig, raw.get("kernel")),
         filesystem=_build_section(FilesystemConfig, raw.get("filesystem")),
@@ -207,4 +229,5 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
         syscall=_build_section(SyscallConfig, raw.get("syscall")),
         llm=llm_config,
         cron=cron_config,
+        triage=triage_config,
     )

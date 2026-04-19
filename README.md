@@ -80,6 +80,10 @@ agent-sys start
 
 # 或作为后台守护进程启动
 agent-sys start -d
+
+# 检测到已有 daemon 时，start 会拒绝启动（避免多 terminal 误杀）
+agent-sys start          # → "already running (PID xxx), use 'agent-sys stop' first"
+agent-sys start --force  # → 显式覆盖，SIGTERM 旧进程后启动新的
 ```
 
 ## Web 仪表盘
@@ -105,22 +109,39 @@ agent-sys dashboard --port 9000     # 自定义端口
 
 启动后 daemon 自动在后台运行以下 agent，由 LLM 自适应调度：
 
-### 智能分诊 — Triage（v0.4 新增）
+### 智能分诊 — Triage（v0.4 新增，v0.6 使命驱动增强）
 
 ```bash
 agent-sys triage                    # 运行 LLM 分诊
 agent-sys triage --batch-size 1000  # 大批量
 ```
 
-解决核心问题：21 万文件中大量第三方库源码不值得浪费 LLM token 总结。
+解决核心问题：21 万文件中大量第三方库源码不值得浪费 LLM token 总结。v0.6 进一步分离"过滤"和"排序"：过滤靠规则，排序靠**使命感 + 用户意愿**。
 
-- **Phase 1 — 规则快跳**：`site-packages/`、`node_modules/` 等自动标 `skip`，零 LLM 成本
-- **Phase 2 — LLM 分诊**：按目录分组 → LLM 批量决策 → 四级分类：
-  - `high` — 用户原创代码、个人文档、学习笔记、个性化配置
-  - `medium` — 依赖配置、数据文件、项目脚手架
-  - `low` — 通用库代码、标准模板
-  - `skip` — 第三方源码、生成文件、原始数据集
+- **Phase 1 — 规则快跳（零 LLM 成本）**：`config/default.yaml` 的 `triage.skip_path_patterns` 列出的路径子串（`site-packages/`、`.cursor/extensions/`、`node_modules/` 等）直接标 `skip`
+- **Phase 2 — 加权排序 + LLM 语义分诊**：
+  - `triage.file_type_priority` 决定"先分析谁"（`.md=9 .docx=9 .py=7 .txt=3 .csv=2`）——token 预算有限时，高优先类型先被判断
+  - `triage.hints` 注入自然语言偏好到 LLM prompt（例如"我的 txt 通常是临时草稿"）
+  - LLM 按目录分组批量决策，四级分类：
+    - `high` — 用户原创代码、个人文档、学习笔记、个性化配置
+    - `medium` — 依赖配置、数据文件、项目脚手架
+    - `low` — 通用库代码、标准模板
+    - `skip` — 第三方源码、生成文件、原始数据集
+- **用户偏好 ≠ 硬规则**：`.txt` 被标为低优先，但一个叫 `journal.txt` 的文件仍然可以被 LLM 判为 `high`。偏好只影响排序和边界判断，语义判断优先
 - Summarizer 自动优先处理 `high` → `medium`，完全跳过 `skip` / `low`
+
+**如何调整偏好**：直接编辑 `config/default.yaml` 的 `triage:` 块。例如：
+
+```yaml
+triage:
+  file_type_priority:
+    .md: 9       # 我主要用 markdown 记录
+    .py: 8       # Python 项目优先
+    .txt: 2      # txt 基本不重要
+  hints:
+    - "Downloads 文件夹里的 PDF 多是学习资料，值得总结"
+    - "带 test_ 前缀的 python 文件通常是测试，可以降级"
+```
 
 ### 文件总结 — Summarizer
 

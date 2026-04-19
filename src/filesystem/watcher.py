@@ -170,12 +170,25 @@ class FileSystemWatcher:
 
     def _should_ignore_dir(self, dirname: str, parent: str) -> bool:
         """Fast check for directory pruning during os.walk — called on dir names only."""
-        # Match against ignore patterns
         for pattern in self.config.ignore_patterns:
             if fnmatch(dirname, pattern):
                 return True
 
-        # Skip hidden directories under home (except .cursor)
+        # Path-aware subpath patterns (e.g. ".cursor/extensions") — check the
+        # full path so we can prune third-party trees inside otherwise-useful
+        # hidden dirs like ~/.cursor.
+        full = os.path.join(parent, dirname)
+        subpaths = getattr(self.config, "ignore_subpaths", None) or []
+        for sub in subpaths:
+            needle = sub.strip("/")
+            if not needle:
+                continue
+            if needle in full:
+                return True
+
+        # Skip hidden directories under home (except .cursor, where users keep
+        # hand-written rules, settings, etc.). Specific third-party subtrees
+        # under .cursor are pruned via ignore_subpaths above.
         home = str(Path.home())
         if parent == home and dirname.startswith(".") and dirname not in (".cursor",):
             return True
@@ -189,6 +202,13 @@ class FileSystemWatcher:
             if any(fnmatch(part, pattern) for part in parts):
                 return True
             if fnmatch(path.name, pattern):
+                return True
+
+        path_str = str(path)
+        subpaths = getattr(self.config, "ignore_subpaths", None) or []
+        for sub in subpaths:
+            needle = sub.strip("/")
+            if needle and needle in path_str:
                 return True
 
         home = Path.home()

@@ -1,0 +1,82 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+wheels/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Cursor workspace (keep shared rules, ignore local state)
+.cursor/plans/
+.cursor/rules/local.*
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Runtime state — user-specific, should never be committed
+~/.agent_sys/
+/tmp/agent_sys.pid
+/tmp/agent_sys.sock
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+auth_token
+llm_config.yaml
+
+# Local DB dumps / cache
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node (if any dashboard tooling lands later)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

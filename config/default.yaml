@@ -39,6 +39,13 @@ filesystem:
   - Music
   - Pictures
   - .agent_sys
+  ignore_subpaths:
+  - .cursor/extensions
+  - .vscode/extensions
+  - .cursor-server
+  - go/pkg
+  - .gradle/caches
+  - .m2/repository
   index_extensions:
   - .py
   - .js
@@ -177,3 +184,65 @@ cron:
 profile:
   owner: ''
   data_dir: ~/.agent_sys/profile
+triage:
+  # Rule-based skip: file paths CONTAINING any of these substrings are auto-skipped
+  # before any LLM call. Use for third-party/generated/cache paths that are noise
+  # regardless of content. Extends (does not replace) filesystem.ignore_patterns.
+  skip_path_patterns:
+  - site-packages/
+  - /vendor/
+  - /third_party/
+  - /.git/objects/
+  - /node_modules/
+  - /__pycache__/
+  - /dist/
+  - /build/
+  - /.tox/
+  - /.eggs/
+  - /egg-info/
+  - /.mypy_cache/
+  - /.pytest_cache/
+  - /.cursor/extensions/
+  - /.vscode/extensions/
+  - /.cursor-server/
+  - /.gradle/caches/
+  - /.m2/repository/
+  - /go/pkg/
+  # File-type priority hint (1-10). LLM uses these as ordering preferences, not
+  # as hard rules — a .txt file with important content can still be classified
+  # high. Higher = analyzed first when token budget is limited.
+  file_type_priority:
+    .md: 9
+    .docx: 9
+    .pdf: 8
+    .rst: 8
+    .tex: 8
+    .py: 7
+    .ts: 7
+    .go: 7
+    .rs: 7
+    .swift: 7
+    .java: 6
+    .c: 6
+    .cpp: 6
+    .js: 6
+    .sh: 6
+    .json: 4
+    .yaml: 4
+    .yml: 4
+    .toml: 4
+    .xml: 3
+    .txt: 3
+    .csv: 2
+    .png: 5
+    .jpg: 5
+    .jpeg: 5
+    .gif: 3
+    .webp: 3
+  # Free-form user hints — injected into the LLM triage prompt. Express what
+  # kinds of files reflect YOU as a person so the LLM prioritizes them.
+  hints:
+  - "My own source code projects and personal notes are the most important."
+  - "Plain .txt files are usually temporary scratch notes — less important unless clearly meaningful."
+  - "Downloaded PDFs/docs are often learning material — worth summarizing."
+  - "Anything under node_modules/site-packages/vendor is third-party junk — always skip."

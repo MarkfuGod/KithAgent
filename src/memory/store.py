@@ -561,17 +561,50 @@ class MemoryStore:
 
     # ── Triage operations ──────────────────────────────────────
 
-    async def get_untriaged_files(self, limit: int = 500) -> list[dict]:
-        """Return files that haven't been triaged yet, grouped to give LLM directory context."""
+    async def get_untriaged_files(
+        self,
+        limit: int = 500,
+        type_priority: dict[str, int] | None = None,
+    ) -> list[dict]:
+        """Return untriaged files ordered by (type_priority, recency).
+
+        `type_priority` maps file extension → 1..10 hint. Higher hint means the
+        file type is considered more likely to reveal the user as a person,
+        so it's analyzed first when token budget is limited. Unknown types
+        default to 5. Falls back to pure modified_at DESC ordering when no
+        priority map is given.
+        """
         assert self._db
-        rows = self._db.execute(
-            """SELECT path, file_type, size_bytes, modified_at
-               FROM file_index
-               WHERE (triage_status = '' OR triage_status IS NULL)
-               ORDER BY modified_at DESC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
+
+        if type_priority:
+            _valid_ext = {
+                ext for ext in type_priority
+                if isinstance(ext, str) and ext.startswith(".")
+                and all(c.isalnum() or c in "._-" for c in ext[1:])
+                and 1 <= len(ext) <= 12
+            }
+            cases = []
+            for ext in _valid_ext:
+                prio = int(type_priority[ext])
+                prio = max(1, min(10, prio))
+                cases.append(f"WHEN '{ext}' THEN {prio}")
+            case_expr = (
+                "CASE file_type " + " ".join(cases) + " ELSE 5 END"
+                if cases else "5"
+            )
+            sql = f"""SELECT path, file_type, size_bytes, modified_at
+                      FROM file_index
+                      WHERE (triage_status = '' OR triage_status IS NULL)
+                      ORDER BY {case_expr} DESC, modified_at DESC
+                      LIMIT ?"""
+        else:
+            sql = """SELECT path, file_type, size_bytes, modified_at
+                     FROM file_index
+                     WHERE (triage_status = '' OR triage_status IS NULL)
+                     ORDER BY modified_at DESC
+                     LIMIT ?"""
+
+        rows = self._db.execute(sql, (limit,)).fetchall()
         return [
             {"path": r[0], "file_type": r[1], "size_bytes": r[2], "modified_at": r[3]}
             for r in rows

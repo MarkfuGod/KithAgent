@@ -42,13 +42,15 @@ logger = logging.getLogger("agent_sys.agents.triage")
 # llm就应该发现我要先做file index，然后index之后，发现要对文件进行总结，这是调用triage，然后triage其实
 # 也是llm驱动，先读取index中的metadata，结合用户意愿，排列哪些文件总结优先级高，哪些低，高的先总结
 # 总结的时候调用多个sub summarizer并行进行总结，然后汇总，因为是按index来吗，启用多少个subagent由发起这个
-# 总结任务的agent来决定。怎么总结，总结策略也是按用户的意愿，是激进还是平衡，还是保守，还是根据文件类型来决定
+# 总结任务的agent来，就像curosr的agent设计一样，比如我遍历codebase时候，主模型通常会唤起三个小模型然后并行探索，最后返回，怎么总结，总结策略也是按用户的意愿，是激进还是平衡，还是保守，还是根据文件类型来决定
 # 然后其他任务就是按整个cpu llm的想法和用户意愿来，就是感觉要出一个profile了，就出一个，用户要求analyze了
 # 就分配分析的任务，当然定期画像更新和brief还是按设定走，有文件改动分析大改动还是小改动，有不同的策略，不要傻傻
 # 的改一个字就直接整个这个index范围内就要重新总结一遍，当然这个改动大小也要有llm来决定，因为有可能出现字符改动少
 # 但是字义或者内容改动就大，所以要智能判断。然后重新index，然后triage，summarize。。。。
 # 当然上述操作不可能是严格并行的，应该是像操作系统并发调度一样，
 # 我的说法是这样，你分析分析，有没有逻辑上的漏洞，当然这只是我的想法，我说的不一定都对，你要有自己的思考
+# 比如完完全全按照操作系统映射就非常合理吗
+
 # 我的终极设想就是让你的电脑安装10分钟agentos之后，就了解了你这个人，大概的喜好，然后就像人与人交往一样，有个
 # 渐进的过程，一步一步，就像我上面说的流程一样，一步一步的深入了解你，对你有更全面的认知
 
@@ -57,11 +59,13 @@ logger = logging.getLogger("agent_sys.agents.triage")
 
 
 
-_TRIAGE_SYSTEM = """You are the file importance triage system for AgentOS.
-Your goal: decide which files are worth spending LLM tokens to summarize,
-based on how much they reveal about THIS USER as a person.
+_TRIAGE_MISSION = """You are the file importance triage system for AgentOS.
 
-You're given a batch of file paths from a specific directory context.
+MISSION: AgentOS exists to gradually understand the user as a person — their
+skills, interests, work patterns, projects, and values — by reading files on
+their machine. Your job is to decide which files are worth spending LLM tokens
+to summarize, based on how much they reveal about THIS USER as a person.
+
 Classify each file as:
 - "high": User's own creation — personal projects, study notes, original code,
   documents they wrote, creative work, config reflecting personal preferences.
@@ -76,6 +80,7 @@ Classify each file as:
 
 CRITICAL SIGNALS for "skip":
 - Paths containing: site-packages, vendor, third_party, __pycache__, .git/objects
+- IDE extension directories (.cursor/extensions, .vscode/extensions)
 - Files inside large known framework directories (e.g. PyTorch source, node_modules)
 - Auto-generated files (*.pb.go, *_generated.*, migrations with numeric prefixes)
 - Large dataset .txt/.csv with generic names (data_0001.txt, train.txt, labels.txt)
@@ -86,8 +91,18 @@ CRITICAL SIGNALS for "high":
 - Config files reflecting personal choices (.zshrc, .gitconfig, custom scripts)
 - Study/learning materials the user collected or annotated
 
-For efficiency, you can classify entire directory subtrees at once using the
-"bulk" field (explained below).
+HOW TO USE USER PREFERENCES (if provided below):
+- Treat them as priority HINTS, not hard rules.
+- A file type the user considers "usually unimportant" (e.g. .txt) can still
+  be classified "high" if its path/name clearly indicates personal value
+  (e.g. `journal.txt`, `resume.txt`, `interview_notes.txt`).
+- A file type the user considers "important" can still be "low" or "skip" if
+  it's obviously generated or third-party.
+- When unsure between two adjacent tiers, lean toward the user's preference.
+
+For efficiency, classify entire directory subtrees at once using the "bulk"
+field. Only use "individual" for files that clearly differ from their directory
+pattern.
 
 Output a JSON object:
 {
@@ -100,16 +115,44 @@ Output a JSON object:
   ]
 }
 
-The "bulk" rules are applied first (by prefix match). "individual" overrides
-are for specific files that differ from their directory's bulk classification.
-Keep individual overrides minimal — only when a file clearly differs from its
-directory pattern.
-
 Output ONLY valid JSON."""
+
+# Backstop: used when config.triage.skip_path_patterns is empty. Kept minimal
+# since the real source of truth should be config/default.yaml.
+_FALLBACK_SKIP_PATTERNS = [
+    "site-packages/",
+    "/vendor/",
+    "/third_party/",
+    "/.git/objects/",
+    "/node_modules/",
+    "/__pycache__/",
+    "/.cursor/extensions/",
+    "/.vscode/extensions/",
+]
 
 _BATCH_SIZE = 500
 _LLM_BATCH_SIZE = 200
 _DEFAULT_TIME_BUDGET = 300
+
+
+def _build_triage_prompt(hints: list[str] | None, type_priority: dict[str, int] | None) -> str:
+    """Compose the triage system prompt with user hints + file-type preferences."""
+    parts = [_TRIAGE_MISSION]
+
+    if hints:
+        parts.append("\n\n=== USER PREFERENCES (hints, not rules) ===")
+        for h in hints:
+            parts.append(f"- {h}")
+
+    if type_priority:
+        ranked = sorted(type_priority.items(), key=lambda x: -int(x[1]))
+        pref_line = ", ".join(f"{ext}={prio}" for ext, prio in ranked[:12])
+        parts.append(
+            "\n\nFile-type priority hints (higher = more likely worth user attention):\n"
+            + pref_line
+        )
+
+    return "\n".join(parts)
 
 
 class TriageAgent(BaseAgent):
@@ -120,18 +163,27 @@ class TriageAgent(BaseAgent):
         memory = context["memory"]
         llm = context.get("llm")
 
+        triage_cfg = self._get_triage_config(context)
+        skip_patterns = triage_cfg.get("skip_path_patterns") or _FALLBACK_SKIP_PATTERNS
+        type_priority = triage_cfg.get("file_type_priority") or {}
+        hints = triage_cfg.get("hints") or []
+
         batch_size = task.input_data.get("batch_size", _BATCH_SIZE)
         time_budget = task.input_data.get("time_budget", _DEFAULT_TIME_BUDGET)
         start_time = time.time()
 
-        # Phase 1: rule-based fast triage for obvious patterns
-        rule_results = await self._rule_based_pass(memory)
+        # Phase 1: rule-based fast triage using config-driven skip patterns.
+        rule_results = await self._rule_based_pass(memory, skip_patterns)
 
         if not llm or not llm.available_providers():
             logger.warning("No LLM available — triage used rules only")
             return {**rule_results, "llm_triaged": 0, "mode": "rules_only"}
 
-        # Phase 2: LLM triage for remaining untriaged files
+        # Compose system prompt once per run (cheap, but keeps logic out of hot loop).
+        system_prompt = _build_triage_prompt(hints, type_priority)
+
+        # Phase 2: LLM triage for remaining untriaged files, ordered by user
+        # type priority so important kinds get analyzed first when budget runs out.
         llm_triaged = 0
         llm_errors = 0
 
@@ -141,7 +193,10 @@ class TriageAgent(BaseAgent):
                 logger.info("Triage time budget exhausted after %.0fs", elapsed)
                 break
 
-            files = await memory.get_untriaged_files(limit=batch_size)
+            files = await memory.get_untriaged_files(
+                limit=batch_size,
+                type_priority=type_priority or None,
+            )
             if not files:
                 logger.info("All files triaged")
                 break
@@ -155,7 +210,7 @@ class TriageAgent(BaseAgent):
 
                 try:
                     result = await self._triage_group(
-                        dir_prefix, dir_files, memory, llm
+                        dir_prefix, dir_files, memory, llm, system_prompt
                     )
                     llm_triaged += result.get("classified", 0)
                     if event_bus:
@@ -183,26 +238,29 @@ class TriageAgent(BaseAgent):
             "triage_distribution": triage_stats,
         }
 
-    async def _rule_based_pass(self, memory) -> dict:
-        """Fast pass: skip obvious noise directories without wasting LLM tokens."""
-        skip_patterns = [
-            "site-packages/",
-            "/vendor/",
-            "/third_party/",
-            "/.git/objects/",
-            "/node_modules/",
-            "/__pycache__/",
-            "/dist/",
-            "/build/",
-            "/.tox/",
-            "/.eggs/",
-            "/egg-info/",
-            "/.mypy_cache/",
-            "/.pytest_cache/",
-        ]
+    def _get_triage_config(self, context: dict[str, Any]) -> dict:
+        """Pull user-tunable triage settings from kernel config with safe fallbacks."""
+        kernel = context.get("kernel")
+        cfg = getattr(kernel, "config", None) if kernel else None
+        tcfg = getattr(cfg, "triage", None) if cfg else None
+        if not tcfg:
+            return {}
+        return {
+            "skip_path_patterns": list(getattr(tcfg, "skip_path_patterns", []) or []),
+            "file_type_priority": dict(getattr(tcfg, "file_type_priority", {}) or {}),
+            "hints": list(getattr(tcfg, "hints", []) or []),
+        }
 
+    async def _rule_based_pass(self, memory, skip_patterns: list[str]) -> dict:
+        """Fast pass: skip files whose path contains any configured noise pattern.
+
+        Uses SQL LIKE substring match (not prefix) so patterns like
+        '.cursor/extensions/' catch the pattern anywhere in the path.
+        """
         total_marked = 0
         for pattern in skip_patterns:
+            if not pattern:
+                continue
             count = await memory.batch_update_triage_by_prefix(
                 f"%{pattern}", "skip"
             )
@@ -211,7 +269,10 @@ class TriageAgent(BaseAgent):
                 logger.debug("Rule-based skip: %s → %d files", pattern, count)
 
         if total_marked > 0:
-            logger.info("Rule-based triage: marked %d files as 'skip'", total_marked)
+            logger.info(
+                "Rule-based triage: marked %d files as 'skip' (patterns=%d)",
+                total_marked, len(skip_patterns),
+            )
 
         return {"rule_based_skipped": total_marked}
 
@@ -230,7 +291,7 @@ class TriageAgent(BaseAgent):
         return dict(groups)
 
     async def _triage_group(
-        self, dir_prefix: str, files: list[dict], memory, llm
+        self, dir_prefix: str, files: list[dict], memory, llm, system_prompt: str
     ) -> dict:
         """Ask LLM to triage a batch of files from the same directory context."""
         home = str(Path.home())
@@ -248,7 +309,7 @@ class TriageAgent(BaseAgent):
 
         response = await llm.complete(
             messages=[
-                LLMMessage(role="system", content=_TRIAGE_SYSTEM),
+                LLMMessage(role="system", content=system_prompt),
                 LLMMessage(role="user", content=prompt),
             ],
             task_type="classify",

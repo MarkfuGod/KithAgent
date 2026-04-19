@@ -47,28 +47,41 @@ def cmd_start(args: argparse.Namespace) -> None:
     logger = logging.getLogger("agent_sys.cli")
 
     pid_file = Path(str(config.kernel.pid_file))
+    force = bool(getattr(args, "force", False))
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
             os.kill(old_pid, 0)
-            # Process exists — but could be a zombie or suspended process
-            # Check if it's actually our agent-sys or a recycled PID
+            # Process is alive.
             if old_pid == os.getpid():
+                # Stale PID file pointing at our own recycled PID — safe to clear.
                 pid_file.unlink(missing_ok=True)
-            else:
-                logger.warning("Found existing process PID %d, attempting cleanup...", old_pid)
+            elif force:
+                logger.warning(
+                    "--force given: terminating existing agent-sys (PID %d) before starting.",
+                    old_pid,
+                )
                 os.kill(old_pid, signal.SIGTERM)
                 import time as _time
-                _time.sleep(1)
-                try:
-                    os.kill(old_pid, 0)
-                    # Still alive — force kill
+                for _ in range(50):
+                    _time.sleep(0.1)
+                    try:
+                        os.kill(old_pid, 0)
+                    except ProcessLookupError:
+                        break
+                else:
                     os.kill(old_pid, signal.SIGKILL)
                     _time.sleep(0.5)
-                except ProcessLookupError:
-                    pass
                 pid_file.unlink(missing_ok=True)
-                logger.info("Cleaned up old process, starting fresh.")
+            else:
+                print(
+                    f"\nagent-sys is already running (PID {old_pid}).\n"
+                    f"  - To see status:      agent-sys status\n"
+                    f"  - To stop it first:   agent-sys stop\n"
+                    f"  - To force restart:   agent-sys start --force\n"
+                    f"\nRefusing to start a second instance — your previous daemon is still alive.\n"
+                )
+                sys.exit(1)
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
 
@@ -597,6 +610,10 @@ def main() -> None:
     # start
     p_start = sub.add_parser("start", help="Start the SysAgent daemon")
     p_start.add_argument("-d", "--daemon", action="store_true", help="Run as background daemon")
+    p_start.add_argument(
+        "-f", "--force", action="store_true",
+        help="Kill any existing agent-sys instance before starting (default: refuse to start)",
+    )
     p_start.set_defaults(func=cmd_start)
 
     # stop
