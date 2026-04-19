@@ -27,9 +27,8 @@ ENV/
 *~
 .DS_Store
 
-# Cursor workspace (keep shared rules + skills, ignore local state)
-.cursor/plans/
-.cursor/rules/local.*
+# Cursor workspace — entirely local, nothing from .cursor/ is shipped
+.cursor/
 
 # Working / personal notes — not shipped with the release
 CODEBASE.md

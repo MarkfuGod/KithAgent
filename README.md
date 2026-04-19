@@ -89,31 +89,12 @@ agent-sys start          # → "already running (PID xxx), use 'agent-sys stop' 
 agent-sys start --force  # → 显式覆盖，SIGTERM 旧进程后启动新的
 ```
 
-## 在 Cursor 里零配置接入（Skills）
+## 接入 AI agent —— `skills/` 文件夹
 
-仓库 `.cursor/skills/` 下内置了三条 Cursor Skill，装好后 agent 会**自动识别调用时机**，不用你每次手写 prompt。
+仓库根目录 `skills/` 下放了三个 skill，每个就是一个带 YAML frontmatter 的
+`SKILL.md`。这是 Anthropic 推的 [Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills) 格式，**Cursor 和 Claude Code 原生支持**；其他工具（Codex、Windsurf、Cline 等）把它当普通 instruction markdown 读也能用。
 
-### 安装（二选一）
-
-**方式 A — 软链（推荐，跟着仓库一起更新）：**
-
-```bash
-mkdir -p ~/.cursor/skills
-ln -sfn "$(pwd)/.cursor/skills/agent-sys-user-context" ~/.cursor/skills/agent-sys-user-context
-ln -sfn "$(pwd)/.cursor/skills/agent-sys-file-search" ~/.cursor/skills/agent-sys-file-search
-ln -sfn "$(pwd)/.cursor/skills/agent-sys-admin"        ~/.cursor/skills/agent-sys-admin
-```
-
-**方式 B — 拷贝（固定快照）：**
-
-```bash
-mkdir -p ~/.cursor/skills
-cp -r .cursor/skills/agent-sys-* ~/.cursor/skills/
-```
-
-任选一种做完，重启 Cursor 即生效。
-
-### 三条 skill 分工
+三个 skill 的分工：
 
 | Skill | 触发场景 | 调用的 syscall |
 |---|---|---|
@@ -121,15 +102,54 @@ cp -r .cursor/skills/agent-sys-* ~/.cursor/skills/
 | `agent-sys-file-search` | "找我之前写过的 X"/"硬盘里关于 Y 的笔记" | `file.search` / `file.read` / `knowledge.query` |
 | `agent-sys-admin` | "daemon 挂了吗"/"手动跑一次 triage"/"换模型" | `agent-sys` CLI + `/status` |
 
-### 直接试一下
+### Cursor
 
-daemon 运行后，在 Cursor 聊天里随便说一句触发词，例如：
+把三个 skill 软链到 `~/.cursor/skills/`，重启 Cursor 即生效：
+
+```bash
+mkdir -p ~/.cursor/skills
+for s in agent-sys-user-context agent-sys-file-search agent-sys-admin; do
+  ln -sfn "$(pwd)/skills/$s" "$HOME/.cursor/skills/$s"
+done
+```
+
+想要固定快照（不跟仓库更新）把 `ln -sfn` 换成 `cp -r` 就行。
+
+### Claude Code
+
+Claude Code 的 skill 目录是 `~/.claude/skills/`，格式完全一致：
+
+```bash
+mkdir -p ~/.claude/skills
+for s in agent-sys-user-context agent-sys-file-search agent-sys-admin; do
+  ln -sfn "$(pwd)/skills/$s" "$HOME/.claude/skills/$s"
+done
+```
+
+如果你的 Claude Code 版本还不认 skills 目录，可以把 `SKILL.md` 的内容拼进项目根的 `CLAUDE.md` 或 `~/.claude/CLAUDE.md` 里，效果等价。
+
+### Codex CLI / 其他走 `AGENTS.md` 的工具
+
+Codex、Aider 等工具读一个叫 `AGENTS.md` 的统一指令文件。把三个 skill 拼进去就行：
+
+```bash
+cat skills/agent-sys-*/SKILL.md > AGENTS.md
+# 全局用：cat skills/agent-sys-*/SKILL.md > ~/.codex/AGENTS.md
+```
+
+YAML frontmatter 在 markdown 里无害，可以保留；嫌碍眼的话手动删掉每段顶上 `---` 之间的部分即可。
+
+### 通用兜底
+
+如果你的 agent 不吃上面任何一种格式，把 `skills/*/SKILL.md` 直接喂给它当 system prompt / context 就行 —— 三个文件加起来不到 300 行，每个都自带触发说明和 curl 范例。
+
+### 试一下
+
+daemon 运行后，在 agent 聊天框里说一句触发词：
 
 > 根据我最近一周的情况，帮我规划下本周重点。
 
-Cursor 会自动加载 `agent-sys-user-context`，在回答前 curl 本地 daemon 拿 brief，然后基于真实的你来回答，而不是凭空猜。
-
-如果 `/syscall` 401，说明 token 过期 —— skill 会自动每次 `$(cat ~/.agent_sys/auth_token)` 现取，正常情况下你不用管。
+Agent 会自动加载 `agent-sys-user-context`，先 `curl -H "X-Agent-Token: $(cat ~/.agent_sys/auth_token)" http://127.0.0.1:7437/syscall ...` 拿 brief，再基于真实的你来回答，而不是凭空猜。
 
 ## Web 仪表盘
 
