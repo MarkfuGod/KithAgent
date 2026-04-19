@@ -14,50 +14,41 @@ When you're using an agent tool like Cursor or Claude Code, it can call agent-sy
 
 ## Architecture at a glance
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    External Agents                          │
-│            (Cursor / Claude Code / OpenClaw)                │
-│                         │                                   │
-│                    ┌────▼────┐                              │
-│                    │ Syscall │  ← syscall layer (API)       │
-│                    │  API    │    Unix Socket / HTTP        │
-│                    └────┬────┘                              │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────┐       │
-│  │              Kernel (SysAgent Daemon)            │       │
-│  │                                                  │       │
-│  │  ┌───────────┐  ┌───────────┐  ┌────────────┐  │       │
-│  │  │ Scheduler │  │  Memory   │  │ FileSystem │  │       │
-│  │  └─────┬─────┘  └───────────┘  └────────────┘  │       │
-│  │        │                                        │       │
-│  │  ┌─────▼─────────────────────────────────────┐  │       │
-│  │  │           Smart Agent Pool                │  │       │
-│  │  │ [Triage] [Summarizer] [Analyzer]          │  │       │
-│  │  │ [Reporter] [ProfileBuilder] [Prioritizer] │  │       │
-│  │  └─────────────────────┬─────────────────────┘  │       │
-│  │                        │                        │       │
-│  │  ┌─────────────────────▼─────────────────────┐  │       │
-│  │  │        LLM Router (multi-model)            │  │       │
-│  │  │  fast ─→ qwen-plus / gpt-4o-mini          │  │       │
-│  │  │  strong ─→ gpt-4o / claude-opus            │  │       │
-│  │  │  vision ─→ qwen-vl-plus                   │  │       │
-│  │  │  anthropic_compat ─→ MiniMax-M2.7          │  │       │
-│  │  └───────────────────────────────────────────┘  │       │
-│  │                                                  │       │
-│  │  ┌───────────────────────────────────────────┐  │       │
-│  │  │  Adaptive Cron (LLM decides what runs when)│  │       │
-│  │  └───────────────────────────────────────────┘  │       │
-│  └─────────────────────────────────────────────────┘       │
-│                                                             │
-│                  ~/.agent_sys/memory.db                     │
-│              (persistent knowledge store)                   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Web Dashboard (http://127.0.0.1:7438)              │   │
-│  │  File distribution · reports · LLM config · triage  │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    ext["External Agents<br/>Cursor · Claude Code · Codex · curl"]
+
+    ext -->|"HTTP :7437<br/>X-Agent-Token"| syscall
+
+    subgraph kernel["SysAgent Daemon"]
+        direction TB
+        syscall["Syscall Server<br/>Unix Socket + HTTP"]
+        cron["Adaptive Cron<br/>LLM decides what runs when"]
+        sched["Scheduler<br/>priority queue + concurrency"]
+        fs["FileSystem Watcher<br/>os.walk + watchdog"]
+
+        syscall --> sched
+        cron --> sched
+        fs --> mem
+
+        subgraph pool["Smart Agent Pool"]
+            direction LR
+            triage[Triage]
+            sum[Summarizer]
+            ana[Analyzer]
+            rep[Reporter]
+            prof[ProfileBuilder]
+            prio[Prioritizer]
+        end
+
+        sched --> pool
+        pool --> mem["Memory Store<br/>LRU + SQLite"]
+        pool --> router["LLM Router<br/>fast / strong / vision / anthropic_compat"]
+    end
+
+    router -.-> providers(("OpenAI · Claude<br/>Qwen · Ollama · MiniMax"))
+    mem <-->|SQLite| db[("~/.agent_sys/memory.db<br/>persistent knowledge")]
+    web["Web Dashboard<br/>http://127.0.0.1:7438"] -->|read-only| db
 ```
 
 | Module | What it actually is | OS analogue |
