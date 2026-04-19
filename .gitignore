@@ -27,9 +27,15 @@ ENV/
 *~
 .DS_Store
 
-# Cursor workspace (keep shared rules, ignore local state)
+# Cursor workspace (keep shared rules + skills, ignore local state)
 .cursor/plans/
 .cursor/rules/local.*
+
+# Working / personal notes — not shipped with the release
+CODEBASE.md
+CONVERSATION_SUMMARY.md
+ROUND_DIALOG_SUMMARY_*.md
+tests/
 
 # Test / coverage
 .pytest_cache/

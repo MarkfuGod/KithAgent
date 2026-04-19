@@ -70,7 +70,8 @@ agent-sys 在后台持续索引你选择的目录（默认 `~/Documents` 和 `~/
 ## 快速开始
 
 ```bash
-# 安装
+# 克隆 & 安装
+git clone https://github.com/MarkfuGod/KernelAgent.git agent_sys
 cd agent_sys
 pip install -e ".[full]"
 
@@ -87,6 +88,48 @@ agent-sys start -d
 agent-sys start          # → "already running (PID xxx), use 'agent-sys stop' first"
 agent-sys start --force  # → 显式覆盖，SIGTERM 旧进程后启动新的
 ```
+
+## 在 Cursor 里零配置接入（Skills）
+
+仓库 `.cursor/skills/` 下内置了三条 Cursor Skill，装好后 agent 会**自动识别调用时机**，不用你每次手写 prompt。
+
+### 安装（二选一）
+
+**方式 A — 软链（推荐，跟着仓库一起更新）：**
+
+```bash
+mkdir -p ~/.cursor/skills
+ln -sfn "$(pwd)/.cursor/skills/agent-sys-user-context" ~/.cursor/skills/agent-sys-user-context
+ln -sfn "$(pwd)/.cursor/skills/agent-sys-file-search" ~/.cursor/skills/agent-sys-file-search
+ln -sfn "$(pwd)/.cursor/skills/agent-sys-admin"        ~/.cursor/skills/agent-sys-admin
+```
+
+**方式 B — 拷贝（固定快照）：**
+
+```bash
+mkdir -p ~/.cursor/skills
+cp -r .cursor/skills/agent-sys-* ~/.cursor/skills/
+```
+
+任选一种做完，重启 Cursor 即生效。
+
+### 三条 skill 分工
+
+| Skill | 触发场景 | 调用的 syscall |
+|---|---|---|
+| `agent-sys-user-context` | "根据我的情况"/"最近我在做什么"/"你了解我吗" | `report.brief` / `profile.get` / `analyze.behavior` |
+| `agent-sys-file-search` | "找我之前写过的 X"/"硬盘里关于 Y 的笔记" | `file.search` / `file.read` / `knowledge.query` |
+| `agent-sys-admin` | "daemon 挂了吗"/"手动跑一次 triage"/"换模型" | `agent-sys` CLI + `/status` |
+
+### 直接试一下
+
+daemon 运行后，在 Cursor 聊天里随便说一句触发词，例如：
+
+> 根据我最近一周的情况，帮我规划下本周重点。
+
+Cursor 会自动加载 `agent-sys-user-context`，在回答前 curl 本地 daemon 拿 brief，然后基于真实的你来回答，而不是凭空猜。
+
+如果 `/syscall` 401，说明 token 过期 —— skill 会自动每次 `$(cat ~/.agent_sys/auth_token)` 现取，正常情况下你不用管。
 
 ## Web 仪表盘
 
