@@ -155,7 +155,7 @@ async function saveRoutingEnhanced() {
   try {
     const resp = await fetch(API + '/api/llm-routing', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: DASHBOARD_JSON_HEADERS,
       body: JSON.stringify({defaults, functions}),
     }).then(r => r.json());
     if (resp.success) {

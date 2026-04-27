@@ -84,8 +84,14 @@ class BehaviorAnalyzerAgent(BaseAgent):
     async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
         memory = context["memory"]
         llm = context.get("llm")
+        event_bus = context.get("event_bus")
 
         hours = task.input_data.get("hours", 168)
+        if event_bus:
+            await event_bus.emit_dict("behavior_insight.started", {
+                "hours": hours,
+                "status": "started",
+            })
 
         file_stats = await memory.get_file_modification_stats()
         mem_stats = await memory.stats()
@@ -126,6 +132,15 @@ class BehaviorAnalyzerAgent(BaseAgent):
             "Behavior analysis complete: %d file types, %d projects, %d recent files, %d active dirs",
             len(file_stats), len(projects), len(recent_files), len(dir_activity),
         )
+        if event_bus:
+            event_type = "behavior_insight.failed" if analysis.get("error") else "behavior_insight.completed"
+            await event_bus.emit_dict(event_type, {
+                "status": "failed" if analysis.get("error") else "completed",
+                "error": analysis.get("error", ""),
+                "projects": len(projects),
+                "recent_files": len(recent_files),
+                "file_types": len(file_stats),
+            })
         return analysis
 
     def _build_data_summary(
@@ -211,10 +226,41 @@ class BehaviorAnalyzerAgent(BaseAgent):
                 max_tokens=3000,
                 temperature=0.3,
             )
-            return json.loads(response.content)
+            parsed = self._parse_json_lenient(response.content)
+            if parsed is None:
+                raise ValueError("LLM returned non-JSON behavior insight")
+            return parsed
         except (json.JSONDecodeError, Exception) as e:
             logger.warning("LLM analysis failed, falling back to rules: %s", e)
-            return {"error": str(e), "raw": data_summary[:500]}
+            fallback = self._rule_based_analysis([], [], [], [], [])
+            fallback["error"] = str(e)
+            fallback["raw"] = data_summary[:500]
+            return fallback
+
+    @staticmethod
+    def _parse_json_lenient(text: str) -> dict | None:
+        """Parse model JSON even when wrapped in fences or extra prose."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+        try:
+            parsed = json.loads(cleaned)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if 0 <= start < end:
+            try:
+                parsed = json.loads(cleaned[start:end + 1])
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
+        return None
 
     def _rule_based_analysis(self, file_stats, projects, dir_activity, dir_breakdown, recent_files) -> dict:
         """Fallback when no LLM is available."""

@@ -16,9 +16,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections import OrderedDict
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +71,9 @@ class MemoryStore:
     async def initialize(self) -> None:
         db_path = Path(str(self.config.db_path)).expanduser().resolve()
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._db = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=30000")
         self._create_tables()
         logger.info("Memory store initialized at %s", db_path)
 
@@ -107,10 +110,92 @@ class MemoryStore:
                 expires_at  REAL
             );
 
+            CREATE TABLE IF NOT EXISTS profile_facts (
+                id          TEXT PRIMARY KEY,
+                category    TEXT NOT NULL,
+                statement   TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_ref  TEXT,
+                confidence  REAL NOT NULL,
+                status      TEXT NOT NULL,
+                created_at  REAL NOT NULL,
+                updated_at  REAL NOT NULL,
+                metadata    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS source_records (
+                id          TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                source_ref  TEXT NOT NULL,
+                title       TEXT,
+                domain      TEXT,
+                path        TEXT,
+                occurred_at REAL,
+                created_at  REAL NOT NULL,
+                metadata    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS insight_runs (
+                id            TEXT PRIMARY KEY,
+                run_type      TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                started_at    REAL NOT NULL,
+                completed_at  REAL,
+                elapsed_s     REAL,
+                input_counts  TEXT,
+                output_summary TEXT,
+                metadata      TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS insight_items (
+                id          TEXT PRIMARY KEY,
+                run_id      TEXT NOT NULL,
+                item_type   TEXT NOT NULL,
+                statement   TEXT NOT NULL,
+                source_type TEXT,
+                source_ref  TEXT,
+                confidence  REAL NOT NULL,
+                status      TEXT NOT NULL,
+                created_at  REAL NOT NULL,
+                updated_at  REAL NOT NULL,
+                metadata    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id              TEXT PRIMARY KEY,
+                path            TEXT NOT NULL,
+                file_hash       TEXT NOT NULL,
+                chunk_index     INTEGER NOT NULL,
+                start_line      INTEGER,
+                end_line        INTEGER,
+                content         TEXT NOT NULL,
+                created_at      REAL NOT NULL,
+                embedding       BLOB,
+                embedding_model TEXT DEFAULT '',
+                metadata        TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_file_type ON file_index(file_type);
             CREATE INDEX IF NOT EXISTS idx_knowledge_cat ON knowledge(category);
             CREATE INDEX IF NOT EXISTS idx_agent_ctx_name ON agent_context(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_profile_facts_status ON profile_facts(status);
+            CREATE INDEX IF NOT EXISTS idx_profile_facts_category ON profile_facts(category);
+            CREATE INDEX IF NOT EXISTS idx_source_records_type ON source_records(source_type);
+            CREATE INDEX IF NOT EXISTS idx_source_records_domain ON source_records(domain);
+            CREATE INDEX IF NOT EXISTS idx_insight_runs_type ON insight_runs(run_type, started_at);
+            CREATE INDEX IF NOT EXISTS idx_insight_items_run ON insight_items(run_id);
+            CREATE INDEX IF NOT EXISTS idx_insight_items_status ON insight_items(status);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_path ON document_chunks(path);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_hash ON document_chunks(path, file_hash);
         """)
+
+        try:
+            self._db.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts
+                   USING fts5(id UNINDEXED, path UNINDEXED, content)"""
+            )
+        except sqlite3.OperationalError as e:
+            logger.warning("SQLite FTS5 unavailable; RAG exact retrieval disabled: %s", e)
 
         # Step 2: migrate — add v0.2 columns to existing tables
         self._migrate_schema()
@@ -152,29 +237,54 @@ class MemoryStore:
         summary: str = "",
         metadata: dict | None = None,
     ) -> None:
+        now = time.time()
+        record = {
+            "path": path,
+            "hash": content_hash,
+            "size_bytes": size_bytes,
+            "modified_at": modified_at,
+            "indexed_at": now,
+            "file_type": file_type,
+            "summary": summary,
+            "metadata": json.dumps(metadata or {}),
+        }
+
         async with self._lock:
-            assert self._db
-            self._db.execute(
-                """INSERT OR REPLACE INTO file_index
-                   (path, hash, size_bytes, modified_at, indexed_at, file_type, summary, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (path, content_hash, size_bytes, modified_at, time.time(),
-                 file_type, summary, json.dumps(metadata or {})),
-            )
-            self._db.commit()
-            self._cache.put(f"file:{path}", {
-                "hash": content_hash, "summary": summary,
-                "file_type": file_type, "size": size_bytes,
-            })
+            db = self._db
+            assert db
+
+            def _run() -> None:
+                db.execute(
+                    """INSERT OR REPLACE INTO file_index
+                       (path, hash, size_bytes, modified_at, indexed_at, file_type, summary, metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        path, content_hash, size_bytes, modified_at, now,
+                        file_type, summary, record["metadata"],
+                    ),
+                )
+                db.commit()
+
+            await asyncio.to_thread(_run)
+            self._cache.put(f"file:{path}", record)
 
     async def get_file_info(self, path: str) -> dict | None:
         cached = self._cache.get(f"file:{path}")
         if cached:
             return cached
-        assert self._db
-        row = self._db.execute(
-            "SELECT * FROM file_index WHERE path = ?", (path,)
-        ).fetchone()
+        db = self._db
+        assert db
+
+        def _run():
+            return db.execute(
+                """SELECT path, hash, size_bytes, modified_at, indexed_at,
+                          file_type, summary, metadata
+                   FROM file_index WHERE path = ?""",
+                (path,),
+            ).fetchone()
+
+        async with self._lock:
+            row = await asyncio.to_thread(_run)
         if row:
             info = dict(zip(
                 ["path", "hash", "size_bytes", "modified_at",
@@ -227,15 +337,22 @@ class MemoryStore:
             for r in rows
         ]
 
-    async def get_files_needing_summary(self, limit: int = 50) -> list[dict]:
+    async def get_files_needing_summary(
+        self,
+        limit: int = 50,
+        *,
+        allowed_triage_statuses: list[str] | tuple[str, ...] | None = None,
+        include_untriaged: bool = False,
+    ) -> list[dict]:
         """Return files that need summarization, prioritized by triage importance.
 
         Order:
           1. triage_status='high' (most important)
           2. triage_status='medium'
-          3. untriaged ('' / NULL only — NOT 'unknown', those are
-             intentionally parked until an LLM becomes available)
-        Files marked 'skip', 'low', or 'unknown' are excluded entirely.
+          3. optional untriaged fallback only when explicitly requested
+        Files marked 'skip', 'low', or 'unknown' are excluded entirely. The
+        default is intentionally strict: summarize only files that triage
+        already marked high/medium.
         Within each tier, we diversify across code / doc / image categories
         so a single huge code tree doesn't starve documents and images.
         """
@@ -250,7 +367,18 @@ class MemoryStore:
         doc_limit = max(limit // 4, 1)
         img_limit = max(limit // 4, 1)
 
-        triage_filter = "AND triage_status NOT IN ('skip', 'low', 'unknown')"
+        allowed = tuple(allowed_triage_statuses or ("high", "medium"))
+        valid_allowed = [s for s in allowed if s in {"high", "medium"}]
+        if not valid_allowed:
+            valid_allowed = ["high", "medium"]
+        placeholders = ",".join("?" for _ in valid_allowed)
+        triage_filter = f"AND triage_status IN ({placeholders})"
+        triage_params: list[Any] = list(valid_allowed)
+        if include_untriaged:
+            triage_filter = (
+                f"AND (triage_status IN ({placeholders}) "
+                "OR triage_status = '' OR triage_status IS NULL)"
+            )
         triage_order = """CASE triage_status
             WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2
         END"""
@@ -271,7 +399,7 @@ class MemoryStore:
                       {triage_filter}
                     ORDER BY {triage_order}, priority ASC, modified_at DESC
                     LIMIT ?""",
-                (grp_limit,),
+                (*triage_params, grp_limit),
             ).fetchall()
             results.extend(rows)
 
@@ -333,7 +461,7 @@ class MemoryStore:
                FROM file_index
                WHERE semantic_summary != '' AND semantic_summary IS NOT NULL
                  AND (embedding IS NULL OR embedding = '')
-                 AND triage_status IN ('high', 'medium', '')
+                 AND triage_status IN ('high', 'medium')
                ORDER BY
                  CASE triage_status WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
                  modified_at DESC
@@ -365,6 +493,8 @@ class MemoryStore:
             try:
                 import numpy as np
                 q = np.frombuffer(query_embedding, dtype=np.float32)
+                if q.size == 0 or not np.isfinite(q).all():
+                    return []
                 q_norm = float(np.linalg.norm(q)) + 1e-9
 
                 paths, ftypes, summaries, sizes, prios, scores = [], [], [], [], [], []
@@ -372,14 +502,22 @@ class MemoryStore:
                 chunk_size = 4096
                 for start in range(0, len(rows), chunk_size):
                     chunk = rows[start:start + chunk_size]
+                    vectors = []
+                    vector_rows = []
+                    for r in chunk:
+                        v = np.frombuffer(r[5], dtype=np.float32)
+                        if v.shape != q.shape or v.size == 0 or not np.isfinite(v).all():
+                            continue
+                        vectors.append(v)
+                        vector_rows.append(r)
+                    if not vectors:
+                        continue
                     try:
-                        mat = np.stack([
-                            np.frombuffer(r[5], dtype=np.float32) for r in chunk
-                        ])
+                        mat = np.stack(vectors)
                     except ValueError:
                         # Mismatched dimensions across rows — fall back to per-row
                         from src.memory.embeddings import cosine_similarity as _cs
-                        for r in chunk:
+                        for r in vector_rows:
                             try:
                                 s = _cs(query_embedding, r[5])
                             except Exception:
@@ -389,8 +527,11 @@ class MemoryStore:
                             prios.append(r[4]); scores.append(float(s))
                         continue
                     norms = np.linalg.norm(mat, axis=1) + 1e-9
-                    sims = (mat @ q) / (norms * q_norm)
-                    for r, s in zip(chunk, sims):
+                    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                        sims = (mat @ q) / (norms * q_norm)
+                    for r, s in zip(vector_rows, sims):
+                        if not np.isfinite(s):
+                            continue
                         paths.append(r[0]); ftypes.append(r[1])
                         summaries.append(r[2]); sizes.append(r[3])
                         prios.append(r[4]); scores.append(float(s))
@@ -645,6 +786,362 @@ class MemoryStore:
         """Retrieve recent adaptive scheduling decisions for LLM context."""
         return await self.query_knowledge(category="scheduling_decision", limit=limit)
 
+    # ── Chunk RAG operations ───────────────────────────────────
+
+    @staticmethod
+    def _fts_query(text: str) -> str:
+        tokens = re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
+        tokens = [t for t in tokens if len(t) > 1][:12]
+        return " OR ".join(tokens)
+
+    async def delete_document_chunks_for_path(self, path: str) -> int:
+        """Remove all RAG chunks for a file path."""
+        db = self._db
+        assert db
+
+        def _run() -> int:
+            ids = [r[0] for r in db.execute(
+                "SELECT id FROM document_chunks WHERE path = ?",
+                (path,),
+            ).fetchall()]
+            if not ids:
+                return 0
+            placeholders = ",".join("?" for _ in ids)
+            try:
+                db.execute(f"DELETE FROM document_chunks_fts WHERE id IN ({placeholders})", ids)
+            except sqlite3.OperationalError:
+                pass
+            db.execute(f"DELETE FROM document_chunks WHERE id IN ({placeholders})", ids)
+            db.commit()
+            return len(ids)
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
+    async def upsert_document_chunks(
+        self,
+        path: str,
+        file_hash: str,
+        chunks: list[dict[str, Any]],
+    ) -> int:
+        """Replace a file's chunks and FTS rows in one transaction."""
+        db = self._db
+        assert db
+        now = time.time()
+
+        def _run() -> int:
+            old_ids = [r[0] for r in db.execute(
+                "SELECT id FROM document_chunks WHERE path = ?",
+                (path,),
+            ).fetchall()]
+            if old_ids:
+                placeholders = ",".join("?" for _ in old_ids)
+                try:
+                    db.execute(f"DELETE FROM document_chunks_fts WHERE id IN ({placeholders})", old_ids)
+                except sqlite3.OperationalError:
+                    pass
+                db.execute(f"DELETE FROM document_chunks WHERE id IN ({placeholders})", old_ids)
+
+            rows = []
+            fts_rows = []
+            for chunk in chunks:
+                chunk_index = int(chunk.get("chunk_index", len(rows)))
+                content = str(chunk.get("content") or "").strip()
+                if not content:
+                    continue
+                chunk_id = chunk.get("id") or f"{file_hash}:{hashlib.sha1(f'{path}:{chunk_index}:{content[:80]}'.encode()).hexdigest()[:16]}"
+                rows.append((
+                    chunk_id,
+                    path,
+                    file_hash,
+                    chunk_index,
+                    chunk.get("start_line"),
+                    chunk.get("end_line"),
+                    content,
+                    now,
+                    json.dumps(chunk.get("metadata") or {}),
+                ))
+                fts_rows.append((chunk_id, path, content))
+
+            if rows:
+                db.executemany(
+                    """INSERT INTO document_chunks
+                       (id, path, file_hash, chunk_index, start_line, end_line,
+                        content, created_at, metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+                try:
+                    db.executemany(
+                        "INSERT INTO document_chunks_fts (id, path, content) VALUES (?, ?, ?)",
+                        fts_rows,
+                    )
+                except sqlite3.OperationalError as e:
+                    logger.warning("Failed to update document chunk FTS rows: %s", e)
+            db.commit()
+            return len(rows)
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
+    async def get_files_needing_rag_index(
+        self,
+        limit: int = 20,
+        *,
+        allowed_triage_statuses: list[str] | tuple[str, ...] | None = None,
+        max_file_size_bytes: int | None = None,
+    ) -> list[dict]:
+        """Files whose chunk index is missing or stale for the current hash."""
+        db = self._db
+        assert db
+        statuses = [s for s in (allowed_triage_statuses or ("high", "medium")) if s in {"high", "medium"}]
+        if not statuses:
+            statuses = ["high", "medium"]
+        placeholders = ",".join("?" for _ in statuses)
+        size_clause = "AND size_bytes <= ?" if max_file_size_bytes else ""
+        params: list[Any] = [*statuses]
+        if max_file_size_bytes:
+            params.append(max_file_size_bytes)
+        params.append(limit)
+
+        rows = db.execute(
+            f"""SELECT path, hash, file_type, size_bytes, modified_at,
+                       COALESCE(semantic_summary, '') as semantic_summary
+                FROM file_index fi
+                WHERE triage_status IN ({placeholders})
+                  {size_clause}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM document_chunks dc
+                    WHERE dc.path = fi.path AND dc.file_hash = fi.hash
+                  )
+                ORDER BY
+                  CASE triage_status WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                  modified_at DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        return [
+            {
+                "path": r[0], "hash": r[1], "file_type": r[2],
+                "size_bytes": r[3], "modified_at": r[4], "semantic_summary": r[5],
+            }
+            for r in rows
+        ]
+
+    async def get_chunks_needing_embedding(
+        self,
+        limit: int = 100,
+        *,
+        embedding_model: str = "",
+    ) -> list[dict]:
+        db = self._db
+        assert db
+        if embedding_model:
+            where = "(embedding IS NULL OR length(embedding) = 0 OR embedding_model != ?)"
+            params: list[Any] = [embedding_model, limit]
+        else:
+            where = "(embedding IS NULL OR length(embedding) = 0)"
+            params = [limit]
+        rows = db.execute(
+            f"""SELECT id, path, chunk_index, content
+                FROM document_chunks
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        return [
+            {"id": r[0], "path": r[1], "chunk_index": r[2], "content": r[3]}
+            for r in rows
+        ]
+
+    async def batch_update_chunk_embeddings(self, updates: list[tuple[str, bytes, str]]) -> None:
+        if not updates:
+            return
+        db = self._db
+        assert db
+
+        def _run() -> None:
+            db.executemany(
+                "UPDATE document_chunks SET embedding = ?, embedding_model = ? WHERE id = ?",
+                [(emb, model, chunk_id) for chunk_id, emb, model in updates],
+            )
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
+
+    async def fts_search_chunks(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        allowed_triage_statuses: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        db = self._db
+        assert db
+        fts_query = self._fts_query(query)
+        if not fts_query:
+            return []
+        statuses = [s for s in (allowed_triage_statuses or ("high", "medium")) if s in {"high", "medium"}]
+        if not statuses:
+            statuses = ["high", "medium"]
+        placeholders = ",".join("?" for _ in statuses)
+        params: list[Any] = [fts_query, *statuses, limit]
+
+        def _run() -> list[dict]:
+            try:
+                rows = db.execute(
+                    f"""SELECT dc.id, dc.path, dc.chunk_index, dc.start_line, dc.end_line,
+                               dc.content, fi.file_type, bm25(document_chunks_fts) as rank
+                        FROM document_chunks_fts
+                        JOIN document_chunks dc ON dc.id = document_chunks_fts.id
+                        JOIN file_index fi ON fi.path = dc.path
+                        WHERE document_chunks_fts MATCH ?
+                          AND fi.triage_status IN ({placeholders})
+                        ORDER BY rank ASC
+                        LIMIT ?""",
+                    params,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                like = f"%{query}%"
+                rows = db.execute(
+                    f"""SELECT dc.id, dc.path, dc.chunk_index, dc.start_line, dc.end_line,
+                               dc.content, fi.file_type, 0.0 as rank
+                        FROM document_chunks dc
+                        JOIN file_index fi ON fi.path = dc.path
+                        WHERE dc.content LIKE ?
+                          AND fi.triage_status IN ({placeholders})
+                        ORDER BY dc.created_at DESC
+                        LIMIT ?""",
+                    [like, *statuses, limit],
+                ).fetchall()
+            return [
+                {
+                    "chunk_id": r[0], "path": r[1], "chunk_index": r[2],
+                    "start_line": r[3], "end_line": r[4], "content": r[5],
+                    "file_type": r[6], "fts_rank": float(r[7] or 0.0),
+                    "retrieval_mode": "fts",
+                }
+                for r in rows
+            ]
+
+        return await asyncio.to_thread(_run)
+
+    async def vector_search_chunks(
+        self,
+        query_embedding: bytes,
+        limit: int = 20,
+        *,
+        allowed_triage_statuses: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        db = self._db
+        assert db
+        statuses = [s for s in (allowed_triage_statuses or ("high", "medium")) if s in {"high", "medium"}]
+        if not statuses:
+            statuses = ["high", "medium"]
+        placeholders = ",".join("?" for _ in statuses)
+
+        def _run() -> list[dict]:
+            rows = db.execute(
+                f"""SELECT dc.id, dc.path, dc.chunk_index, dc.start_line, dc.end_line,
+                           dc.content, fi.file_type, dc.embedding
+                    FROM document_chunks dc
+                    JOIN file_index fi ON fi.path = dc.path
+                    WHERE dc.embedding IS NOT NULL AND length(dc.embedding) > 0
+                      AND fi.triage_status IN ({placeholders})""",
+                statuses,
+            ).fetchall()
+            if not rows:
+                return []
+            try:
+                import numpy as np
+                q = np.frombuffer(query_embedding, dtype=np.float32)
+                q_norm = float(np.linalg.norm(q)) + 1e-9
+                scored: list[tuple[float, Any]] = []
+                for r in rows:
+                    v = np.frombuffer(r[7], dtype=np.float32)
+                    if v.shape != q.shape or v.size == 0:
+                        continue
+                    score = float((v @ q) / ((np.linalg.norm(v) + 1e-9) * q_norm))
+                    if np.isfinite(score):
+                        scored.append((score, r))
+            except ImportError:
+                from src.memory.embeddings import cosine_similarity
+                scored = []
+                for r in rows:
+                    try:
+                        scored.append((cosine_similarity(query_embedding, r[7]), r))
+                    except Exception:
+                        continue
+            scored.sort(key=lambda item: item[0], reverse=True)
+            return [
+                {
+                    "chunk_id": r[0], "path": r[1], "chunk_index": r[2],
+                    "start_line": r[3], "end_line": r[4], "content": r[5],
+                    "file_type": r[6], "score": round(score, 4),
+                    "retrieval_mode": "vector",
+                }
+                for score, r in scored[:limit]
+            ]
+
+        return await asyncio.to_thread(_run)
+
+    async def hybrid_search_chunks(
+        self,
+        query: str,
+        *,
+        limit: int = 6,
+        fts_limit: int = 20,
+        vector_limit: int = 20,
+        min_score: float = 0.05,
+        allowed_triage_statuses: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """Hybrid RAG retrieval over chunks, with best-effort vector fallback."""
+        fts_results = await self.fts_search_chunks(
+            query, limit=fts_limit, allowed_triage_statuses=allowed_triage_statuses,
+        )
+        vector_results: list[dict] = []
+        try:
+            from src.memory.embeddings import embed_text, is_available
+            if is_available():
+                q_emb = embed_text(query)
+                if q_emb:
+                    vector_results = await self.vector_search_chunks(
+                        q_emb, limit=vector_limit, allowed_triage_statuses=allowed_triage_statuses,
+                    )
+        except Exception as e:
+            logger.debug("Chunk vector retrieval unavailable: %s", e)
+
+        merged: dict[str, dict] = {}
+        for rank, item in enumerate(fts_results):
+            score = 1.0 / (rank + 1)
+            current = merged.setdefault(item["chunk_id"], {**item, "hybrid_score": 0.0, "modes": []})
+            current["hybrid_score"] += score
+            current["modes"].append("fts")
+        for rank, item in enumerate(vector_results):
+            score = max(float(item.get("score", 0.0)), 0.0) + (0.25 / (rank + 1))
+            current = merged.setdefault(item["chunk_id"], {**item, "hybrid_score": 0.0, "modes": []})
+            current["hybrid_score"] += score
+            current["score"] = max(float(current.get("score", 0.0)), float(item.get("score", 0.0)))
+            current["modes"].append("vector")
+
+        results = [
+            item for item in merged.values()
+            if float(item.get("hybrid_score", 0.0)) >= min_score
+        ]
+        results.sort(key=lambda item: item.get("hybrid_score", 0.0), reverse=True)
+        for idx, item in enumerate(results[:limit], 1):
+            item["source_id"] = f"S{idx}"
+            item["hybrid_score"] = round(float(item.get("hybrid_score", 0.0)), 4)
+            item["content"] = str(item.get("content", ""))[:1200]
+            item["modes"] = sorted(set(item.get("modes", [])))
+        return results[:limit]
+
+    async def count_document_chunks(self) -> int:
+        assert self._db
+        return self._db.execute("SELECT COUNT(*) FROM document_chunks").fetchone()[0]
+
     # ── Triage operations ──────────────────────────────────────
 
     async def get_untriaged_files(
@@ -746,6 +1243,59 @@ class MemoryStore:
         async with self._lock:
             return await asyncio.to_thread(_run)
 
+    async def batch_update_triage_by_extensions(self, extensions: list[str], status: str) -> int:
+        """Mark untriaged files with matching extensions."""
+        normalized = sorted({
+            ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+            for ext in extensions
+            if ext
+        })
+        if not normalized:
+            return 0
+        db = self._db
+        assert db
+        placeholders = ",".join("?" for _ in normalized)
+
+        def _run() -> int:
+            cursor = db.execute(
+                f"UPDATE file_index SET triage_status = ? "
+                f"WHERE lower(file_type) IN ({placeholders}) "
+                "AND (triage_status = '' OR triage_status IS NULL)",
+                (status, *normalized),
+            )
+            db.commit()
+            return cursor.rowcount or 0
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
+    async def batch_update_triage_by_file_patterns(self, patterns: list[str], status: str) -> int:
+        """Mark untriaged files whose basename or full path matches fnmatch patterns."""
+        normalized = [p for p in patterns if p]
+        if not normalized:
+            return 0
+        db = self._db
+        assert db
+
+        def _run() -> int:
+            rows = db.execute(
+                "SELECT path FROM file_index WHERE triage_status = '' OR triage_status IS NULL"
+            ).fetchall()
+            updates: list[tuple[str, str]] = []
+            for (path,) in rows:
+                name = Path(path).name
+                rel = str(Path(path).expanduser())
+                if any(fnmatch(name, pat) or fnmatch(rel, pat) for pat in normalized):
+                    updates.append((status, path))
+            if not updates:
+                return 0
+            db.executemany("UPDATE file_index SET triage_status = ? WHERE path = ?", updates)
+            db.commit()
+            return len(updates)
+
+        async with self._lock:
+            return await asyncio.to_thread(_run)
+
     async def park_remaining_as_unknown(self) -> int:
         """Mark every still-untriaged row as 'unknown' so downstream
         agents don't keep re-queueing them when no LLM is available.
@@ -827,6 +1377,17 @@ class MemoryStore:
     async def remove_file(self, path: str) -> None:
         async with self._lock:
             assert self._db
+            ids = [r[0] for r in self._db.execute(
+                "SELECT id FROM document_chunks WHERE path = ?",
+                (path,),
+            ).fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                try:
+                    self._db.execute(f"DELETE FROM document_chunks_fts WHERE id IN ({placeholders})", ids)
+                except sqlite3.OperationalError:
+                    pass
+                self._db.execute(f"DELETE FROM document_chunks WHERE id IN ({placeholders})", ids)
             self._db.execute("DELETE FROM file_index WHERE path = ?", (path,))
             self._db.commit()
             self._cache.invalidate(f"file:{path}")
@@ -877,6 +1438,364 @@ class MemoryStore:
             ).fetchall()
         return [{"id": r[0], "category": r[1], "content": r[2], "source": r[3]} for r in rows]
 
+    # ── Correctable profile facts ──────────────────────────────
+
+    async def upsert_profile_fact(
+        self,
+        fact_id: str,
+        category: str,
+        statement: str,
+        source_type: str = "inferred",
+        source_ref: str = "",
+        confidence: float = 0.5,
+        status: str = "inferred",
+        metadata: dict | None = None,
+    ) -> None:
+        """Store a user-profile fact while preserving explicit user feedback."""
+        statement = statement.strip()
+        if not fact_id or not statement:
+            return
+
+        async with self._lock:
+            now = time.time()
+            assert self._db
+            existing = self._db.execute(
+                "SELECT status, created_at FROM profile_facts WHERE id = ?",
+                (fact_id,),
+            ).fetchone()
+            created_at = existing[1] if existing else now
+            if existing and existing[0] in {"confirmed", "rejected", "hidden"}:
+                status = existing[0]
+
+            self._db.execute(
+                """INSERT OR REPLACE INTO profile_facts
+                   (id, category, statement, source_type, source_ref,
+                    confidence, status, created_at, updated_at, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fact_id, category, statement, source_type, source_ref,
+                    float(max(0, min(1, confidence))), status, created_at, now,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self._db.commit()
+
+    async def list_profile_facts(
+        self,
+        status: str | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        include_hidden: bool = False,
+    ) -> list[dict]:
+        assert self._db
+        sql = """SELECT id, category, statement, source_type, source_ref,
+                        confidence, status, created_at, updated_at, metadata
+                 FROM profile_facts WHERE 1=1"""
+        params: list[Any] = []
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        elif not include_hidden:
+            sql += " AND status != 'hidden'"
+        if category:
+            sql += " AND category = ?"
+            params.append(category)
+        sql += " ORDER BY CASE status WHEN 'confirmed' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0],
+                "category": r[1],
+                "statement": r[2],
+                "source_type": r[3],
+                "source_ref": r[4],
+                "confidence": r[5],
+                "status": r[6],
+                "created_at": r[7],
+                "updated_at": r[8],
+                "metadata": json.loads(r[9] or "{}"),
+            }
+            for r in rows
+        ]
+
+    async def update_profile_fact_status(self, fact_id: str, status: str) -> bool:
+        if status not in {"inferred", "confirmed", "rejected", "hidden"}:
+            raise ValueError(f"Invalid profile fact status: {status}")
+        async with self._lock:
+            assert self._db
+            cursor = self._db.execute(
+                "UPDATE profile_facts SET status = ?, updated_at = ? WHERE id = ?",
+                (status, time.time(), fact_id),
+            )
+            self._db.commit()
+            return bool(cursor.rowcount)
+
+    # ── Source records + insight runs ──────────────────────────
+
+    async def upsert_source_record(
+        self,
+        record_id: str,
+        source_type: str,
+        source_ref: str,
+        title: str = "",
+        domain: str = "",
+        path: str = "",
+        occurred_at: float = 0.0,
+        metadata: dict | None = None,
+    ) -> None:
+        """Store a provenance record used to explain profile/insight claims."""
+        if not record_id or not source_type or not source_ref:
+            return
+        async with self._lock:
+            assert self._db
+            self._db.execute(
+                """INSERT OR REPLACE INTO source_records
+                   (id, source_type, source_ref, title, domain, path,
+                    occurred_at, created_at, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record_id,
+                    source_type,
+                    source_ref,
+                    title,
+                    domain,
+                    path,
+                    occurred_at,
+                    time.time(),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self._db.commit()
+
+    async def list_source_records(
+        self,
+        source_type: str | None = None,
+        domain: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        assert self._db
+        sql = """SELECT id, source_type, source_ref, title, domain, path,
+                        occurred_at, created_at, metadata
+                 FROM source_records WHERE 1=1"""
+        params: list[Any] = []
+        if source_type:
+            sql += " AND source_type = ?"
+            params.append(source_type)
+        if domain:
+            sql += " AND domain = ?"
+            params.append(domain)
+        sql += " ORDER BY COALESCE(occurred_at, created_at) DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0],
+                "source_type": r[1],
+                "source_ref": r[2],
+                "title": r[3] or "",
+                "domain": r[4] or "",
+                "path": r[5] or "",
+                "occurred_at": r[6] or 0,
+                "created_at": r[7],
+                "metadata": json.loads(r[8] or "{}"),
+            }
+            for r in rows
+        ]
+
+    async def start_insight_run(
+        self,
+        run_id: str,
+        run_type: str,
+        input_counts: dict | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        if not run_id or not run_type:
+            return
+        async with self._lock:
+            assert self._db
+            self._db.execute(
+                """INSERT OR REPLACE INTO insight_runs
+                   (id, run_type, status, started_at, completed_at, elapsed_s,
+                    input_counts, output_summary, metadata)
+                   VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)""",
+                (
+                    run_id,
+                    run_type,
+                    "running",
+                    time.time(),
+                    json.dumps(input_counts or {}, ensure_ascii=False),
+                    "",
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self._db.commit()
+
+    async def finish_insight_run(
+        self,
+        run_id: str,
+        status: str = "completed",
+        output_summary: dict | str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        if status not in {"running", "completed", "failed"}:
+            raise ValueError(f"Invalid insight run status: {status}")
+        async with self._lock:
+            assert self._db
+            row = self._db.execute(
+                "SELECT started_at, metadata FROM insight_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if not row:
+                return
+            now = time.time()
+            existing_meta = json.loads(row[1] or "{}")
+            existing_meta.update(metadata or {})
+            summary = (
+                output_summary
+                if isinstance(output_summary, str)
+                else json.dumps(output_summary or {}, ensure_ascii=False)
+            )
+            self._db.execute(
+                """UPDATE insight_runs
+                   SET status = ?, completed_at = ?, elapsed_s = ?,
+                       output_summary = ?, metadata = ?
+                   WHERE id = ?""",
+                (
+                    status,
+                    now,
+                    round(now - float(row[0]), 3),
+                    summary,
+                    json.dumps(existing_meta, ensure_ascii=False),
+                    run_id,
+                ),
+            )
+            self._db.commit()
+
+    async def list_insight_runs(self, run_type: str | None = None, limit: int = 20) -> list[dict]:
+        assert self._db
+        if run_type:
+            rows = self._db.execute(
+                """SELECT id, run_type, status, started_at, completed_at, elapsed_s,
+                          input_counts, output_summary, metadata
+                   FROM insight_runs WHERE run_type = ?
+                   ORDER BY started_at DESC LIMIT ?""",
+                (run_type, limit),
+            ).fetchall()
+        else:
+            rows = self._db.execute(
+                """SELECT id, run_type, status, started_at, completed_at, elapsed_s,
+                          input_counts, output_summary, metadata
+                   FROM insight_runs ORDER BY started_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "run_type": r[1],
+                "status": r[2],
+                "started_at": r[3],
+                "completed_at": r[4],
+                "elapsed_s": r[5],
+                "input_counts": json.loads(r[6] or "{}"),
+                "output_summary": json.loads(r[7] or "{}") if (r[7] or "").startswith("{") else (r[7] or ""),
+                "metadata": json.loads(r[8] or "{}"),
+            }
+            for r in rows
+        ]
+
+    async def upsert_insight_item(
+        self,
+        item_id: str,
+        run_id: str,
+        item_type: str,
+        statement: str,
+        source_type: str = "",
+        source_ref: str = "",
+        confidence: float = 0.5,
+        status: str = "inferred",
+        metadata: dict | None = None,
+    ) -> None:
+        if status not in {"inferred", "confirmed", "rejected", "hidden"}:
+            raise ValueError(f"Invalid insight item status: {status}")
+        statement = statement.strip()
+        if not item_id or not run_id or not item_type or not statement:
+            return
+        async with self._lock:
+            assert self._db
+            existing = self._db.execute(
+                "SELECT status, created_at FROM insight_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            created_at = existing[1] if existing else time.time()
+            if existing and existing[0] in {"confirmed", "rejected", "hidden"}:
+                status = existing[0]
+            now = time.time()
+            self._db.execute(
+                """INSERT OR REPLACE INTO insight_items
+                   (id, run_id, item_type, statement, source_type, source_ref,
+                    confidence, status, created_at, updated_at, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item_id,
+                    run_id,
+                    item_type,
+                    statement,
+                    source_type,
+                    source_ref,
+                    float(max(0, min(1, confidence))),
+                    status,
+                    created_at,
+                    now,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self._db.commit()
+
+    async def list_insight_items(
+        self,
+        run_id: str | None = None,
+        item_type: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        include_hidden: bool = False,
+    ) -> list[dict]:
+        assert self._db
+        sql = """SELECT id, run_id, item_type, statement, source_type, source_ref,
+                        confidence, status, created_at, updated_at, metadata
+                 FROM insight_items WHERE 1=1"""
+        params: list[Any] = []
+        if run_id:
+            sql += " AND run_id = ?"
+            params.append(run_id)
+        if item_type:
+            sql += " AND item_type = ?"
+            params.append(item_type)
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        elif not include_hidden:
+            sql += " AND status != 'hidden'"
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0],
+                "run_id": r[1],
+                "item_type": r[2],
+                "statement": r[3],
+                "source_type": r[4] or "",
+                "source_ref": r[5] or "",
+                "confidence": r[6],
+                "status": r[7],
+                "created_at": r[8],
+                "updated_at": r[9],
+                "metadata": json.loads(r[10] or "{}"),
+            }
+            for r in rows
+        ]
+
     # ── Agent context (session cache) ─────────────────────────
 
     async def save_context(self, session_id: str, agent_name: str, context: dict, ttl: float = 3600) -> None:
@@ -913,9 +1832,11 @@ class MemoryStore:
         assert self._db
         file_count = self._db.execute("SELECT COUNT(*) FROM file_index").fetchone()[0]
         knowledge_count = self._db.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
+        chunk_count = self._db.execute("SELECT COUNT(*) FROM document_chunks").fetchone()[0]
         return {
             "indexed_files": file_count,
             "knowledge_entries": knowledge_count,
+            "document_chunks": chunk_count,
             "cache_items": len(self._cache),
         }
 

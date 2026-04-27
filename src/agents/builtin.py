@@ -216,6 +216,8 @@ from src.agents.prioritizer import PriorityClassifierAgent
 from src.agents.reporter import ReportGeneratorAgent
 from src.agents.profile_builder import ProfileBuilderAgent
 from src.agents.triage import TriageAgent
+from src.agents.assistant import AssistantAgent
+from src.agents.rag_indexer import RagIndexerAgent
 
 
 BUILTIN_AGENTS: list[BaseAgent] = [
@@ -235,7 +237,11 @@ BUILTIN_AGENTS: list[BaseAgent] = [
     ProfileBuilderAgent(),
     # v0.3 — LLM triage (decides what's worth summarizing)
     TriageAgent(),
+    # v0.8 — delayed background chunk RAG
+    RagIndexerAgent(),
     # v0.5 — agent management syscalls
     AgentSubmitAgent(),
     AgentTaskStatusAgent(),
+    # v0.7 — consumer desktop facade
+    AssistantAgent(),
 ]

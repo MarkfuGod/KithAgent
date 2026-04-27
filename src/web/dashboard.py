@@ -25,13 +25,15 @@ from pathlib import Path
 
 from aiohttp import web
 
-from src.web._utils import DB_PATH
+from src.web._utils import DB_PATH, require_dashboard_mutation_header
 from src.web.api import (
+    clusters as clusters_api,
     daemon as daemon_api,
     events as events_api,
     knowledge as knowledge_api,
     llm_config as llm_api,
     overview as overview_api,
+    rag as rag_api,
     scheduling as scheduling_api,
     search as search_api,
     triage as triage_api,
@@ -76,7 +78,7 @@ def create_app(event_bus=None) -> web.Application:
     """Build the aiohttp app. `event_bus` is optional — when the dashboard
     is started in-process by the kernel it'll be passed in so SSE can
     stream events from the local bus instead of proxying to the daemon."""
-    app = web.Application()
+    app = web.Application(middlewares=[require_dashboard_mutation_header])
     if event_bus is not None:
         app["event_bus"] = event_bus
 
@@ -88,6 +90,8 @@ def create_app(event_bus=None) -> web.Application:
     app.router.add_get("/api/directories", overview_api.directory_tree)
     app.router.add_get("/api/recent", overview_api.recent_files)
     app.router.add_get("/api/summary-progress", overview_api.summary_progress)
+    app.router.add_get("/api/file-clusters", clusters_api.file_clusters)
+    app.router.add_post("/api/file-clusters/decision", clusters_api.file_cluster_decision)
 
     # Search
     app.router.add_get("/api/search", search_api.file_search)
@@ -112,6 +116,13 @@ def create_app(event_bus=None) -> web.Application:
     # Cron strategy
     app.router.add_get("/api/scheduling-strategy", scheduling_api.strategy_get)
     app.router.add_post("/api/scheduling-strategy", scheduling_api.strategy_set)
+
+    # RAG control + debugging
+    app.router.add_get("/api/rag/status", rag_api.status)
+    app.router.add_post("/api/rag/config", rag_api.config_save)
+    app.router.add_post("/api/rag/trigger", rag_api.trigger)
+    app.router.add_get("/api/rag/debug-search", rag_api.debug_search)
+    app.router.add_get("/api/rag/logs", rag_api.logs)
 
     # Daemon proxies
     app.router.add_get("/api/daemon", daemon_api.status)

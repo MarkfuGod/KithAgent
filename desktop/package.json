@@ -1,0 +1,30 @@
+{
+  "name": "kith-jarvis-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mac desktop companion for the local Kith personal memory daemon.",
+  "main": "src/main/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
+    "build": "tsc -p tsconfig.json && vite build",
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "typescript": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "electron": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "wait-on": "latest"
+  }
+}

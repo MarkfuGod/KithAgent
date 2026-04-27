@@ -19,7 +19,7 @@ let llmDirty = false;
 
 const PROVIDER_TYPES = {
   openai:                { label: 'OpenAI',                keyEnv: 'OPENAI_API_KEY',                defaultUrl: '',                                          placeholder: 'gpt-4o-mini' },
-  openai_compatible:     { label: 'OpenAI Compatible',     keyEnv: 'OPENAI_COMPATIBLE_API_KEY',     defaultUrl: '',                                          placeholder: 'deepseek-chat' },
+  openai_compatible:     { label: 'OpenAI Compatible',     keyEnv: 'OPENAI_COMPATIBLE_API_KEY',     defaultUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', placeholder: 'qwen3.6-plus' },
   anthropic:             { label: 'Anthropic',             keyEnv: 'ANTHROPIC_API_KEY',             defaultUrl: '',                                          placeholder: 'claude-sonnet-4-20250514' },
   anthropic_compatible:  { label: 'Anthropic Compatible',  keyEnv: 'ANTHROPIC_COMPATIBLE_API_KEY',  defaultUrl: 'https://api.minimaxi.com/anthropic',        placeholder: 'MiniMax-M2.7' },
 };
@@ -210,7 +210,7 @@ async function saveLLMConfig() {
   try {
     const resp = await fetch(API + '/api/llm-config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: DASHBOARD_JSON_HEADERS,
       body: JSON.stringify(payload),
     }).then(r => r.json());
 
@@ -358,7 +358,7 @@ async function saveRouting() {
   try {
     const resp = await fetch(API + '/api/llm-routing', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: DASHBOARD_JSON_HEADERS,
       body: JSON.stringify({ defaults, functions }),
     }).then(r => r.json());
     if (resp.success) {
@@ -438,7 +438,7 @@ function renderEmbeddingConfig() {
         </div>
         <div class="form-group">
           <label class="form-label" style="font-size:12px;">Model</label>
-          <input class="form-input mono" id="emb_model" value="${cfg.model || (provider === 'dashscope' ? 'qwen3-vl-embedding' : 'text-embedding-3-small')}" oninput="markEmbeddingDirty()">
+          <input class="form-input mono" id="emb_model" value="${cfg.model || (provider === 'dashscope' ? 'text-embedding-v4' : 'text-embedding-3-small')}" oninput="markEmbeddingDirty()">
         </div>
         <div class="form-group">
           <label class="form-label" style="font-size:12px;">Dimensions (0 = auto)</label>
@@ -460,7 +460,7 @@ function selectEmbeddingProvider(name) {
   if (!embeddingConfig) return;
   const defaults = {
     local:     { provider: 'local',     local_model: 'all-MiniLM-L6-v2' },
-    dashscope: { provider: 'dashscope', api_key_env: 'DASHSCOPE_API_KEY', api_base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen3-vl-embedding',     dimensions: 0 },
+    dashscope: { provider: 'dashscope', api_key_env: 'DASHSCOPE_API_KEY', api_base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'text-embedding-v4',     dimensions: 1024 },
     openai:    { provider: 'openai',    api_key_env: 'OPENAI_API_KEY',    api_base_url: 'https://api.openai.com/v1',                          model: 'text-embedding-3-small', dimensions: 0 },
   };
   embeddingConfig.config = defaults[name] || defaults.local;
@@ -488,7 +488,7 @@ async function saveEmbeddingConfig() {
   try {
     const resp = await fetch(API + '/api/embedding-config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: DASHBOARD_JSON_HEADERS,
       body: JSON.stringify({ embedding: payload }),
     }).then(r => r.json());
     if (resp.success) {

@@ -23,6 +23,7 @@ async function loadTriage() {
   await _loadTriageDistribution();
   await _loadTriageByDir();
   await _loadSkippedDirectories();
+  await _loadFileClusters();
 }
 
 async function _loadTriageDistribution() {
@@ -138,5 +139,71 @@ async function _loadSkippedDirectories() {
     `;
   } catch (e) {
     target.innerHTML = `<div style="color:var(--accent-red);padding:20px;">Failed to load: ${e.message}</div>`;
+  }
+}
+
+async function _loadFileClusters() {
+  const target = document.getElementById('fileClusterRecommendations');
+  if (!target) return;
+  try {
+    const data = await fetch(API + '/api/file-clusters?depth=3&limit=60').then(r => r.json());
+    const clusters = data.clusters || [];
+    if (clusters.length === 0) {
+      target.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">No clusters yet.</div>';
+      return;
+    }
+
+    const colors = {
+      include: 'var(--accent-green)',
+      review: 'var(--accent-orange)',
+      exclude: 'var(--text-muted)',
+    };
+    target.innerHTML = `
+      <div style="padding:12px 20px;color:var(--text-muted);font-size:12px;">
+        ${data.total_clusters.toLocaleString()} clusters detected. Excluding a cluster marks its files <code>skip</code>;
+        including marks unreviewed files <code>high</code> so they can be summarized.
+      </div>
+      <table class="data-table">
+        <thead><tr><th>Cluster</th><th>Recommendation</th><th>Status Mix</th><th>Signals</th><th>Decision</th></tr></thead>
+        <tbody>${clusters.map(c => {
+          const statuses = Object.entries(c.statuses || {}).map(([k, v]) =>
+            `<span class="type-badge" style="margin-right:4px;color:${TRIAGE_STATUS_COLORS[k] || 'var(--text-muted)'};">${k}:${v}</span>`
+          ).join('');
+          const rec = c.recommendation || 'review';
+          const prefixArg = escapeHtml(JSON.stringify(c.prefix || ''));
+          return `<tr>
+            <td class="path" title="${escapeHtml(c.prefix || c.directory)}">${escapeHtml(c.directory)}<br><span style="color:var(--text-muted);font-size:11px;">${c.total.toLocaleString()} files, ${formatBytes(c.total_size || 0)}</span></td>
+            <td><span class="type-badge" style="color:${colors[rec] || 'var(--text-muted)'};">${rec}</span><br><span style="color:var(--text-muted);font-size:11px;">${escapeHtml(c.reason || '')}</span></td>
+            <td>${statuses}</td>
+            <td style="font-size:12px;color:var(--text-muted);">config ${c.config || 0}, data ${c.data || 0}, generated ${c.generated || 0}</td>
+            <td>
+              <button class="btn btn-success" style="font-size:11px;padding:4px 8px;" onclick="setClusterDecision(${prefixArg},'high')">Include</button>
+              <button class="btn btn-danger" style="font-size:11px;padding:4px 8px;" onclick="setClusterDecision(${prefixArg},'skip')">Exclude</button>
+            </td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    `;
+  } catch (e) {
+    target.innerHTML = `<div style="color:var(--accent-red);padding:20px;">Failed to load clusters: ${e.message}</div>`;
+  }
+}
+
+async function setClusterDecision(prefix, status) {
+  try {
+    const resp = await fetch(API + '/api/file-clusters/decision', {
+      method: 'POST',
+      headers: DASHBOARD_JSON_HEADERS,
+      body: JSON.stringify({ prefix, status }),
+    }).then(r => r.json());
+    if (resp.success) {
+      showToast(`Updated ${resp.updated} files to ${status}`, 'success');
+      await loadTriage();
+      await loadSummaryProgress();
+    } else {
+      showToast(resp.error || 'Cluster update failed', 'error');
+    }
+  } catch (e) {
+    showToast('Cluster update failed: ' + e.message, 'error');
   }
 }

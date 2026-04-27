@@ -10,8 +10,9 @@ async function loadSummaryProgress() {
   document.getElementById('summaryOverview').innerHTML = `
     <div class="stat-grid">
       <div class="stat-card">
-        <div class="label">Total Files</div>
+        <div class="label">Eligible Files</div>
         <div class="value">${data.total.toLocaleString()}</div>
+        <div class="sub">${(data.indexed_total || data.total).toLocaleString()} indexed total</div>
       </div>
       <div class="stat-card">
         <div class="label">Summarized</div>
@@ -22,6 +23,11 @@ async function loadSummaryProgress() {
       <div class="stat-card">
         <div class="label">Pending</div>
         <div class="value" style="color:var(--accent-orange)">${data.pending.toLocaleString()}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Excluded / Waiting</div>
+        <div class="value" style="color:var(--text-muted)">${(data.excluded_by_triage || 0).toLocaleString()}</div>
+        <div class="sub">skip, low, unknown, or untriaged</div>
       </div>
     </div>
   `;

@@ -44,6 +44,17 @@ class SyscallType(str, Enum):
 
     # Profile (v0.2)
     PROFILE_GET = "profile.get"
+    PROFILE_SUMMARY = "profile.summary"
+
+    # Consumer assistant surface (desktop app)
+    ASSISTANT_CHAT = "assistant.chat"
+    MEMORY_REVIEW = "memory.review"
+    MEMORY_FEEDBACK = "memory.feedback"
+    SOURCES_GET = "sources.get"
+    SOURCES_CONFIGURE = "sources.configure"
+    SETTINGS_MODEL = "settings.model"
+    ONBOARDING_BOOTSTRAP = "onboarding.bootstrap"
+    ASSISTANT_FIRST_INSIGHT = "assistant.first_insight"
 
     # Smart agents (v0.2)
     ANALYZE_BEHAVIOR = "analyze.behavior"
@@ -73,6 +84,15 @@ SYSCALL_TO_AGENT: dict[str, str] = {
     SyscallType.REPORT_PROJECT: "report_generator",
     SyscallType.REPORT_BRIEF: "report_generator",
     SyscallType.PROFILE_GET: "profile_builder",
+    SyscallType.PROFILE_SUMMARY: "assistant",
+    SyscallType.ASSISTANT_CHAT: "assistant",
+    SyscallType.MEMORY_REVIEW: "assistant",
+    SyscallType.MEMORY_FEEDBACK: "assistant",
+    SyscallType.SOURCES_GET: "assistant",
+    SyscallType.SOURCES_CONFIGURE: "assistant",
+    SyscallType.SETTINGS_MODEL: "assistant",
+    SyscallType.ONBOARDING_BOOTSTRAP: "assistant",
+    SyscallType.ASSISTANT_FIRST_INSIGHT: "assistant",
     SyscallType.ANALYZE_BEHAVIOR: "behavior_analyzer",
     SyscallType.CLASSIFY_PRIORITY: "priority_classifier",
     SyscallType.TRIAGE_FILES: "triage",

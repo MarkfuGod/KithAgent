@@ -22,6 +22,7 @@ async function loadAll() {
     loadDirectories(),
     loadKnowledge(),
     loadScheduling(),
+    loadRag(),
     loadLLMConfig(),
     loadRouting(),
     loadEmbeddingConfig(),

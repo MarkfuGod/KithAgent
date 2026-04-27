@@ -142,6 +142,8 @@ class TriageAgent(BaseAgent):
 
         triage_cfg = self._get_triage_config(context)
         skip_patterns = triage_cfg.get("skip_path_patterns") or _FALLBACK_SKIP_PATTERNS
+        hard_skip_extensions = triage_cfg.get("hard_skip_extensions") or []
+        hard_skip_file_patterns = triage_cfg.get("hard_skip_file_patterns") or []
         type_priority = triage_cfg.get("file_type_priority") or {}
         hints = triage_cfg.get("hints") or []
 
@@ -150,7 +152,12 @@ class TriageAgent(BaseAgent):
         start_time = time.time()
 
         # Phase 1: rule-based fast triage using config-driven skip patterns.
-        rule_results = await self._rule_based_pass(memory, skip_patterns)
+        rule_results = await self._rule_based_pass(
+            memory,
+            skip_patterns,
+            hard_skip_extensions,
+            hard_skip_file_patterns,
+        )
 
         # If an LLM just became available, re-open any files we previously
         # parked as 'unknown' so they get a real classification this run.
@@ -220,6 +227,13 @@ class TriageAgent(BaseAgent):
                 except Exception as e:
                     llm_errors += 1
                     logger.warning("Triage failed for %s: %s", dir_prefix, e)
+                    if event_bus:
+                        await event_bus.emit_dict("triage.batch_failed", {
+                            "directory": dir_prefix,
+                            "error": str(e),
+                            "llm_errors": llm_errors,
+                            "elapsed_s": round(time.time() - start_time, 1),
+                        })
 
             if len(files) < batch_size:
                 break
@@ -244,17 +258,26 @@ class TriageAgent(BaseAgent):
             return {}
         return {
             "skip_path_patterns": list(getattr(tcfg, "skip_path_patterns", []) or []),
+            "hard_skip_extensions": list(getattr(tcfg, "hard_skip_extensions", []) or []),
+            "hard_skip_file_patterns": list(getattr(tcfg, "hard_skip_file_patterns", []) or []),
             "file_type_priority": dict(getattr(tcfg, "file_type_priority", {}) or {}),
             "hints": list(getattr(tcfg, "hints", []) or []),
         }
 
-    async def _rule_based_pass(self, memory, skip_patterns: list[str]) -> dict:
+    async def _rule_based_pass(
+        self,
+        memory,
+        skip_patterns: list[str],
+        hard_skip_extensions: list[str] | None = None,
+        hard_skip_file_patterns: list[str] | None = None,
+    ) -> dict:
         """Fast pass: skip files whose path contains any configured noise pattern.
 
         Uses SQL LIKE substring match (not prefix) so patterns like
         '.cursor/extensions/' catch the pattern anywhere in the path.
         """
         total_marked = 0
+        by_rule: dict[str, int] = {}
         for pattern in skip_patterns:
             if not pattern:
                 continue
@@ -263,15 +286,30 @@ class TriageAgent(BaseAgent):
             )
             if count > 0:
                 total_marked += count
+                by_rule[f"path:{pattern}"] = count
                 logger.debug("Rule-based skip: %s → %d files", pattern, count)
+
+        ext_count = await memory.batch_update_triage_by_extensions(
+            hard_skip_extensions or [], "skip"
+        )
+        if ext_count:
+            total_marked += ext_count
+            by_rule["extension"] = ext_count
+
+        pattern_count = await memory.batch_update_triage_by_file_patterns(
+            hard_skip_file_patterns or [], "skip"
+        )
+        if pattern_count:
+            total_marked += pattern_count
+            by_rule["file_pattern"] = pattern_count
 
         if total_marked > 0:
             logger.info(
-                "Rule-based triage: marked %d files as 'skip' (patterns=%d)",
-                total_marked, len(skip_patterns),
+                "Rule-based triage: marked %d files as 'skip' (path_patterns=%d, extensions=%d, file_patterns=%d)",
+                total_marked, len(skip_patterns), len(hard_skip_extensions or []), len(hard_skip_file_patterns or []),
             )
 
-        return {"rule_based_skipped": total_marked}
+        return {"rule_based_skipped": total_marked, "rule_breakdown": by_rule}
 
     def _group_by_directory(self, files: list[dict], depth: int = 3) -> dict[str, list[dict]]:
         """Group files by directory prefix for batch LLM processing."""

@@ -33,6 +33,7 @@ async def status(request: web.Request) -> web.Response:
 _ALLOWED_AGENTS = frozenset({
     "triage", "summarizer", "behavior_analyzer",
     "priority_classifier", "report_generator", "profile_builder",
+    "rag_indexer",
 })
 
 
@@ -48,6 +49,17 @@ async def trigger_agent(request: web.Request) -> web.Response:
 
     if not agent_name:
         return web.json_response({"error": "Missing 'agent' parameter"}, status=400)
+    if agent_name not in _ALLOWED_AGENTS:
+        return web.json_response(
+            {"error": f"Agent '{agent_name}' not in allowed list"},
+            status=400,
+        )
+
+    return await submit_agent(agent_name, input_data)
+
+
+async def submit_agent(agent_name: str, input_data: dict) -> web.Response:
+    """Submit an allow-listed agent task to the daemon."""
     if agent_name not in _ALLOWED_AGENTS:
         return web.json_response(
             {"error": f"Agent '{agent_name}' not in allowed list"},

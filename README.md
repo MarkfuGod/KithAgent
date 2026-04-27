@@ -164,6 +164,23 @@ With the daemon running, say something like this to your agent:
 
 The agent will auto-load `agent-sys-user-context`, run `curl -H "X-Agent-Token: $(cat ~/.agent_sys/auth_token)" http://127.0.0.1:7437/syscall ...` to fetch your brief, and answer from the real you instead of guessing.
 
+### First Insight onboarding
+
+Kith's consumer path is optimized for **Time to First Insight**: a first useful profile in minutes, before full summarization or embeddings finish.
+
+The product-level syscall is `assistant.first_insight` (alias: `onboarding.bootstrap`). It combines:
+
+- explicit onboarding answers: role, goals, current focus, suggestion cadence, and content boundaries
+- recent file metadata and active folder shape
+- optional Chromium-family browser metadata: History titles/domains, Bookmarks, and Downloads metadata
+- correctable memory stored in `profile_facts`
+- provenance stored in `source_records`
+- run telemetry stored in `insight_runs` / `insight_items`
+
+Privacy boundary: browser ingestion does **not** read Cookies, Login Data, sessions, passwords, or tokens. URLs are sanitized by stripping query strings and fragments before they are used.
+
+The intended first-run flow is: ask 5 lightweight questions, request source consent, run First Insight, show “what I think I understand”, recent themes, 3-5 suggestions, and let the user mark each memory as accurate / inaccurate / hidden.
+
 ### Web dashboard
 
 ```bash

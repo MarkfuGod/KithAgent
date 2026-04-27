@@ -81,6 +81,9 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     # Load any persisted scan-scope preferences from a previous first-run.
     config = _load_saved_scan_config(config)
+    # Desktop/background starts are non-interactive, so saved model settings
+    # must be applied before the optional first-run prompt gate.
+    config = _load_saved_llm_config(config)
 
     # First-run UX: ask about scan scope + LLM before we actually boot.
     if not args.daemon:
@@ -114,7 +117,10 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 def cmd_stop(args: argparse.Namespace) -> None:
     """Stop the running SysAgent daemon."""
-    pid_file = Path("/tmp/agent_sys.pid")
+    from src.kernel.config import load_config
+
+    config = load_config(args.config)
+    pid_file = Path(str(config.kernel.pid_file)).expanduser()
     if not pid_file.exists():
         print("SysAgent is not running.")
         return
@@ -406,14 +412,9 @@ _FIRSTRUN_MARKER = Path.home() / ".agent_sys" / ".firstrun_done"
 
 def _load_saved_scan_config(config) -> object:
     """Apply any persisted watch_paths override from the first-run wizard."""
-    import yaml
-
-    if not _SCAN_CONFIG_PATH.exists():
-        return config
-
     try:
-        with open(_SCAN_CONFIG_PATH) as f:
-            saved = yaml.safe_load(f) or {}
+        from src.kernel.user_settings import load_scan_settings
+        saved = load_scan_settings([str(p) for p in config.filesystem.watch_paths])
         paths = saved.get("watch_paths") or []
         if paths:
             config.filesystem.watch_paths = [
@@ -428,10 +429,8 @@ def _load_saved_scan_config(config) -> object:
 
 
 def _save_scan_config(watch_paths: list[str]) -> None:
-    import yaml
-    _SCAN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_SCAN_CONFIG_PATH, "w") as f:
-        yaml.dump({"watch_paths": watch_paths}, f, default_flow_style=False)
+    from src.kernel.user_settings import save_scan_settings
+    save_scan_settings(watch_paths)
 
 
 def _prompt_scan_paths(config) -> object:
@@ -527,7 +526,10 @@ def _load_saved_llm_config(config) -> object:
         with open(_LLM_CONFIG_PATH) as f:
             saved = yaml.safe_load(f) or {}
 
-        if saved.get("default_provider"):
+        if saved.get("mode") == "local":
+            config.llm.default_provider = ""
+            config.llm.providers = {}
+        elif saved.get("default_provider"):
             config.llm.default_provider = saved["default_provider"]
         if saved.get("providers"):
             config.llm.providers.update(saved["providers"])

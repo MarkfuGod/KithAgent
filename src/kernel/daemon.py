@@ -236,7 +236,10 @@ class SysAgentKernel:
         try:
             with open(saved_path) as f:
                 saved = yaml.safe_load(f) or {}
-            if saved.get("default_provider"):
+            if saved.get("mode") == "local":
+                config.llm.default_provider = ""
+                config.llm.providers = {}
+            elif saved.get("default_provider"):
                 config.llm.default_provider = saved["default_provider"]
             if saved.get("providers"):
                 config.llm.providers.update(saved["providers"])

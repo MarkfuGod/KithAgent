@@ -7,6 +7,8 @@
  */
 
 const API = '';
+const DASHBOARD_MUTATION_HEADERS = { 'X-Kith-Dashboard': '1' };
+const DASHBOARD_JSON_HEADERS = { ...DASHBOARD_MUTATION_HEADERS, 'Content-Type': 'application/json' };
 
 const chartColors = [
   '#58a6ff', '#3fb950', '#d29922', '#f85149', '#bc8cff', '#f778ba',
@@ -61,7 +63,10 @@ function showToast(msg, type) {
 
 async function reloadDaemonConfig() {
   try {
-    const resp = await fetch(API + '/api/reload-config', { method: 'POST' }).then(r => r.json());
+    const resp = await fetch(API + '/api/reload-config', {
+      method: 'POST',
+      headers: DASHBOARD_MUTATION_HEADERS,
+    }).then(r => r.json());
     if (resp.success) {
       showToast('Config applied to running daemon.', 'success');
       return true;

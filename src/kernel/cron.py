@@ -43,6 +43,7 @@ Available agents and their purposes:
 - priority_classifier: Classifies files into P0 (hot) / P1 (warm) / P2 (cold).
 - report_generator: Produces daily reports. Types: "daily", "quick", "brief".
 - profile_builder: Builds a user profile from indexed data.
+- rag_indexer: Low-priority background chunk indexing for hybrid RAG. Run only after first insight/startup delay.
 
 Output a JSON scheduling decision. You can use "stages" for sequential groups
 (each stage runs in order, agents within a stage run in parallel):
@@ -131,6 +132,7 @@ class CronScheduler:
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._last_run: dict[str, float] = {}
+        self._started_at = time.time()
 
     async def start(self) -> None:
         if not self.config.enabled:
@@ -207,6 +209,10 @@ class CronScheduler:
 
         while self._running:
             try:
+                if not await self._first_insight_ready():
+                    await asyncio.sleep(30)
+                    continue
+
                 snapshot = await self._gather_activity_snapshot()
                 decision = await self._llm_decide_schedule(snapshot)
 
@@ -215,11 +221,13 @@ class CronScheduler:
                 if scheduler:
                     active_names = {t.name for t in scheduler._active_tasks.values()}
 
+                decision = await self._maybe_add_rag_indexer(decision, snapshot, active_names)
+
                 stages = decision.get("stages")
                 if stages and isinstance(stages, list):
                     await self._dispatch_stages(stages, active_names)
                 else:
-                    for agent_spec in decision.get("agents_to_run", []):
+                    for agent_spec in self._triage_first(decision.get("agents_to_run", [])):
                         agent_name = agent_spec.get("name", "")
                         input_data = agent_spec.get("input_data", {})
                         if not agent_name:
@@ -318,6 +326,26 @@ class CronScheduler:
                 "total_tokens": llm._total_tokens,
             }
 
+        rag_status = {}
+        try:
+            rag_cfg = getattr(self.kernel.config.memory, "rag", None)
+            if rag_cfg and getattr(rag_cfg, "enabled", True):
+                pending = await memory.get_files_needing_rag_index(
+                    limit=1,
+                    allowed_triage_statuses=getattr(rag_cfg, "allowed_triage_statuses", ["high", "medium"]),
+                    max_file_size_bytes=getattr(rag_cfg, "max_file_size_mb", 5) * 1024 * 1024,
+                )
+                rag_status = {
+                    "enabled": True,
+                    "pending": len(pending),
+                    "chunks": await memory.count_document_chunks(),
+                    "initial_delay_seconds": getattr(rag_cfg, "initial_delay_seconds", 600),
+                }
+            else:
+                rag_status = {"enabled": False}
+        except Exception:
+            rag_status = {}
+
         strategy = getattr(self.config.adaptive, "strategy", "balanced")
         now = datetime.now()
         return {
@@ -334,6 +362,7 @@ class CronScheduler:
             "triage_stats": triage_stats,
             "summary_progress": summary_progress,
             "embedding": embedding_info,
+            "rag": rag_status,
             "llm": llm_status,
             "past_decisions": [
                 json.loads(d["content"]) if isinstance(d.get("content"), str) else d.get("content", {})
@@ -482,6 +511,52 @@ class CronScheduler:
             "strategy": strategy_name,
         }
 
+    async def _maybe_add_rag_indexer(
+        self,
+        decision: dict,
+        snapshot: dict,
+        active_names: set[str],
+    ) -> dict:
+        """Append delayed low-priority RAG indexing without asking chat to wait."""
+        rag_cfg = getattr(self.kernel.config.memory, "rag", None)
+        if not rag_cfg or not getattr(rag_cfg, "enabled", True):
+            return decision
+        if "rag_indexer" in active_names:
+            return decision
+        if time.time() - self._started_at < getattr(rag_cfg, "initial_delay_seconds", 600):
+            return decision
+        if time.time() - self._last_run.get("rag_indexer", 0) < 600:
+            return decision
+        if not (snapshot.get("rag") or {}).get("pending"):
+            return decision
+
+        spec = {
+            "name": "rag_indexer",
+            "input_data": {
+                "batch_size": getattr(rag_cfg, "batch_size", 20),
+                "embedding_batch_size": getattr(rag_cfg, "embedding_batch_size", 32),
+                "time_budget": getattr(rag_cfg, "time_budget_seconds", 90),
+                "timeout": max(180, getattr(rag_cfg, "time_budget_seconds", 90) + 60),
+            },
+        }
+        if isinstance(decision.get("stages"), list):
+            decision["stages"].append([spec])
+        else:
+            agents = decision.setdefault("agents_to_run", [])
+            if isinstance(agents, list) and not any(a.get("name") == "rag_indexer" for a in agents):
+                agents.append(spec)
+        return decision
+
+    @staticmethod
+    def _triage_first(agent_specs: list[dict]) -> list[dict]:
+        """Force triage before summarizer even if the scheduler LLM reversed them."""
+        if not isinstance(agent_specs, list):
+            return []
+        return sorted(
+            agent_specs,
+            key=lambda spec: {"triage": 0, "summarizer": 1}.get(spec.get("name", ""), 2),
+        )
+
     async def _persist_decision(self, decision: dict, snapshot: dict) -> None:
         """Store the scheduling decision in knowledge DB for future LLM context."""
         memory = self.kernel.get_memory()
@@ -557,12 +632,37 @@ class CronScheduler:
             if fs and hasattr(fs, "_stats"):
                 current_scan = fs._stats.get("last_scan", 0.0)
                 if current_scan > last_scan_time:
-                    if first_scan_seen or last_scan_time == 0:
+                    if first_scan_seen:
+                        if not await self._first_insight_ready():
+                            logger.info(
+                                "Cron: scan completed; deferring %s until First Insight is ready",
+                                agent_name,
+                            )
+                            last_scan_time = current_scan
+                            continue
                         logger.info("Cron: scan completed, triggering %s", agent_name)
                         overrides = _after_scan_overrides.get(agent_name, {})
                         await self._dispatch(agent_name, input_data=overrides)
+                    else:
+                        logger.info(
+                            "Cron: initial scan completed; deferring %s so First Insight can run first",
+                            agent_name,
+                        )
                     first_scan_seen = True
                     last_scan_time = current_scan
+
+    async def _first_insight_ready(self) -> bool:
+        """Give the product onboarding path the first few minutes after boot."""
+        memory = self.kernel.get_memory()
+        if memory:
+            try:
+                runs = await memory.list_insight_runs(run_type="first_insight", limit=1)
+                if runs and runs[0].get("status") == "completed":
+                    return True
+            except Exception:
+                pass
+        # Legacy/daemon-only sessions should still make progress eventually.
+        return (time.time() - self._started_at) > 600
 
     async def _after_agent_loop(self, agent_name: str, dependency: str) -> None:
         """Poll for completion of a dependency agent, then run."""
@@ -747,6 +847,7 @@ class CronScheduler:
         "profile_builder": 300,
         "report_generator": 300,
         "priority_classifier": 180,
+        "rag_indexer": 180,
     }
 
     async def _dispatch(self, agent_name: str, input_data: dict | None = None) -> None:

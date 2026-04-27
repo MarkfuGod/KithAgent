@@ -3,7 +3,7 @@ Embedding Engine — pluggable providers for vector semantic search.
 
 Providers:
   - local:     sentence-transformers (all-MiniLM-L6-v2, 384d, runs on CPU)
-  - dashscope: Qwen3-VL-Embedding via DashScope OpenAI-compatible API
+  - dashscope: text-embedding-v4 via DashScope OpenAI-compatible API
   - openai:    OpenAI text-embedding-3-small/large
 
 Configured via memory.embedding in default.yaml.
@@ -173,7 +173,7 @@ class APIEmbeddingProvider(EmbeddingProvider):
         try:
             import numpy as np
             all_vecs: list[bytes] = []
-            batch_size = 20
+            batch_size = 10
             for i in range(0, len(texts), batch_size):
                 chunk = texts[i:i + batch_size]
                 vecs = self._call_api(chunk)
@@ -201,7 +201,7 @@ def configure(provider: str = "local", **kwargs) -> None:
             name="dashscope",
             api_key_env=kwargs.get("api_key_env", "DASHSCOPE_API_KEY"),
             base_url=kwargs.get("api_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            model=kwargs.get("model", "qwen3-vl-embedding"),
+            model=kwargs.get("model", "text-embedding-v4"),
             dimensions=kwargs.get("dimensions", 0),
         )
         logger.info("Embedding provider: dashscope (%s)", _provider_instance._model)

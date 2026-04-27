@@ -66,6 +66,7 @@ class ModelRouter:
         self._event_bus = None
         self._auth_failures: dict[str, int] = {}
         self._tripped_until: dict[str, float] = {}
+        self._call_seq = 0
 
     def set_event_bus(self, event_bus) -> None:
         self._event_bus = event_bus
@@ -140,13 +141,19 @@ class ModelRouter:
         )
 
         _req_start = _time.time()
+        self._call_seq += 1
+        call_id = f"llm-{int(_req_start * 1000)}-{self._call_seq}"
         if self._event_bus:
             await self._event_bus.emit_dict("llm.request", {
+                "call_id": call_id,
                 "task_type": task_type,
                 "is_vision": is_vision,
                 "provider": provider.name,
                 "model": resolved_model or "default",
                 "max_tokens": max_tokens,
+                "temperature": temperature,
+                "message_count": len(messages),
+                "prompt_preview": self._messages_preview(messages),
             })
 
         try:
@@ -172,6 +179,15 @@ class ModelRouter:
                         "Pausing for %ds. Fix your API key and reload config.",
                         provider.name, count, _CIRCUIT_BREAKER_COOLDOWN,
                     )
+            if self._event_bus:
+                await self._event_bus.emit_dict("llm.error", {
+                    "call_id": call_id,
+                    "task_type": task_type,
+                    "provider": provider.name,
+                    "model": resolved_model or "default",
+                    "error": str(e),
+                    "elapsed_ms": round((_time.time() - _req_start) * 1000, 1),
+                })
             raise
 
         # Successful call — reset circuit breaker for this provider
@@ -182,12 +198,16 @@ class ModelRouter:
         self._total_tokens += sum(response.usage.values())
 
         if self._event_bus:
+            content = response.content or ""
             await self._event_bus.emit_dict("llm.response", {
+                "call_id": call_id,
                 "task_type": task_type,
                 "provider": response.provider,
                 "model": response.model,
                 "usage": response.usage,
-                "content_preview": response.content[:200] if response.content else "",
+                "content_preview": content[:200],
+                "content": content[:4000],
+                "content_truncated": len(content) > 4000,
                 "elapsed_ms": round((_time.time() - _req_start) * 1000, 1),
             })
 
@@ -233,6 +253,26 @@ class ModelRouter:
                     return prov, resolved
 
         return prov, None
+
+    @staticmethod
+    def _messages_preview(messages: list[LLMMessage], limit: int = 1200) -> str:
+        parts: list[str] = []
+        remaining = limit
+        for msg in messages:
+            content = msg.content
+            if isinstance(content, list):
+                text = "[multimodal content]"
+            else:
+                text = str(content)
+            chunk = f"{msg.role}: {text}"
+            if len(chunk) > remaining:
+                parts.append(chunk[:remaining])
+                break
+            parts.append(chunk)
+            remaining -= len(chunk)
+            if remaining <= 0:
+                break
+        return "\n\n".join(parts)
 
     def _resolve_provider(self, name: str | None) -> LLMProvider | None:
         if name:
@@ -313,6 +353,7 @@ def create_router_from_config(llm_config: dict[str, Any]) -> ModelRouter:
             base_url=cfg.get("base_url", ""),
             api_key_env=cfg.get("api_key_env", "OPENAI_COMPATIBLE_API_KEY"),
             models=cfg.get("models"),
+            extra_body=cfg.get("extra_body"),
         ))
 
     return router

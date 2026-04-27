@@ -10,7 +10,9 @@ let sseSource = null;
 let llmCallCount = 0;
 let totalTokens = 0;
 const activeTasks = new Map();
+const taskHistory = [];
 const llmLogs = [];
+const llmCallMap = new Map();
 const eventLog = [];
 
 function connectSSE() {
@@ -34,8 +36,16 @@ function connectSSE() {
     'task.failed': handleTaskCompleted,
     'llm.request': handleLLMRequest,
     'llm.response': handleLLMResponse,
+    'llm.error': handleLLMError,
     'triage.batch_progress': handleTriageProgress,
+    'triage.batch_failed': handlePipelineFailure,
     'summarize.file_progress': handleSummarizeProgress,
+    'summarize.file_failed': handlePipelineFailure,
+    'behavior_insight.started': handleBehaviorInsight,
+    'behavior_insight.completed': handleBehaviorInsight,
+    'behavior_insight.failed': handleBehaviorInsight,
+    'rag_indexer.started': handleRagIndexerEvent,
+    'rag_indexer.completed': handleRagIndexerEvent,
   };
 
   for (const [etype, handler] of Object.entries(handlers)) {
@@ -60,12 +70,18 @@ function connectSSE() {
 
 function handleTaskStarted(data) {
   activeTasks.set(data.task_id, { ...data, startedAt: Date.now() });
+  taskHistory.push({ ...data, state: 'started', time: Date.now() });
+  if (taskHistory.length > 200) taskHistory.splice(0, taskHistory.length - 200);
   renderActiveTasks();
+  renderTaskHistory();
 }
 
 function handleTaskCompleted(data) {
   activeTasks.delete(data.task_id);
+  taskHistory.push({ ...data, time: Date.now() });
+  if (taskHistory.length > 200) taskHistory.splice(0, taskHistory.length - 200);
   renderActiveTasks();
+  renderTaskHistory();
 }
 
 function renderActiveTasks() {
@@ -89,10 +105,32 @@ function renderActiveTasks() {
   container.innerHTML = html;
 }
 
+function renderTaskHistory() {
+  const container = document.getElementById('liveTaskTimeline');
+  if (!container) return;
+  const recent = taskHistory.slice(-60).reverse();
+  if (recent.length === 0) {
+    container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:12px;">Waiting for task events...</div>';
+    return;
+  }
+  container.innerHTML = recent.map(t => {
+    const timeStr = new Date(t.time).toLocaleTimeString();
+    const state = t.state || 'completed';
+    const color = state === 'failed' || t.error ? 'var(--accent-red)' : state === 'started' ? 'var(--accent-orange)' : 'var(--accent-green)';
+    return `<div style="display:grid;grid-template-columns:90px 140px 1fr;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;">
+      <span style="color:var(--text-muted);">${timeStr}</span>
+      <span><span class="type-badge" style="color:${color};">${escapeHtml(t.name || '?')}</span></span>
+      <span style="color:var(--text-secondary);">${escapeHtml(state)} ${t.elapsed_s ? '(' + t.elapsed_s + 's)' : ''} ${t.error ? '- ' + escapeHtml(t.error) : ''}</span>
+    </div>`;
+  }).join('');
+}
+
 function handleLLMRequest(data) {
   llmCallCount++;
   document.getElementById('liveLLMCount').textContent = llmCallCount;
   llmLogs.push({ type: 'request', ...data, time: Date.now() });
+  const key = data.call_id || `legacy-${Date.now()}-${llmLogs.length}`;
+  llmCallMap.set(key, { call_id: key, request: data, time: Date.now() });
   renderLLMLogs();
 }
 
@@ -101,29 +139,65 @@ function handleLLMResponse(data) {
   totalTokens += (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
   document.getElementById('liveTotalTokens').textContent = totalTokens.toLocaleString();
   llmLogs.push({ type: 'response', ...data, time: Date.now() });
+  const key = data.call_id || `legacy-response-${Date.now()}-${llmLogs.length}`;
+  const existing = llmCallMap.get(key) || { call_id: key, time: Date.now() };
+  existing.response = data;
+  existing.time = Date.now();
+  llmCallMap.set(key, existing);
   if (llmLogs.length > 200) llmLogs.splice(0, llmLogs.length - 200);
+  _trimLLMCallMap();
   renderLLMLogs();
+}
+
+function handleLLMError(data) {
+  llmLogs.push({ type: 'error', ...data, time: Date.now() });
+  const key = data.call_id || `legacy-error-${Date.now()}-${llmLogs.length}`;
+  const existing = llmCallMap.get(key) || { call_id: key, time: Date.now() };
+  existing.error = data;
+  existing.time = Date.now();
+  llmCallMap.set(key, existing);
+  _trimLLMCallMap();
+  renderLLMLogs();
+}
+
+function _trimLLMCallMap() {
+  const entries = Array.from(llmCallMap.entries()).sort((a, b) => (a[1].time || 0) - (b[1].time || 0));
+  while (entries.length > 120) {
+    const [key] = entries.shift();
+    llmCallMap.delete(key);
+  }
 }
 
 function renderLLMLogs() {
   const container = document.getElementById('liveLLMLogs');
-  const recent = llmLogs.slice(-30).reverse();
-  container.innerHTML = recent.map(l => {
-    const timeStr = new Date(l.time).toLocaleTimeString();
-    if (l.type === 'request') {
-      return `<div style="padding:8px 16px;border-bottom:1px solid var(--border);font-size:12px;">
-        <span style="color:var(--accent-orange);">[${timeStr}]</span>
-        <span class="type-badge">${l.task_type || '?'}</span>
-        <span style="color:var(--text-muted);">→ ${l.provider || '?'} / ${l.model || '?'}</span>
-        ${l.is_vision ? '<span class="type-badge" style="background:rgba(247,120,186,0.15);color:var(--accent-pink);">vision</span>' : ''}
-      </div>`;
-    }
-    const tokens = (l.usage?.prompt_tokens || 0) + (l.usage?.completion_tokens || 0);
-    return `<div style="padding:8px 16px;border-bottom:1px solid var(--border);font-size:12px;">
-      <span style="color:var(--accent-green);">[${timeStr}]</span>
-      <span style="color:var(--text-secondary);">${l.model || '?'}</span>
-      <span style="color:var(--text-muted);">${tokens} tokens, ${l.elapsed_ms || 0}ms</span>
-      <div style="color:var(--text-muted);margin-top:4px;white-space:pre-wrap;max-height:60px;overflow:hidden;font-size:11px;">${escapeHtml(l.content_preview || '')}</div>
+  const recent = Array.from(llmCallMap.values()).sort((a, b) => (b.time || 0) - (a.time || 0)).slice(0, 30);
+  container.innerHTML = recent.map(call => {
+    const req = call.request || {};
+    const res = call.response || {};
+    const err = call.error || null;
+    const timeStr = new Date(call.time || Date.now()).toLocaleTimeString();
+    const usage = res.usage || {};
+    const tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+    const taskType = req.task_type || res.task_type || err?.task_type || '?';
+    const model = req.model || res.model || err?.model || '?';
+    const provider = req.provider || res.provider || err?.provider || '?';
+    const isClassifyJson = taskType === 'classify' && (res.content || res.content_preview || '').trim().startsWith('{');
+    const content = err ? err.error : (res.content || res.content_preview || 'Waiting for response...');
+    const stateColor = err ? 'var(--accent-red)' : res.content || res.content_preview ? 'var(--accent-green)' : 'var(--accent-orange)';
+    return `<div style="padding:10px 16px;border-bottom:1px solid var(--border);font-size:12px;">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span style="color:${stateColor};">[${timeStr}]</span>
+        <span class="type-badge">${taskType}</span>
+        <span style="color:var(--text-muted);">${provider} / ${model}</span>
+        ${req.is_vision ? '<span class="type-badge" style="background:rgba(247,120,186,0.15);color:var(--accent-pink);">vision</span>' : ''}
+        <span style="color:var(--text-muted);">${tokens} tokens, ${res.elapsed_ms || err?.elapsed_ms || 0}ms</span>
+        <span style="color:var(--text-muted);font-family:monospace;">${call.call_id || ''}</span>
+      </div>
+      <details ${isClassifyJson ? '' : 'open'} style="margin-top:6px;">
+        <summary style="cursor:pointer;color:var(--text-secondary);">${isClassifyJson ? 'JSON classify response hidden by default' : 'LLM details'}</summary>
+        <div style="margin-top:6px;color:var(--text-muted);white-space:pre-wrap;max-height:220px;overflow:auto;font-size:11px;">${escapeHtml(content)}${res.content_truncated ? '\n...[truncated]' : ''}</div>
+        ${req.prompt_preview ? `<div style="margin-top:8px;color:var(--text-muted);font-size:11px;"><strong>Prompt preview</strong><pre style="white-space:pre-wrap;max-height:160px;overflow:auto;">${escapeHtml(req.prompt_preview)}</pre></div>` : ''}
+      </details>
     </div>`;
   }).join('');
 }
@@ -168,6 +242,33 @@ function handleSummarizeProgress(data) {
   `;
 }
 
+function handlePipelineFailure(data) {
+  addEventLogEntry({ type: 'pipeline.failure', data, ts: Date.now() / 1000 });
+}
+
+function handleBehaviorInsight(data) {
+  const target = document.getElementById('liveTaskHint');
+  if (target) {
+    const status = data.status || data.error || 'updated';
+    target.textContent = `Behavior insight: ${status}`;
+  }
+}
+
+function handleRagIndexerEvent(data) {
+  const target = document.getElementById('ragLogs');
+  if (target) {
+    const line = `RAG ${data.indexed_files !== undefined ? 'completed' : 'started'} ` +
+      JSON.stringify(data).slice(0, 220);
+    const el = document.createElement('div');
+    el.textContent = line;
+    el.style.cssText = 'padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);color:var(--accent-green);';
+    target.prepend(el);
+  }
+  if (typeof loadRag === 'function') {
+    setTimeout(loadRag, 800);
+  }
+}
+
 function addEventLogEntry(parsed) {
   eventLog.push(parsed);
   if (eventLog.length > 300) eventLog.splice(0, eventLog.length - 300);
@@ -176,17 +277,28 @@ function addEventLogEntry(parsed) {
   const typeColor = {
     'task.started': 'var(--accent-green)', 'task.completed': 'var(--accent)',
     'task.failed': 'var(--accent-red)', 'llm.request': 'var(--accent-orange)',
-    'llm.response': 'var(--accent-purple)', 'triage.batch_progress': 'var(--accent-green)',
-    'summarize.file_progress': 'var(--accent-pink)',
+    'llm.response': 'var(--accent-purple)', 'llm.error': 'var(--accent-red)',
+    'triage.batch_progress': 'var(--accent-green)', 'triage.batch_failed': 'var(--accent-red)',
+    'summarize.file_progress': 'var(--accent-pink)', 'summarize.file_failed': 'var(--accent-red)',
+    'behavior_insight.started': 'var(--accent-orange)',
+    'behavior_insight.completed': 'var(--accent-green)',
+    'behavior_insight.failed': 'var(--accent-red)',
+    'rag_indexer.started': 'var(--accent-orange)',
+    'rag_indexer.completed': 'var(--accent-green)',
   }[parsed.type] || 'var(--text-muted)';
   const line = document.createElement('div');
   line.style.cssText = 'padding:2px 0;border-bottom:1px solid var(--border);';
-  line.innerHTML = `<span style="color:var(--text-muted);">${ts}</span> <span style="color:${typeColor};font-weight:500;">${parsed.type}</span> <span style="color:var(--text-secondary);">${JSON.stringify(parsed.data || {}).slice(0, 120)}</span>`;
+  const data = parsed.data || {};
+  const compact = JSON.stringify(data, (key, value) => {
+    if (key === 'content' || key === 'prompt_preview') return value ? String(value).slice(0, 160) : value;
+    return value;
+  }).slice(0, 260);
+  line.innerHTML = `<span style="color:var(--text-muted);">${ts}</span> <span style="color:${typeColor};font-weight:500;">${parsed.type}</span> <span style="color:var(--text-secondary);">${escapeHtml(compact)}</span>`;
   container.prepend(line);
   while (container.children.length > 200) container.removeChild(container.lastChild);
 }
 
-function clearLLMLogs() { llmLogs.length = 0; document.getElementById('liveLLMLogs').innerHTML = ''; }
+function clearLLMLogs() { llmLogs.length = 0; llmCallMap.clear(); document.getElementById('liveLLMLogs').innerHTML = ''; }
 function clearEventLog() { eventLog.length = 0; document.getElementById('liveEventLog').innerHTML = ''; }
 
 async function triggerAgent(agentName, inputData) {
@@ -197,7 +309,7 @@ async function triggerAgent(agentName, inputData) {
   try {
     const resp = await fetch(API + '/api/trigger-agent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: DASHBOARD_JSON_HEADERS,
       body: JSON.stringify({ agent: agentName, input_data: inputData }),
     }).then(r => r.json());
     if (resp.success) {

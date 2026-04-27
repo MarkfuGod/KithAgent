@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import time
 from datetime import datetime
 from pathlib import Path
@@ -109,6 +110,7 @@ class ProfileBuilderAgent(BaseAgent):
             content=json.dumps(profile, ensure_ascii=False),
             metadata={"generated_at": time.time(), "indexed_files": mem_stats.get("indexed_files", 0)},
         )
+        await self._store_correctable_facts(memory, profile)
 
         logger.info(
             "User profile built/updated: %d languages, %d projects, %d expertise areas",
@@ -117,6 +119,49 @@ class ProfileBuilderAgent(BaseAgent):
             len(profile.get("expertise_areas", [])),
         )
         return profile
+
+    async def _store_correctable_facts(self, memory, profile: dict) -> None:
+        """Project structured profile JSON into user-correctable fact rows."""
+        facts: list[tuple[str, str, float, dict]] = []
+
+        identity = profile.get("identity", {}) or {}
+        summary = identity.get("summary")
+        if summary:
+            facts.append(("identity", str(summary), 0.72, {"field": "identity.summary"}))
+        for role in identity.get("roles", []) or []:
+            facts.append(("role", f"你可能是 {role}", 0.66, {"field": "identity.roles"}))
+
+        interests = profile.get("interests", {}) or {}
+        for group, values in interests.items():
+            for item in values or []:
+                facts.append((f"interest.{group}", f"你对 {item} 感兴趣", 0.62, {"field": f"interests.{group}"}))
+
+        for area in profile.get("expertise_areas", []) or []:
+            facts.append(("expertise", f"你在 {area} 方面有经验或持续投入", 0.64, {"field": "expertise_areas"}))
+
+        work_patterns = profile.get("work_patterns", {}) or {}
+        for key in ("most_active_hours", "productivity_style"):
+            value = work_patterns.get(key)
+            if value:
+                facts.append(("work_pattern", str(value), 0.58, {"field": f"work_patterns.{key}"}))
+
+        for project in (profile.get("projects", []) or [])[:10]:
+            name = project.get("name") or project.get("path")
+            if name:
+                statement = f"你最近关注项目 {name}"
+                facts.append(("project", statement, 0.6, {"field": "projects", "path": project.get("path", "")}))
+
+        for category, statement, confidence, metadata in facts:
+            digest = hashlib.sha1(f"{category}:{statement}".encode("utf-8")).hexdigest()[:16]
+            await memory.upsert_profile_fact(
+                fact_id=f"profile_{digest}",
+                category=category,
+                statement=statement,
+                source_type="inferred",
+                source_ref="user_profile_current",
+                confidence=confidence,
+                metadata=metadata,
+            )
 
     def _build_data_summary(
         self, file_stats, dir_activity, dir_breakdown,

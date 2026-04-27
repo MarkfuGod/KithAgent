@@ -25,10 +25,12 @@ class OpenAIAdapter(LLMProvider):
         api_key_env: str = "OPENAI_API_KEY",
         base_url: str = "https://api.openai.com/v1",
         models: dict[str, str] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         self._api_key = api_key or os.environ.get(api_key_env, "")
         self._base_url = base_url.rstrip("/")
         self._models = models or {"fast": "gpt-4o-mini", "strong": "gpt-4o"}
+        self._extra_body = extra_body or {}
         self._client = None
 
     def available(self) -> bool:
@@ -67,6 +69,11 @@ class OpenAIAdapter(LLMProvider):
         if self._client is None:
             self._client = openai.AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
 
+        if self._extra_body:
+            existing_extra = dict(kwargs.pop("extra_body", {}) or {})
+            existing_extra.update(self._extra_body)
+            kwargs["extra_body"] = existing_extra
+
         resp = await self._client.chat.completions.create(
             model=model,
             messages=msgs,
@@ -103,6 +110,8 @@ class OpenAIAdapter(LLMProvider):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        payload.update(self._extra_body)
+        payload.update(kwargs)
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload) as resp:

@@ -163,10 +163,19 @@ async def recent_files(request: web.Request) -> web.Response:
 async def summary_progress(request: web.Request) -> web.Response:
     db = get_db()
     try:
-        total = db.execute("SELECT COUNT(*) FROM file_index").fetchone()[0]
+        total_indexed = db.execute("SELECT COUNT(*) FROM file_index").fetchone()[0]
+        eligible_where = "triage_status IN ('high', 'medium')"
+        total = db.execute(
+            f"SELECT COUNT(*) FROM file_index WHERE {eligible_where}"
+        ).fetchone()[0]
         done = db.execute(
             "SELECT COUNT(*) FROM file_index "
-            "WHERE semantic_summary != '' AND semantic_summary IS NOT NULL"
+            f"WHERE semantic_summary != '' AND semantic_summary IS NOT NULL AND {eligible_where}"
+        ).fetchone()[0]
+        excluded = db.execute(
+            "SELECT COUNT(*) FROM file_index "
+            "WHERE triage_status IN ('skip', 'low', 'unknown') "
+            "OR triage_status = '' OR triage_status IS NULL"
         ).fetchone()[0]
 
         by_type = db.execute(
@@ -174,14 +183,17 @@ async def summary_progress(request: web.Request) -> web.Response:
                       COUNT(*) as total,
                       SUM(CASE WHEN semantic_summary != '' AND semantic_summary IS NOT NULL THEN 1 ELSE 0 END) as done
                FROM file_index
+               WHERE triage_status IN ('high', 'medium')
                GROUP BY file_type
                ORDER BY total DESC"""
         ).fetchall()
 
         return web.json_response({
+            "indexed_total": total_indexed,
             "total": total,
             "summarized": done,
             "pending": total - done,
+            "excluded_by_triage": excluded,
             "percent": round(done / total * 100, 1) if total > 0 else 0,
             "by_type": [
                 {"type": r[0] or "unknown", "total": r[1], "done": r[2],

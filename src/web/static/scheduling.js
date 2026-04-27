@@ -63,7 +63,7 @@ async function setStrategy(name) {
   try {
     const resp = await fetch(API + '/api/scheduling-strategy', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: DASHBOARD_JSON_HEADERS,
       body: JSON.stringify({ strategy: name }),
     });
     const data = await resp.json();

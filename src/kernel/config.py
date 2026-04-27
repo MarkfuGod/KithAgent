@@ -45,8 +45,25 @@ class EmbeddingConfig:
     local_model: str = "all-MiniLM-L6-v2"
     api_key_env: str = "DASHSCOPE_API_KEY"
     api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model: str = "qwen3-vl-embedding"
-    dimensions: int = 0
+    model: str = "text-embedding-v4"
+    dimensions: int = 1024
+
+
+@dataclass
+class RagConfig:
+    enabled: bool = True
+    initial_delay_seconds: int = 600
+    batch_size: int = 20
+    embedding_batch_size: int = 32
+    time_budget_seconds: int = 90
+    chunk_size_chars: int = 1600
+    chunk_overlap_chars: int = 250
+    max_file_size_mb: int = 5
+    allowed_triage_statuses: list[str] = field(default_factory=lambda: ["high", "medium"])
+    fts_top_k: int = 20
+    vector_top_k: int = 20
+    assistant_top_k: int = 6
+    min_score: float = 0.05
 
 
 @dataclass
@@ -56,6 +73,7 @@ class MemoryConfig:
     use_local_embeddings: bool = True
     local_model: str = "all-MiniLM-L6-v2"
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    rag: RagConfig = field(default_factory=RagConfig)
 
 
 @dataclass
@@ -70,7 +88,7 @@ class SyscallConfig:
     transport: str = "unix_socket"
     http_port: int = 7437
     auth_token_path: Path = Path("~/.agent_sys/auth_token")
-    allowed_callers: list[str] = field(default_factory=lambda: ["cursor", "claude_code", "cli", "dashboard"])
+    allowed_callers: list[str] = field(default_factory=lambda: ["cursor", "claude_code", "cli", "dashboard", "electron"])
     # When `require_auth` is True, HTTP callers MUST provide
     # `X-Agent-Token: <token>` matching the contents of auth_token_path,
     # AND their `caller` field must be in allowed_callers.
@@ -137,11 +155,13 @@ class CronConfig:
 class TriageConfig:
     """User-tunable knobs for the triage agent.
 
-    `skip_path_patterns` is a hard filter (bypasses LLM). `file_type_priority`
-    and `hints` influence ordering and LLM decisions but do not override
-    per-file semantic judgment.
+    Hard filters bypass the LLM entirely. `file_type_priority` and `hints`
+    influence ordering and LLM decisions but do not override per-file
+    semantic judgment.
     """
     skip_path_patterns: list[str] = field(default_factory=list)
+    hard_skip_extensions: list[str] = field(default_factory=list)
+    hard_skip_file_patterns: list[str] = field(default_factory=list)
     file_type_priority: dict[str, int] = field(default_factory=dict)
     hints: list[str] = field(default_factory=list)
 
@@ -207,6 +227,22 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
         model=emb_raw.get("model", ""),
         dimensions=emb_raw.get("dimensions", 0),
     )
+    rag_raw = mem_raw.get("rag", {}) or {}
+    rag_config = RagConfig(
+        enabled=bool(rag_raw.get("enabled", True)),
+        initial_delay_seconds=int(rag_raw.get("initial_delay_seconds", 600)),
+        batch_size=int(rag_raw.get("batch_size", 20)),
+        embedding_batch_size=int(rag_raw.get("embedding_batch_size", 32)),
+        time_budget_seconds=int(rag_raw.get("time_budget_seconds", 90)),
+        chunk_size_chars=int(rag_raw.get("chunk_size_chars", 1600)),
+        chunk_overlap_chars=int(rag_raw.get("chunk_overlap_chars", 250)),
+        max_file_size_mb=int(rag_raw.get("max_file_size_mb", 5)),
+        allowed_triage_statuses=rag_raw.get("allowed_triage_statuses", ["high", "medium"]) or ["high", "medium"],
+        fts_top_k=int(rag_raw.get("fts_top_k", 20)),
+        vector_top_k=int(rag_raw.get("vector_top_k", 20)),
+        assistant_top_k=int(rag_raw.get("assistant_top_k", 6)),
+        min_score=float(rag_raw.get("min_score", 0.05)),
+    )
 
     cron_raw = raw.get("cron", {})
     adaptive_raw = cron_raw.get("adaptive", {})
@@ -226,10 +262,13 @@ def load_config(path: str | Path | None = None) -> AgentOSConfig:
 
     memory_config = _build_section(MemoryConfig, raw.get("memory"))
     memory_config.embedding = embedding_config
+    memory_config.rag = rag_config
 
     triage_raw = raw.get("triage", {}) or {}
     triage_config = TriageConfig(
         skip_path_patterns=triage_raw.get("skip_path_patterns", []) or [],
+        hard_skip_extensions=triage_raw.get("hard_skip_extensions", []) or [],
+        hard_skip_file_patterns=triage_raw.get("hard_skip_file_patterns", []) or [],
         file_type_priority=triage_raw.get("file_type_priority", {}) or {},
         hints=triage_raw.get("hints", []) or [],
     )

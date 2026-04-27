@@ -18,6 +18,7 @@ stored in the knowledge table.
 # TODO：这个总结agent是根据triage的优先级来吗，就是我觉得这里是并行处理任务好时机，比如并行好多subagent一块总结
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -82,6 +83,7 @@ Be factual and dense. No filler. Output ONLY the summary text."""
 _MAX_CONTENT_CHARS = 4000
 _DEFAULT_TIME_BUDGET_SECONDS = 240
 _LIGHT_BATCH_SIZE = 10
+_DEFAULT_DEEP_CONCURRENCY = 4
 
 
 class SummarizerAgent(BaseAgent):
@@ -99,6 +101,7 @@ class SummarizerAgent(BaseAgent):
         mode = task.input_data.get("mode", "deep")
         time_budget = task.input_data.get("time_budget", _DEFAULT_TIME_BUDGET_SECONDS)
         batch_size = task.input_data.get("batch_size", 30 if mode == "deep" else 200)
+        max_concurrency = max(1, min(int(task.input_data.get("max_concurrency", _DEFAULT_DEEP_CONCURRENCY)), 8))
         event_bus = context.get("event_bus")
 
         start_time = time.time()
@@ -106,7 +109,15 @@ class SummarizerAgent(BaseAgent):
         if mode == "light":
             result = await self._run_light(memory, llm, batch_size, time_budget, start_time)
         else:
-            result = await self._run_deep(memory, llm, batch_size, time_budget, start_time, event_bus=event_bus)
+            result = await self._run_deep(
+                memory,
+                llm,
+                batch_size,
+                time_budget,
+                start_time,
+                event_bus=event_bus,
+                max_concurrency=max_concurrency,
+            )
 
         # After individual summarization, attempt hierarchical project summaries
         elapsed = time.time() - start_time
@@ -122,110 +133,141 @@ class SummarizerAgent(BaseAgent):
 
         return result
 
-    async def _run_deep(self, memory, llm, batch_size, time_budget, start_time, event_bus=None) -> dict:
-        """Deep mode: read file content + LLM summarize, one file at a time."""
+    async def _run_deep(
+        self,
+        memory,
+        llm,
+        batch_size,
+        time_budget,
+        start_time,
+        event_bus=None,
+        max_concurrency: int = _DEFAULT_DEEP_CONCURRENCY,
+    ) -> dict:
+        """Deep mode: read file content + LLM summarize with bounded concurrency."""
         files = await memory.get_files_needing_summary(limit=batch_size)
         if not files:
             return {"summarized": 0, "mode": "deep", "message": "all files already summarized"}
 
-        summarized = 0
-        errors = 0
-        vision_count = 0
-        doc_count = 0
+        deadline = start_time + time_budget
+        semaphore = asyncio.Semaphore(max_concurrency)
+        progress_lock = asyncio.Lock()
+        progress = {"summarized": 0, "errors": 0, "vision": 0, "document": 0, "skipped": 0}
         summarized_files: list[dict] = []
 
-        for f in files:
-            if time.time() - start_time >= time_budget:
-                logger.info("Time budget exhausted after %d files, will resume next cycle", summarized)
-                break
-
-            try:
-                path = f["path"]
-                ext = f.get("file_type", Path(path).suffix).lower()
-
-                if is_image(ext):
-                    result = await self._summarize_image(path, f, llm)
-                    if result:
-                        await memory.update_semantic_summary(path, f"[vision] {result}")
-                        summarized += 1
-                        vision_count += 1
-                        summarized_files.append({"path": path, "type": "image", "summary": result[:120]})
+        async def _run_one(f: dict) -> dict:
+            async with semaphore:
+                if time.time() >= deadline:
+                    return {"status": "skipped", "path": f.get("path"), "reason": "time_budget"}
+                result = await self._summarize_file_deep(f, memory, llm)
+                async with progress_lock:
+                    if result["status"] == "summarized":
+                        progress["summarized"] += 1
+                        if result.get("type") == "image":
+                            progress["vision"] += 1
+                        elif result.get("type") == "document":
+                            progress["document"] += 1
+                        summarized_files.append({
+                            "path": result["path"],
+                            "type": result.get("type", "code"),
+                            "summary": result.get("summary", "")[:120],
+                        })
                         if event_bus:
                             await event_bus.emit_dict("summarize.file_progress", {
-                                "path": path, "type": "image",
-                                "summarized": summarized, "total": len(files),
-                                "preview": result[:120],
+                                "path": result["path"],
+                                "type": result.get("type", "code"),
+                                "triage_status": f.get("triage_status"),
+                                "summarized": progress["summarized"],
+                                "errors": progress["errors"],
+                                "total": len(files),
+                                "concurrency": max_concurrency,
+                                "preview": result.get("summary", "")[:120],
                             })
-                    continue
-
-                if is_document(ext):
-                    result = await self._summarize_document(path, f, llm)
-                    if result:
-                        await memory.update_semantic_summary(path, f"[doc] {result}")
-                        summarized += 1
-                        doc_count += 1
-                        summarized_files.append({"path": path, "type": "document", "summary": result[:120]})
+                    elif result["status"] == "error":
+                        progress["errors"] += 1
                         if event_bus:
-                            await event_bus.emit_dict("summarize.file_progress", {
-                                "path": path, "type": "document",
-                                "summarized": summarized, "total": len(files),
-                                "preview": result[:120],
+                            await event_bus.emit_dict("summarize.file_failed", {
+                                "path": result.get("path"),
+                                "error": result.get("error", "unknown"),
+                                "errors": progress["errors"],
+                                "total": len(files),
                             })
-                    continue
+                    else:
+                        progress["skipped"] += 1
+                return result
 
-                content_preview = self._read_preview(path)
-                if not content_preview:
-                    continue
-
-                prompt = (
-                    f"File: {path}\n"
-                    f"Type: {ext}\n"
-                    f"Size: {f['size_bytes']} bytes\n\n"
-                    f"Content (first {_MAX_CONTENT_CHARS} chars):\n"
-                    f"```\n{content_preview}\n```"
-                )
-
-                response = await llm.complete(
-                    messages=[
-                        LLMMessage(role="system", content=_DEEP_SYSTEM),
-                        LLMMessage(role="user", content=prompt),
-                    ],
-                    task_type="summarize",
-                    max_tokens=300,
-                    temperature=0.2,
-                )
-
-                summary_text = response.content.strip()
-                await memory.update_semantic_summary(path, summary_text)
-                summarized += 1
-                summarized_files.append({"path": path, "type": "code", "summary": summary_text[:120]})
-                logger.debug("Summarized [deep]: %s", path)
-                if event_bus:
-                    await event_bus.emit_dict("summarize.file_progress", {
-                        "path": path, "type": "code",
-                        "summarized": summarized, "total": len(files),
-                        "preview": summary_text[:120],
-                    })
-
-            except Exception as e:
-                errors += 1
-                logger.warning("Failed to summarize %s: %s", f.get("path"), e)
+        tasks = [asyncio.create_task(_run_one(f)) for f in files]
+        if tasks:
+            await asyncio.gather(*tasks)
 
         elapsed = time.time() - start_time
         logger.info(
-            "Summarizer [deep] complete: %d summarized (%d vision, %d doc), %d errors in %.1fs",
-            summarized, vision_count, doc_count, errors, elapsed,
+            "Summarizer [deep] complete: %d summarized (%d vision, %d doc), %d errors in %.1fs (concurrency=%d)",
+            progress["summarized"], progress["vision"], progress["document"], progress["errors"], elapsed, max_concurrency,
         )
         return {
-            "summarized": summarized,
-            "vision_files": vision_count,
-            "document_files": doc_count,
-            "errors": errors,
+            "summarized": progress["summarized"],
+            "vision_files": progress["vision"],
+            "document_files": progress["document"],
+            "errors": progress["errors"],
+            "skipped": progress["skipped"],
             "mode": "deep",
             "total_candidates": len(files),
+            "max_concurrency": max_concurrency,
             "elapsed_seconds": round(elapsed, 1),
             "files": summarized_files,
         }
+
+    async def _summarize_file_deep(self, f: dict, memory, llm) -> dict:
+        """Summarize one file and persist the result."""
+        path = f["path"]
+        try:
+            ext = f.get("file_type", Path(path).suffix).lower()
+
+            if is_image(ext):
+                result = await self._summarize_image(path, f, llm)
+                if not result:
+                    return {"status": "skipped", "path": path, "reason": "no_image_content"}
+                await memory.update_semantic_summary(path, f"[vision] {result}")
+                logger.debug("Summarized [vision]: %s", path)
+                return {"status": "summarized", "path": path, "type": "image", "summary": result}
+
+            if is_document(ext):
+                result = await self._summarize_document(path, f, llm)
+                if not result:
+                    return {"status": "skipped", "path": path, "reason": "no_document_content"}
+                await memory.update_semantic_summary(path, f"[doc] {result}")
+                logger.debug("Summarized [doc]: %s", path)
+                return {"status": "summarized", "path": path, "type": "document", "summary": result}
+
+            content_preview = self._read_preview(path)
+            if not content_preview:
+                return {"status": "skipped", "path": path, "reason": "empty_or_unreadable"}
+
+            prompt = (
+                f"File: {path}\n"
+                f"Type: {ext}\n"
+                f"Size: {f['size_bytes']} bytes\n\n"
+                f"Content (first {_MAX_CONTENT_CHARS} chars):\n"
+                f"```\n{content_preview}\n```"
+            )
+
+            response = await llm.complete(
+                messages=[
+                    LLMMessage(role="system", content=_DEEP_SYSTEM),
+                    LLMMessage(role="user", content=prompt),
+                ],
+                task_type="summarize",
+                max_tokens=300,
+                temperature=0.2,
+            )
+
+            summary_text = response.content.strip()
+            await memory.update_semantic_summary(path, summary_text)
+            logger.debug("Summarized [deep]: %s", path)
+            return {"status": "summarized", "path": path, "type": "code", "summary": summary_text}
+        except Exception as e:
+            logger.warning("Failed to summarize %s: %s", path, e)
+            return {"status": "error", "path": path, "error": str(e)}
 
     async def _summarize_image(self, path: str, file_info: dict, llm) -> str | None:
         """Use the vision model (qwen-vl-plus) to describe an image."""

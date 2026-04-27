@@ -12,10 +12,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from aiohttp import web
+
 DB_PATH = Path.home() / ".agent_sys" / "memory.db"
 LLM_CONFIG_PATH = Path.home() / ".agent_sys" / "llm_config.yaml"
 AUTH_TOKEN_PATH = Path.home() / ".agent_sys" / "auth_token"
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "default.yaml"
+DASHBOARD_MUTATION_HEADER = "X-Kith-Dashboard"
 
 # Daemon HTTP port — the syscall/events server the dashboard proxies to.
 DAEMON_HTTP_PORT = 7437
@@ -46,3 +49,20 @@ def auth_headers() -> dict[str, str]:
     except Exception:
         pass
     return {}
+
+
+@web.middleware
+async def require_dashboard_mutation_header(request, handler):
+    """Require a non-simple header for local dashboard mutations.
+
+    The dashboard is bound to localhost, but browsers can still submit simple
+    cross-site POSTs to localhost. Requiring this custom header blocks those
+    requests because they need a CORS preflight that this app does not allow.
+    """
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        if request.headers.get(DASHBOARD_MUTATION_HEADER) != "1":
+            return web.json_response(
+                {"error": "dashboard mutation header required"},
+                status=403,
+            )
+    return await handler(request)

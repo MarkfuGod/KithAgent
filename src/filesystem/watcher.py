@@ -32,6 +32,13 @@ _BINARY_EXTENSIONS = frozenset({
 })
 
 
+def _next_walk(walker):
+    try:
+        return next(walker)
+    except StopIteration:
+        return None
+
+
 class FileSystemWatcher:
     """Watches directories and indexes files into Memory."""
 
@@ -56,9 +63,21 @@ class FileSystemWatcher:
 
     async def _initial_scan_and_watch(self) -> None:
         """Run initial scan, then start periodic rescan + realtime watcher."""
-        await self._full_scan()
-        self._start_realtime_watcher()
-        self._scan_task = asyncio.create_task(self._periodic_scan_loop())
+        # Let the kernel finish bringing syscall/HTTP online before the
+        # potentially expensive initial scan starts consuming event-loop time.
+        await asyncio.sleep(1)
+        try:
+            await self._full_scan()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Initial filesystem scan failed: %s", e, exc_info=True)
+        finally:
+            self._stats["scan_in_progress"] = False
+
+        if self._running:
+            self._start_realtime_watcher()
+            self._scan_task = asyncio.create_task(self._periodic_scan_loop())
 
     async def stop(self) -> None:
         self._running = False
@@ -81,17 +100,18 @@ class FileSystemWatcher:
         self._stats["scan_in_progress"] = True
         self._stats["scan_progress_files"] = 0
         count = 0
-        for watch_path in self.config.watch_paths:
-            expanded = Path(os.path.expanduser(str(watch_path)))
-            if not expanded.exists():
-                logger.warning("Watch path does not exist: %s", expanded)
-                continue
-            count += await self._scan_directory(expanded)
-
-        self._stats["files_indexed"] = count
-        self._stats["scan_progress_files"] = count
-        self._stats["last_scan"] = time.time()
-        self._stats["scan_in_progress"] = False
+        try:
+            for watch_path in self.config.watch_paths:
+                expanded = Path(os.path.expanduser(str(watch_path)))
+                if not await asyncio.to_thread(expanded.exists):
+                    logger.warning("Watch path does not exist: %s", expanded)
+                    continue
+                count += await self._scan_directory(expanded)
+        finally:
+            self._stats["files_indexed"] = count
+            self._stats["scan_progress_files"] = count
+            self._stats["last_scan"] = time.time()
+            self._stats["scan_in_progress"] = False
         logger.info("Full scan complete: %d files indexed", count)
 
     async def _scan_directory(self, root: Path) -> int:
@@ -102,7 +122,12 @@ class FileSystemWatcher:
         extensions = set(self.config.index_extensions)
 
         try:
-            for dirpath, dirnames, filenames in os.walk(str(root)):
+            walker = os.walk(str(root))
+            while self._running:
+                item = await asyncio.to_thread(_next_walk, walker)
+                if item is None:
+                    break
+                dirpath, dirnames, filenames = item
                 if not self._running:
                     break
 
@@ -129,7 +154,7 @@ class FileSystemWatcher:
                     full_path = os.path.join(dirpath, fname)
 
                     try:
-                        stat = os.stat(full_path)
+                        stat = await asyncio.to_thread(os.stat, full_path)
                         if stat.st_size > max_size:
                             continue
 
@@ -139,11 +164,14 @@ class FileSystemWatcher:
                             continue
 
                         if ext in _BINARY_EXTENSIONS:
-                            raw = Path(full_path).read_bytes()
+                            raw = await asyncio.to_thread(Path(full_path).read_bytes)
                             chash = hashlib.sha256(raw[:8192]).hexdigest()[:16]
                             summary = ""
                         else:
-                            content = Path(full_path).read_text(errors="replace")
+                            content = await asyncio.to_thread(
+                                Path(full_path).read_text,
+                                errors="replace",
+                            )
                             chash = content_hash(content)
                             summary = self._extract_summary(Path(full_path), content)
 
@@ -334,17 +362,17 @@ class FileSystemWatcher:
             try:
                 if not path.exists():
                     return
-                stat = path.stat()
+                stat = await asyncio.to_thread(path.stat)
                 if stat.st_size > self.config.max_file_size_mb * 1024 * 1024:
                     return
 
                 ext = path.suffix.lower()
                 if ext in _BINARY_EXTENSIONS:
-                    raw = path.read_bytes()
+                    raw = await asyncio.to_thread(path.read_bytes)
                     chash = hashlib.sha256(raw[:8192]).hexdigest()[:16]
                     summary = ""
                 else:
-                    content = path.read_text(errors="replace")
+                    content = await asyncio.to_thread(path.read_text, errors="replace")
                     chash = content_hash(content)
                     summary = self._extract_summary(path, content)
 

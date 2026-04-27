@@ -158,6 +158,73 @@ class SysAgentClient:
             return resp.data
         raise RuntimeError(resp.error)
 
+    async def profile_summary(self, rebuild: bool = False) -> dict:
+        resp = await self._call(SyscallType.PROFILE_SUMMARY, {"rebuild": rebuild, "timeout": 300})
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def assistant_chat(self, message: str, history: list[dict] | None = None) -> dict:
+        resp = await self._call(SyscallType.ASSISTANT_CHAT, {
+            "message": message,
+            "history": history or [],
+            "timeout": 300,
+        })
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def onboarding_bootstrap(
+        self,
+        answers: dict,
+        include_browser_history: bool = False,
+        history_days: int = 30,
+        history_limit: int = 500,
+    ) -> dict:
+        resp = await self._call(SyscallType.ONBOARDING_BOOTSTRAP, {
+            "answers": answers,
+            "include_browser_history": include_browser_history,
+            "history_days": history_days,
+            "history_limit": history_limit,
+            "timeout": 300,
+        })
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def first_insight(
+        self,
+        answers: dict,
+        include_browser_history: bool = False,
+        history_days: int = 30,
+        history_limit: int = 500,
+    ) -> dict:
+        resp = await self._call(SyscallType.ASSISTANT_FIRST_INSIGHT, {
+            "answers": answers,
+            "include_browser_history": include_browser_history,
+            "history_days": history_days,
+            "history_limit": history_limit,
+            "timeout": 300,
+        })
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def memory_review(self, status: str | None = None, limit: int = 50) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        resp = await self._call(SyscallType.MEMORY_REVIEW, params)
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def memory_feedback(self, fact_id: str, status: str) -> dict:
+        resp = await self._call(SyscallType.MEMORY_FEEDBACK, {"fact_id": fact_id, "status": status})
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
     async def analyze_behavior(self, hours: float = 168) -> dict:
         resp = await self._call(SyscallType.ANALYZE_BEHAVIOR, {"hours": hours, "timeout": 300})
         if resp.success:
@@ -254,6 +321,50 @@ class SyncSysAgentClient:
 
     def profile_get(self) -> dict:
         return self._get_loop().run_until_complete(self._async_client.profile_get())
+
+    def profile_summary(self, rebuild: bool = False) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.profile_summary(rebuild))
+
+    def assistant_chat(self, message: str, history: list[dict] | None = None) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.assistant_chat(message, history))
+
+    def onboarding_bootstrap(
+        self,
+        answers: dict,
+        include_browser_history: bool = False,
+        history_days: int = 30,
+        history_limit: int = 500,
+    ) -> dict:
+        return self._get_loop().run_until_complete(
+            self._async_client.onboarding_bootstrap(
+                answers,
+                include_browser_history=include_browser_history,
+                history_days=history_days,
+                history_limit=history_limit,
+            )
+        )
+
+    def first_insight(
+        self,
+        answers: dict,
+        include_browser_history: bool = False,
+        history_days: int = 30,
+        history_limit: int = 500,
+    ) -> dict:
+        return self._get_loop().run_until_complete(
+            self._async_client.first_insight(
+                answers,
+                include_browser_history=include_browser_history,
+                history_days=history_days,
+                history_limit=history_limit,
+            )
+        )
+
+    def memory_review(self, status: str | None = None, limit: int = 50) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.memory_review(status, limit))
+
+    def memory_feedback(self, fact_id: str, status: str) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.memory_feedback(fact_id, status))
 
     def analyze_behavior(self, hours: float = 168) -> dict:
         return self._get_loop().run_until_complete(self._async_client.analyze_behavior(hours))

@@ -37,6 +37,7 @@ class AgentScheduler:
         self._semaphore = asyncio.Semaphore(config.max_concurrent_agents)
         self._running = False
         self._worker_task: asyncio.Task | None = None
+        self._runner_tasks: dict[str, asyncio.Task] = {}
         self._total_dispatched = 0
 
     async def start(self) -> None:
@@ -55,6 +56,12 @@ class AgentScheduler:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+
+        for runner in list(self._runner_tasks.values()):
+            runner.cancel()
+        if self._runner_tasks:
+            await asyncio.gather(*self._runner_tasks.values(), return_exceptions=True)
+            self._runner_tasks.clear()
 
         for task_id, task in self._active_tasks.items():
             task.state = AgentState.CANCELLED
@@ -80,8 +87,7 @@ class AgentScheduler:
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            task.state = AgentState.FAILED
-            task.error = "Timeout"
+            await self._timeout_task(task, "Timeout")
         return task
 
     async def fan_out(
@@ -110,8 +116,7 @@ class AgentScheduler:
             try:
                 await asyncio.wait_for(evt.wait(), timeout=timeout)
             except asyncio.TimeoutError:
-                task.state = AgentState.FAILED
-                task.error = "Timeout (fan_out)"
+                await self._timeout_task(task, "Timeout (fan_out)")
 
         await asyncio.gather(*[_wait_one(t, e) for t, e in events])
         return [t for t, _ in events]
@@ -129,9 +134,20 @@ class AgentScheduler:
             except asyncio.CancelledError:
                 break
 
-            asyncio.create_task(self._run_task(task))
+            runner = asyncio.create_task(self._run_task(task))
+            self._runner_tasks[task.task_id] = runner
+            runner.add_done_callback(
+                lambda _done, task_id=task.task_id: self._runner_tasks.pop(task_id, None)
+            )
 
     async def _run_task(self, task: AgentTask) -> None:
+        if getattr(task, "_cancel_requested", False):
+            task.state = AgentState.FAILED
+            task.error = task.error or "Timeout"
+            task.completed_at = time.time()
+            self._finalize(task)
+            return
+
         agent = self._find_agent(task.name)
         if not agent:
             task.state = AgentState.FAILED
@@ -163,6 +179,13 @@ class AgentScheduler:
             except asyncio.TimeoutError:
                 task.state = AgentState.FAILED
                 task.error = "Agent execution timed out"
+            except asyncio.CancelledError:
+                if getattr(task, "_cancel_requested", False):
+                    task.state = AgentState.FAILED
+                    task.error = task.error or "Timeout"
+                else:
+                    task.state = AgentState.CANCELLED
+                    task.error = task.error or "Cancelled"
             except Exception as e:
                 task.state = AgentState.FAILED
                 task.error = str(e)
@@ -179,7 +202,26 @@ class AgentScheduler:
                 }, task)
                 self._finalize(task)
 
+    async def _timeout_task(self, task: AgentTask, error: str) -> None:
+        """Cancel a timed-out queued/running task and finalize it once."""
+        task._cancel_requested = True  # type: ignore[attr-defined]
+        task.state = AgentState.FAILED
+        task.error = error
+        task.completed_at = time.time()
+        self._active_tasks.pop(task.task_id, None)
+
+        runner = self._runner_tasks.get(task.task_id)
+        if runner and not runner.done():
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+            self._finalize(task)
+        else:
+            self._finalize(task)
+
     def _finalize(self, task: AgentTask) -> None:
+        if getattr(task, "_finalized", False):
+            return
+        task._finalized = True  # type: ignore[attr-defined]
         self._completed_tasks.append(task)
         if len(self._completed_tasks) > 1000:
             self._completed_tasks = self._completed_tasks[-500:]

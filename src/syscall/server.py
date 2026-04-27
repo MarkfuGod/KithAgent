@@ -267,7 +267,7 @@ class SyscallServer:
 
         event_bus = self.kernel.get_event_bus()
         if not event_bus:
-            await resp.write(b"event: error\ndata: {\"msg\":\"No EventBus available\"}\n\n")
+            await self._sse_write(resp, b"event: error\ndata: {\"msg\":\"No EventBus available\"}\n\n")
             return resp
 
         queue = event_bus.subscribe(replay_buffer=False)
@@ -275,20 +275,35 @@ class SyscallServer:
             recent = event_bus.recent_events(limit=50)
             for evt in recent:
                 line = json.dumps(evt, default=str)
-                await resp.write(f"event: {evt['type']}\ndata: {line}\n\n".encode())
+                if not await self._sse_write(resp, f"event: {evt['type']}\ndata: {line}\n\n".encode()):
+                    return resp
 
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30)
-                    await resp.write(event.to_sse().encode())
+                    if not await self._sse_write(resp, event.to_sse().encode()):
+                        break
                 except asyncio.TimeoutError:
-                    await resp.write(b": keepalive\n\n")
-                except ConnectionResetError:
+                    if not await self._sse_write(resp, b": keepalive\n\n"):
+                        break
+                except (ConnectionResetError, web.HTTPException):
                     break
         finally:
             event_bus.unsubscribe(queue)
 
         return resp
+
+    async def _sse_write(self, resp, payload: bytes) -> bool:
+        """Write to an SSE stream; return False if the browser already closed it."""
+        try:
+            await resp.write(payload)
+            return True
+        except (ConnectionResetError, BrokenPipeError):
+            return False
+        except Exception as e:
+            if e.__class__.__name__ == "ClientConnectionResetError":
+                return False
+            raise
 
     # ── Core dispatch ─────────────────────────────────────────
 
@@ -377,5 +392,19 @@ class SyscallServer:
             params["report_type"] = "project"
         elif request.call_type == SyscallType.REPORT_BRIEF:
             params["report_type"] = "brief"
+
+        assistant_actions = {
+            SyscallType.ASSISTANT_CHAT: "chat",
+            SyscallType.PROFILE_SUMMARY: "profile_summary",
+            SyscallType.MEMORY_REVIEW: "memory_review",
+            SyscallType.MEMORY_FEEDBACK: "memory_feedback",
+            SyscallType.SOURCES_GET: "sources_get",
+            SyscallType.SOURCES_CONFIGURE: "sources_configure",
+            SyscallType.SETTINGS_MODEL: "settings_model",
+            SyscallType.ONBOARDING_BOOTSTRAP: "onboarding_bootstrap",
+            SyscallType.ASSISTANT_FIRST_INSIGHT: "onboarding_bootstrap",
+        }
+        if request.call_type in assistant_actions:
+            params["action"] = assistant_actions[request.call_type]
 
         return params

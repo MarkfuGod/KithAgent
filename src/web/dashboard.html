@@ -30,6 +30,7 @@
     <button class="nav-tab" data-tab="files">Files &amp; Directories</button>
     <button class="nav-tab" data-tab="knowledge">Knowledge Base</button>
     <button class="nav-tab" data-tab="scheduling">Scheduling</button>
+    <button class="nav-tab" data-tab="rag">RAG</button>
     <button class="nav-tab" data-tab="llm">LLM Config</button>
     <button class="nav-tab" data-tab="triage">Triage</button>
     <button class="nav-tab" data-tab="summary">Summary Progress</button>
@@ -106,6 +107,16 @@
       </div>
       <div id="liveActiveTasks" style="padding:16px;">
         <div style="text-align:center;color:var(--text-muted);padding:20px;">No active tasks</div>
+      </div>
+    </div>
+
+    <div class="data-card">
+      <div class="card-header">
+        <h3>Task Timeline</h3>
+        <span style="font-size:12px;color:var(--text-muted);">Started, completed, failed</span>
+      </div>
+      <div id="liveTaskTimeline" style="max-height:260px;overflow-y:auto;padding:12px 16px;">
+        <div style="text-align:center;color:var(--text-muted);padding:12px;">Waiting for task events...</div>
       </div>
     </div>
 
@@ -193,6 +204,66 @@
 
     <div id="schedulingContent">
       <div class="loading">Loading scheduling decisions...</div>
+    </div>
+  </div>
+
+  <!-- RAG TAB -->
+  <div class="tab-content" id="tab-rag">
+    <div class="data-card" style="margin-bottom:24px;overflow:hidden;">
+      <div style="padding:22px 24px;background:linear-gradient(135deg, rgba(88,166,255,.16), rgba(63,185,80,.08));border-bottom:1px solid var(--border);">
+        <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+          <div>
+            <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px;">Hybrid Retrieval</div>
+            <h2 style="font-size:22px;margin:0 0 6px;">RAG Control Room</h2>
+            <p style="font-size:13px;color:var(--text-muted);max-width:720px;line-height:1.6;margin:0;">
+              Full-text chunks + vector embeddings run as a delayed background job. Keep it enabled for better assistant citations, or pause it when you need a quiet machine.
+            </p>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button class="btn btn-primary" onclick="triggerRagIndex()">Run RAG Now</button>
+            <button class="btn" onclick="loadRag()">Refresh</button>
+          </div>
+        </div>
+      </div>
+      <div class="stat-grid" id="ragStats" style="padding:16px;"></div>
+    </div>
+
+    <div class="chart-grid" style="grid-template-columns:1fr 1fr;">
+      <div class="data-card">
+        <div class="card-header">
+          <h3>Startup & Indexing Controls</h3>
+          <button class="btn btn-success" onclick="saveRagConfig()">Save RAG Config</button>
+        </div>
+        <div style="padding:16px;" id="ragConfigPanel">
+          <div class="loading">Loading RAG config...</div>
+        </div>
+      </div>
+
+      <div class="data-card">
+        <div class="card-header">
+          <h3>Debug Retrieval</h3>
+          <span style="font-size:12px;color:var(--text-muted);">Runs the same hybrid retriever used by Assistant</span>
+        </div>
+        <div style="padding:16px;">
+          <div class="search-box" style="margin-bottom:12px;">
+            <input class="search-input" id="ragDebugQuery" placeholder="Ask a question to inspect retrieved chunks..." onkeydown="if(event.key==='Enter') debugRagSearch()">
+            <button class="btn btn-primary" onclick="debugRagSearch()">Search</button>
+          </div>
+          <div id="ragDebugResults" style="max-height:420px;overflow-y:auto;">
+            <div style="color:var(--text-muted);text-align:center;padding:24px;">Enter a query to inspect chunks, scores, and source paths.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="data-card">
+      <div class="card-header">
+        <h3>RAG Logs</h3>
+        <button class="btn" onclick="loadRagLogs()" style="font-size:11px;padding:4px 10px;">Reload Logs</button>
+      </div>
+      <div id="ragLogs" style="max-height:360px;overflow-y:auto;font-family:'SF Mono','Fira Code',monospace;font-size:12px;padding:14px 16px;background:var(--bg-primary);">
+        <div style="color:var(--text-muted);text-align:center;padding:16px;">No RAG logs loaded yet.</div>
+      </div>
     </div>
   </div>
 
@@ -302,6 +373,16 @@
     </div>
 
     <div class="data-card">
+      <div class="card-header">
+        <h3>File Cluster Recommendations</h3>
+        <span style="font-size:12px;color:var(--text-muted);">Approve or exclude whole groups before summarization</span>
+      </div>
+      <div id="fileClusterRecommendations">
+        <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading cluster recommendations...</div>
+      </div>
+    </div>
+
+    <div class="data-card">
       <div class="card-header"><h3>Triage by Directory</h3></div>
       <div style="padding:16px;" id="triageByDir">
         <div style="color:var(--text-muted);text-align:center;">Loading directory breakdown...</div>
@@ -346,6 +427,7 @@
 <script src="/static/files.js"></script>
 <script src="/static/knowledge.js"></script>
 <script src="/static/scheduling.js"></script>
+<script src="/static/rag.js"></script>
 <script src="/static/summary.js"></script>
 <script src="/static/triage.js"></script>
 <script src="/static/events.js"></script>
