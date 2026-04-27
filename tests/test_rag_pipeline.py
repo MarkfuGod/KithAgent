@@ -5,12 +5,85 @@ from src.agents.rag_indexer import RagIndexerAgent
 from src.agents.base import AgentTask
 from src.kernel.config import MemoryConfig
 from src.memory.chunking import chunk_text
+from src.memory.embeddings import APIEmbeddingProvider
 from src.memory.store import MemoryStore, content_hash
 
 
 class _Kernel:
     def __init__(self, memory_config):
         self.config = type("Config", (), {"memory": memory_config})()
+
+
+class _FakeEmbeddingResponse:
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {
+            "output": {
+                "embeddings": [
+                    {"index": 1, "embedding": [0.0, 1.0]},
+                    {"index": 0, "embedding": [1.0, 0.0]},
+                ],
+            },
+        }
+
+
+class _FakeEmbeddingClient:
+    def __init__(self):
+        self.url = None
+        self.body = None
+
+    def post(self, url, json):
+        self.url = url
+        self.body = json
+        return _FakeEmbeddingResponse()
+
+
+def test_qwen_vl_embedding_uses_dashscope_multimodal_endpoint(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    provider = APIEmbeddingProvider(
+        name="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen3-vl-embedding",
+    )
+    client = _FakeEmbeddingClient()
+    provider._client = client
+
+    vectors = provider._call_api(["alpha", "beta"])
+
+    assert client.url == (
+        "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
+        "multimodal-embedding/multimodal-embedding"
+    )
+    assert client.body["input"]["contents"] == [{"text": "alpha"}, {"text": "beta"}]
+    assert client.body["parameters"]["dimension"] == 1024
+    assert vectors == [[1.0, 0.0], [0.0, 1.0]]
+
+
+def test_qwen_vl_structured_embedding_accepts_image_input(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    provider = APIEmbeddingProvider(
+        name="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen3-vl-embedding",
+    )
+    client = _FakeEmbeddingClient()
+    provider._client = client
+
+    vectors = provider.embed_items([
+        {"text": "screenshot with roadmap", "image": "data:image/png;base64,AAAA"},
+        {"text": "plain caption"},
+    ])
+
+    assert client.body["input"]["contents"][0] == {
+        "text": "screenshot with roadmap",
+        "image": "data:image/png;base64,AAAA",
+    }
+    assert client.body["input"]["contents"][1] == {"text": "plain caption"}
+    assert len(vectors) == 2
 
 
 def test_chunk_text_preserves_line_ranges_and_overlap():
@@ -90,6 +163,57 @@ def test_rag_indexer_builds_chunks_without_blocking_on_embeddings(tmp_path):
             await store.stop()
 
     asyncio.run(run_case())
+
+
+def test_rag_indexer_builds_media_chunk_from_image_summary(tmp_path):
+    async def run_case():
+        cfg = MemoryConfig(db_path=tmp_path / "memory.db")
+        cfg.rag.batch_size = 5
+        cfg.rag.embedding_batch_size = 0
+        store = MemoryStore(cfg)
+        await store.initialize()
+        try:
+            path = tmp_path / "roadmap.png"
+            path.write_bytes(b"fake-png")
+            await store.upsert_file(
+                path=str(path),
+                content_hash=content_hash(path.read_bytes()),
+                size_bytes=path.stat().st_size,
+                modified_at=path.stat().st_mtime,
+                file_type=".png",
+                summary="roadmap screenshot with onboarding funnel",
+            )
+            await store.batch_update_triage([(str(path), "high")])
+
+            result = await RagIndexerAgent().execute(
+                AgentTask(name="rag_indexer", input_data={"embedding_batch_size": 0}),
+                {"memory": store, "kernel": _Kernel(cfg)},
+            )
+            assert result["indexed_files"] == 1
+
+            results = await store.hybrid_search_chunks("onboarding funnel", limit=3)
+            assert results
+            assert results[0]["metadata"]["modality"] == "image"
+            assert results[0]["metadata"]["source_kind"] == "image"
+            assert results[0]["start_line"] is None
+            assert "roadmap screenshot" in results[0]["content"]
+        finally:
+            await store.stop()
+
+    asyncio.run(run_case())
+
+
+def test_rag_indexer_media_embedding_input_includes_image(tmp_path):
+    path = tmp_path / "screen.png"
+    path.write_bytes(b"image-bytes")
+    item = RagIndexerAgent()._embedding_input_for_chunk({
+        "path": str(path),
+        "content": "screen summary",
+        "metadata": {"modality": "image", "source_kind": "image"},
+    })
+
+    assert item["text"] == "screen summary"
+    assert item["image"].startswith("data:image/png;base64,")
 
 
 def test_assistant_retrieves_rag_evidence_best_effort(tmp_path):

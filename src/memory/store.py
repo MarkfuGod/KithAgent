@@ -205,6 +205,16 @@ class MemoryStore:
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_file_triage ON file_index(triage_status)")
         self._db.commit()
 
+    @staticmethod
+    def _decode_chunk_metadata(raw: str | None) -> dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
     def _migrate_schema(self) -> None:
         """Add new columns to existing tables if they don't exist yet."""
         assert self._db
@@ -906,7 +916,7 @@ class MemoryStore:
 
         rows = db.execute(
             f"""SELECT path, hash, file_type, size_bytes, modified_at,
-                       COALESCE(semantic_summary, '') as semantic_summary
+                       COALESCE(NULLIF(semantic_summary, ''), summary, '') as semantic_summary
                 FROM file_index fi
                 WHERE triage_status IN ({placeholders})
                   {size_clause}
@@ -943,7 +953,7 @@ class MemoryStore:
             where = "(embedding IS NULL OR length(embedding) = 0)"
             params = [limit]
         rows = db.execute(
-            f"""SELECT id, path, chunk_index, content
+            f"""SELECT id, path, chunk_index, content, metadata
                 FROM document_chunks
                 WHERE {where}
                 ORDER BY created_at DESC
@@ -951,7 +961,13 @@ class MemoryStore:
             params,
         ).fetchall()
         return [
-            {"id": r[0], "path": r[1], "chunk_index": r[2], "content": r[3]}
+            {
+                "id": r[0],
+                "path": r[1],
+                "chunk_index": r[2],
+                "content": r[3],
+                "metadata": self._decode_chunk_metadata(r[4]),
+            }
             for r in rows
         ]
 
@@ -993,7 +1009,8 @@ class MemoryStore:
             try:
                 rows = db.execute(
                     f"""SELECT dc.id, dc.path, dc.chunk_index, dc.start_line, dc.end_line,
-                               dc.content, fi.file_type, bm25(document_chunks_fts) as rank
+                               dc.content, fi.file_type, dc.metadata,
+                               bm25(document_chunks_fts) as rank
                         FROM document_chunks_fts
                         JOIN document_chunks dc ON dc.id = document_chunks_fts.id
                         JOIN file_index fi ON fi.path = dc.path
@@ -1007,7 +1024,7 @@ class MemoryStore:
                 like = f"%{query}%"
                 rows = db.execute(
                     f"""SELECT dc.id, dc.path, dc.chunk_index, dc.start_line, dc.end_line,
-                               dc.content, fi.file_type, 0.0 as rank
+                               dc.content, fi.file_type, dc.metadata, 0.0 as rank
                         FROM document_chunks dc
                         JOIN file_index fi ON fi.path = dc.path
                         WHERE dc.content LIKE ?
@@ -1020,7 +1037,8 @@ class MemoryStore:
                 {
                     "chunk_id": r[0], "path": r[1], "chunk_index": r[2],
                     "start_line": r[3], "end_line": r[4], "content": r[5],
-                    "file_type": r[6], "fts_rank": float(r[7] or 0.0),
+                    "file_type": r[6], "metadata": self._decode_chunk_metadata(r[7]),
+                    "fts_rank": float(r[8] or 0.0),
                     "retrieval_mode": "fts",
                 }
                 for r in rows
@@ -1045,7 +1063,7 @@ class MemoryStore:
         def _run() -> list[dict]:
             rows = db.execute(
                 f"""SELECT dc.id, dc.path, dc.chunk_index, dc.start_line, dc.end_line,
-                           dc.content, fi.file_type, dc.embedding
+                           dc.content, fi.file_type, dc.metadata, dc.embedding
                     FROM document_chunks dc
                     JOIN file_index fi ON fi.path = dc.path
                     WHERE dc.embedding IS NOT NULL AND length(dc.embedding) > 0
@@ -1060,7 +1078,7 @@ class MemoryStore:
                 q_norm = float(np.linalg.norm(q)) + 1e-9
                 scored: list[tuple[float, Any]] = []
                 for r in rows:
-                    v = np.frombuffer(r[7], dtype=np.float32)
+                    v = np.frombuffer(r[8], dtype=np.float32)
                     if v.shape != q.shape or v.size == 0:
                         continue
                     score = float((v @ q) / ((np.linalg.norm(v) + 1e-9) * q_norm))
@@ -1071,7 +1089,7 @@ class MemoryStore:
                 scored = []
                 for r in rows:
                     try:
-                        scored.append((cosine_similarity(query_embedding, r[7]), r))
+                        scored.append((cosine_similarity(query_embedding, r[8]), r))
                     except Exception:
                         continue
             scored.sort(key=lambda item: item[0], reverse=True)
@@ -1079,7 +1097,8 @@ class MemoryStore:
                 {
                     "chunk_id": r[0], "path": r[1], "chunk_index": r[2],
                     "start_line": r[3], "end_line": r[4], "content": r[5],
-                    "file_type": r[6], "score": round(score, 4),
+                    "file_type": r[6], "metadata": self._decode_chunk_metadata(r[7]),
+                    "score": round(score, 4),
                     "retrieval_mode": "vector",
                 }
                 for score, r in scored[:limit]

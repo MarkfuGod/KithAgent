@@ -2,6 +2,193 @@
 
 > Local note for future Cursor sessions. This file is intentionally ignored by git.
 
+## LLM Navigation Index
+
+Use this section first when an LLM needs to locate code quickly. The rest of this file explains architecture, runtime behavior, product direction, and debugging details in more depth.
+
+### Top-Level Repository Index
+
+- `README.md`: user-facing product README, install flow, CLI usage, skill integration, architecture overview, and bilingual project description.
+- `CODEBASE.md`: local LLM-oriented codebase memory and navigation guide.
+- `pyproject.toml`: Python package metadata, optional dependency groups, console script mapping for `agent-sys`, and pytest config.
+- `requirements.txt`: pip dependency list for non-PEP-621 installation flows.
+- `.gitignore`: excludes runtime data, build artifacts, caches, local databases, and generated files.
+- `agent_sys/`: public import shim so external code can import `agent_sys.*` while implementation stays in `src/`.
+- `assets/`: static repository assets such as the Kith logo used by documentation/product surfaces.
+- `config/`: default daemon, indexing, memory, LLM, cron, triage, and RAG configuration.
+- `desktop/`: Electron + React desktop app, the consumer Jarvis/Kith surface.
+- `skills/`: Agent Skill markdown packs for external agent tools to call the daemon.
+- `src/`: Python daemon, scheduler, agents, memory store, syscall server/client, LLM routing, ingestion, extraction, and legacy dashboard.
+- `tests/`: pytest/node tests for RAG, embeddings, desktop daemon bridge, and integration-critical behavior.
+
+### Root Files And Packages
+
+#### `agent_sys/`
+
+- `agent_sys/__init__.py`: thin public package alias. It reuses `src` package paths so `agent_sys.syscall.client` and `src.syscall.client` resolve to the same implementation without hard module aliasing.
+
+#### `assets/`
+
+- `assets/kith-logo.png`: Kith logo used by README and product/documentation branding.
+
+#### `config/`
+
+- `config/default.yaml`: canonical default config for filesystem scanning, ignored paths, memory/RAG settings, scheduler limits, syscall auth/ports, LLM providers/routing, cron jobs, triage filters, and AgentOS behavior.
+
+#### `skills/`
+
+- `skills/agent-sys-admin/SKILL.md`: instructions for agent tools to inspect daemon status, run admin commands, trigger agents, and troubleshoot local runtime.
+- `skills/agent-sys-file-search/SKILL.md`: instructions for agent tools to search local files, read indexed content, and query knowledge through syscalls.
+- `skills/agent-sys-user-context/SKILL.md`: instructions for agent tools to retrieve personal context, recent work, profile summaries, and behavior reports.
+
+### Desktop App Index
+
+#### `desktop/`
+
+- `desktop/package.json`: Electron/Vite/React package metadata, scripts, dependencies, and `main` entry.
+- `desktop/package-lock.json`: npm lockfile for deterministic desktop dependency installs.
+- `desktop/tsconfig.json`: TypeScript config for renderer/preload typings and desktop build checks.
+- `desktop/vite.config.ts`: Vite config for the React renderer bundle.
+
+#### `desktop/src/main/`
+
+- `desktop/src/main/main.js`: Electron main process. Creates the window, wires IPC handlers, opens the legacy dashboard, starts/stops the Python daemon, and routes renderer requests through the daemon bridge.
+- `desktop/src/main/daemon.js`: daemon transport bridge. Starts `python3 -m src.cli start -d`, reads auth token, calls HTTP `/syscall`, falls back to Unix socket framing, probes status, and coalesces concurrent daemon starts.
+
+#### `desktop/src/preload/`
+
+- `desktop/src/preload/preload.js`: secure preload bridge. Exposes the narrow `window.kith` API and keeps the renderer away from Node/Electron primitives, tokens, and direct filesystem access.
+
+#### `desktop/src/renderer/`
+
+- `desktop/src/renderer/index.html`: Vite HTML entry for the React renderer.
+- `desktop/src/renderer/vite-env.d.ts`: renderer type declarations for daemon status, chat messages, profile/memory/source payloads, and `window.kith`.
+
+#### `desktop/src/renderer/src/`
+
+- `desktop/src/renderer/src/main.tsx`: React mount point.
+- `desktop/src/renderer/src/App.tsx`: single-file MVP desktop UI. Owns tab state, daemon status, chat, profile summary, memory review, source settings, model settings, and actions for Jarvis/profile/memory/privacy/advanced tabs.
+- `desktop/src/renderer/src/styles.css`: global desktop styling: dark Mac-like shell, glass panels, sidebar, chat bubbles, profile/memory cards, and responsive limits.
+
+#### `desktop/test/`
+
+- `desktop/test/daemon.test.js`: Node tests for daemon bridge fallback behavior, Unix socket fallback, and concurrent daemon start coalescing.
+
+### Python Backend Index
+
+#### `src/`
+
+- `src/__init__.py`: source package marker.
+- `src/cli.py`: CLI entry point. Handles daemon start/stop/status/ping, search/query/report/profile/summarize/analyze/triage/classify/dashboard commands, first-run scan prompts, model setup, saved config merging, and daemonization.
+- `src/extractors.py`: content extraction utilities for plain text, PDF, DOCX, PPTX, XLSX, image base64, rendered PDF pages, and modality detection for summarization/RAG.
+
+#### `src/agents/`
+
+- `src/agents/__init__.py`: agents package marker.
+- `src/agents/base.py`: `AgentTask`, `AgentState`, and `BaseAgent`; shared contract for every scheduled agent.
+- `src/agents/builtin.py`: lightweight built-in agents for file search/read/list, knowledge query/store, context save/load, status, task submission/status, and registry assembly.
+- `src/agents/assistant.py`: Jarvis consumer assistant. Builds context from profile facts, insight runs, recent activity, knowledge, hybrid RAG evidence, and LLM/fallback responses.
+- `src/agents/rag_indexer.py`: delayed background RAG indexer. Extracts eligible high/medium files, chunks text or media summaries, stores document chunks, and optionally embeds chunks.
+- `src/agents/triage.py`: hard filters plus LLM-assisted file triage into high/medium/low/skip with progress/failure events.
+- `src/agents/summarizer.py`: file/project summarizer with bounded concurrency, multimodal extraction, triage-aware selection, and summary persistence.
+- `src/agents/analyzer.py`: behavior insight agent over recent activity; parses LLM JSON leniently and stores structured/fallback insight.
+- `src/agents/reporter.py`: report generator for daily, project, brief, and other knowledge reports.
+- `src/agents/profile_builder.py`: personal profile builder; derives correctable profile facts and stores profile knowledge.
+- `src/agents/prioritizer.py`: hot/warm/cold file priority classifier.
+
+#### `src/filesystem/`
+
+- `src/filesystem/__init__.py`: filesystem package marker.
+- `src/filesystem/watcher.py`: scan/watch subsystem. Walks configured paths, filters ignored/sensitive/generated files, hashes and summarizes metadata, upserts file rows, and optionally listens with watchdog.
+
+#### `src/ingest/`
+
+- `src/ingest/__init__.py`: ingestion package marker.
+- `src/ingest/browser_history.py`: privacy-scoped Chromium-family metadata ingestion. Reads copied History DBs, bookmarks, downloads metadata, sanitizes URLs, and avoids cookies/password/session stores.
+
+#### `src/kernel/`
+
+- `src/kernel/__init__.py`: kernel package marker.
+- `src/kernel/config.py`: dataclass config model and loader for filesystem, memory/RAG, scheduler, syscall, LLM, cron/adaptive, triage, and AgentOS settings.
+- `src/kernel/daemon.py`: `SysAgentKernel` lifecycle. Creates runtime dirs, PID/socket state, signal handlers, subsystems, config reloads, status output, and reverse-order shutdown.
+- `src/kernel/cron.py`: adaptive/fixed background scheduler. Decides when to run triage, summarizer, analyzer, reporter, profile builder, and delayed RAG indexing.
+- `src/kernel/event_bus.py`: in-process event bus and `AgentEvent` serialization for task, LLM, pipeline, and SSE observability.
+- `src/kernel/user_settings.py`: persisted user settings helpers for scan paths and model settings under `~/.agent_sys/`.
+
+#### `src/llm/`
+
+- `src/llm/__init__.py`: LLM package marker.
+- `src/llm/base.py`: `LLMMessage`, `LLMResponse`, and abstract multimodal-aware `LLMProvider`.
+- `src/llm/openai_adapter.py`: OpenAI chat/vision provider adapter.
+- `src/llm/claude_adapter.py`: Anthropic Claude adapter plus Anthropic-compatible provider behavior.
+- `src/llm/compatible_adapter.py`: OpenAI-compatible adapter for DashScope, Ollama-compatible servers, DeepSeek-style APIs, and similar providers.
+- `src/llm/router.py`: `ModelRouter` for task-type routing, provider setup, model tiers, vision/text split, event emission, and provider availability checks.
+
+#### `src/memory/`
+
+- `src/memory/__init__.py`: memory package marker.
+- `src/memory/store.py`: SQLite-backed `MemoryStore`, LRU cache, migrations, file index, knowledge, context, profile facts, source records, insight runs/items, document chunks, FTS, vector search, hybrid RAG, triage updates, and stats.
+- `src/memory/embeddings.py`: embedding provider layer. Supports local sentence-transformers, API/DashScope/OpenAI-compatible embeddings, multimodal embedding inputs, batch calls, vector serialization, and cosine similarity.
+- `src/memory/chunking.py`: deterministic overlapping text chunker with line ranges and nearest-heading metadata for citations.
+
+#### `src/scheduler/`
+
+- `src/scheduler/__init__.py`: scheduler package marker.
+- `src/scheduler/pool.py`: `AgentScheduler` priority queue, concurrency semaphore, task state tracking, timeout handling, registry, `submit_and_wait`, and child-task fan-out.
+
+#### `src/syscall/`
+
+- `src/syscall/__init__.py`: syscall package marker.
+- `src/syscall/protocol.py`: syscall enum, agent mapping, request/response dataclasses, and the stable RPC vocabulary.
+- `src/syscall/server.py`: Unix socket and optional HTTP syscall server with length-prefixed JSON, auth checks, public health/status paths, SSE events, reload endpoint, and agent dispatch.
+- `src/syscall/client.py`: async and sync client SDKs for file search/read, knowledge, reports, profile, triage, context, status, and generic syscall execution.
+
+### Web Dashboard Index
+
+#### `src/web/`
+
+- `src/web/__init__.py`: web package marker.
+- `src/web/dashboard.py`: aiohttp dashboard app factory, route registration, static serving, event middleware, and dashboard server runner.
+- `src/web/dashboard.html`: legacy diagnostics SPA shell and tab layout.
+- `src/web/_utils.py`: shared dashboard helpers for SQLite access, safe JSON parsing, auth headers, and mutation-header protection.
+
+#### `src/web/api/`
+
+- `src/web/api/__init__.py`: dashboard API package marker.
+- `src/web/api/overview.py`: overview stats, daemon probe, directory tree, recent files, and summary progress endpoints.
+- `src/web/api/search.py`: file search endpoint with vector-search attempt and SQL LIKE fallback.
+- `src/web/api/knowledge.py`: knowledge browsing and scheduling history endpoints.
+- `src/web/api/triage.py`: triage distribution and skipped-directory endpoints.
+- `src/web/api/clusters.py`: file cluster recommendation and include/exclude decision endpoints.
+- `src/web/api/llm_config.py`: LLM provider config, routing config, embedding info, and embedding config read/write endpoints.
+- `src/web/api/scheduling.py`: adaptive scheduling strategy read/write endpoints.
+- `src/web/api/events.py`: local/proxied SSE event stream endpoint.
+- `src/web/api/rag.py`: RAG status/config/trigger/debug-search/log endpoints.
+- `src/web/api/daemon.py`: daemon status, manual agent trigger, and reload-config endpoints.
+
+#### `src/web/static/`
+
+- `src/web/static/common.js`: shared frontend constants, formatting helpers, HTML escaping, toast UI, and daemon config reload helper.
+- `src/web/static/app.js`: dashboard bootstrap that loads all tab data.
+- `src/web/static/overview.js`: overview cards, file-type/priority charts, daemon badge, and recent-file rendering.
+- `src/web/static/files.js`: directory chart, debounced file search, and search results UI.
+- `src/web/static/knowledge.js`: knowledge category browser and detail rendering.
+- `src/web/static/scheduling.js`: scheduling strategy UI and adaptive scheduling history.
+- `src/web/static/summary.js`: summary progress chart and progress table.
+- `src/web/static/triage.js`: triage charts, skipped directory view, file cluster recommendations, and include/exclude actions.
+- `src/web/static/events.js`: SSE client, task/LLM event timeline, token tracking, pipeline failure display, and manual trigger helper.
+- `src/web/static/llm-config.js`: provider/model/API-key form, routing matrix editor, embedding provider config, dirty-state handling, and save calls.
+- `src/web/static/routing-ui.js`: enhanced routing UI helpers for per-function model fields and vision toggles.
+- `src/web/static/rag.js`: RAG status/config/debug search/log UI with media/source citation rendering.
+- `src/web/static/dashboard.css`: legacy dashboard styling.
+- `src/web/static/chart.min.js`: vendored Chart.js runtime for dashboard charts.
+
+### Test Index
+
+#### `tests/`
+
+- `tests/test_rag_pipeline.py`: pytest coverage for DashScope/Qwen embedding endpoint behavior, multimodal embeddings, chunk line ranges, chunk FTS citations, RAG indexing, media chunk indexing, and assistant RAG evidence retrieval.
+
 ## What This Backend Is
 
 `agent-sys` is a local Python daemon that indexes user-approved files, stores metadata and knowledge in SQLite, runs LLM-powered agents, and exposes those capabilities through a syscall-style RPC layer.

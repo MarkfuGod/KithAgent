@@ -172,15 +172,21 @@ class AssistantAgent(BaseAgent):
             return []
         evidence = []
         for item in results:
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
             evidence.append({
                 "source_id": item.get("source_id"),
                 "path": item.get("path"),
                 "file_type": item.get("file_type"),
+                "modality": metadata.get("modality", "text"),
+                "source_kind": metadata.get("source_kind", "text"),
+                "page": metadata.get("page"),
+                "frame_time_ms": metadata.get("frame_time_ms"),
                 "start_line": item.get("start_line"),
                 "end_line": item.get("end_line"),
                 "snippet": item.get("content"),
                 "score": item.get("hybrid_score"),
                 "modes": item.get("modes", []),
+                "metadata": metadata,
             })
         return evidence
 

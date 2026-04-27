@@ -184,6 +184,36 @@ def encode_image_base64(path: str, max_bytes: int = 5 * 1024 * 1024) -> str | No
         return None
 
 
+def render_pdf_page_base64(
+    path: str,
+    page_number: int = 0,
+    max_bytes: int = 5 * 1024 * 1024,
+) -> str | None:
+    """Render one PDF page to a PNG data URI for vision/multimodal models."""
+    try:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(path)
+        try:
+            if page_number < 0 or page_number >= len(doc):
+                return None
+            page = doc[page_number]
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            raw = pix.tobytes("png")
+        finally:
+            doc.close()
+        if len(raw) > max_bytes:
+            return None
+        b64 = base64.b64encode(raw).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except ImportError:
+        logger.debug("PyMuPDF not installed — cannot render PDF page image")
+        return None
+    except Exception as e:
+        logger.debug("PDF page rendering failed for %s: %s", path, e)
+        return None
+
+
 def extract_content(path: str, max_chars: int = 4000) -> dict | None:
     """
     Extract content from any supported file type.
@@ -199,10 +229,10 @@ def extract_content(path: str, max_chars: int = 4000) -> dict | None:
         text = extract_text_from_pdf(path, max_chars)
         if text:
             return {"type": "text", "content": text}
-        # PDF might be image-only; fall through to image if small enough
-        data_uri = encode_image_base64(path)
+        # Image-only PDFs need a rendered page, not raw PDF bytes.
+        data_uri = render_pdf_page_base64(path)
         if data_uri:
-            return {"type": "image", "data_uri": data_uri}
+            return {"type": "image", "data_uri": data_uri, "metadata": {"source_kind": "scanned_pdf", "page": 1}}
         return None
 
     if ext in (".docx", ".doc"):

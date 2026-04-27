@@ -158,19 +158,52 @@ async function debugRagSearch() {
       target.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:24px;">No matching chunks yet. RAG may still be indexing.</div>';
       return;
     }
-    target.innerHTML = results.map(r => `
-      <div style="padding:12px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px;background:var(--bg-secondary);">
-        <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;">
-          <strong style="color:var(--accent);">${escapeHtml(r.source_id || r.chunk_id || 'S?')}</strong>
-          <span style="font-size:12px;color:var(--text-muted);">score ${r.hybrid_score ?? r.score ?? '-'} · ${(r.modes || [r.retrieval_mode]).join('+')}</span>
+    target.innerHTML = results.map(r => {
+      const meta = r.metadata || {};
+      return `
+        <div style="padding:12px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <strong style="color:var(--accent);">${escapeHtml(r.source_id || r.chunk_id || 'S?')}</strong>
+              ${ragMediaBadge(meta)}
+            </div>
+            <span style="font-size:12px;color:var(--text-muted);">score ${r.hybrid_score ?? r.score ?? '-'} · ${(r.modes || [r.retrieval_mode]).join('+')}</span>
+          </div>
+          <div class="mono" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${ragLocationLabel(r, meta)}</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;font-size:12px;">${ragOpenLink(r, meta)}</div>
+          <div style="font-size:13px;line-height:1.6;white-space:pre-wrap;">${escapeHtml((r.content || '').slice(0, 700))}</div>
         </div>
-        <div class="mono" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${escapeHtml(r.path || '')}:${r.start_line || '?'}-${r.end_line || '?'}</div>
-        <div style="font-size:13px;line-height:1.6;white-space:pre-wrap;">${escapeHtml((r.content || '').slice(0, 700))}</div>
-      </div>
-    `).join('');
+      `;
+    }).join('');
   } catch (e) {
     target.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Debug search failed: ${escapeHtml(e.message)}</div>`;
   }
+}
+
+function ragMediaBadge(meta) {
+  const modality = meta.modality || 'text';
+  if (modality === 'text') return '<span class="type-badge">text</span>';
+  const label = meta.source_kind === 'scanned_pdf' ? 'scanned PDF' : modality;
+  return `<span class="type-badge" style="background:rgba(247,120,186,0.15);color:var(--accent-pink);">${escapeHtml(label)}</span>`;
+}
+
+function ragLocationLabel(r, meta) {
+  const path = escapeHtml(r.path || '');
+  if (meta.page) return `${path} · page ${escapeHtml(String(meta.page))}`;
+  if (meta.frame_time_ms !== undefined && meta.frame_time_ms !== null) {
+    return `${path} · frame ${(Number(meta.frame_time_ms) / 1000).toFixed(1)}s`;
+  }
+  if (meta.modality && meta.modality !== 'text') return path;
+  return `${path}:${r.start_line || '?'}-${r.end_line || '?'}`;
+}
+
+function ragOpenLink(r, meta) {
+  if (!r.path) return '';
+  const href = 'file://' + encodeURI(r.path);
+  const anchor = meta.page ? `page ${escapeHtml(String(meta.page))}` :
+    meta.frame_time_ms !== undefined && meta.frame_time_ms !== null ? `${(Number(meta.frame_time_ms) / 1000).toFixed(1)}s` : '';
+  const suffix = anchor ? `<span style="color:var(--text-muted);">anchor: ${anchor}</span>` : '';
+  return `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer" style="color:var(--accent);">Open source file</a>${suffix}`;
 }
 
 async function loadRagLogs() {

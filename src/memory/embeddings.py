@@ -33,6 +33,10 @@ class EmbeddingProvider:
     def embed_batch(self, texts: list[str]) -> list[bytes]:
         raise NotImplementedError
 
+    def embed_items(self, items: list[dict[str, Any]]) -> list[bytes]:
+        """Embed structured items, falling back to their text field."""
+        return self.embed_batch([str(item.get("text") or "") for item in items])
+
 
 class LocalEmbeddingProvider(EmbeddingProvider):
     """sentence-transformers local model."""
@@ -120,9 +124,77 @@ class APIEmbeddingProvider(EmbeddingProvider):
             )
         return self._client
 
+    def _dashscope_multimodal_endpoint(self) -> str:
+        """Translate DashScope compatible-mode URLs to the multimodal embedding endpoint."""
+        root = self._base_url
+        if "/compatible-mode/" in root:
+            root = root.split("/compatible-mode/", 1)[0]
+        return f"{root.rstrip('/')}/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+
+    def _call_dashscope_multimodal_api(self, contents: list[dict[str, Any]]) -> list[list[float]]:
+        """Call DashScope's multimodal embedding API used by qwen3-vl-embedding."""
+        import json as _json
+
+        key = self._get_key()
+        if not key:
+            raise RuntimeError(f"No API key set in env var {self._api_key_env}")
+
+        dimension = self._dimensions if self._dimensions > 0 else 1024
+        body: dict[str, Any] = {
+            "model": self._model,
+            "input": {
+                "contents": contents,
+            },
+            "parameters": {
+                "dimension": dimension,
+                "output_type": "dense",
+            },
+        }
+        endpoint = self._dashscope_multimodal_endpoint()
+
+        client = self._get_client()
+        if client == "urllib":
+            import urllib.request
+            req = urllib.request.Request(
+                endpoint,
+                data=_json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = _json.loads(resp.read())
+        else:
+            resp = client.post(endpoint, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw_embeddings = (data.get("output") or {}).get("embeddings") or []
+        if not isinstance(raw_embeddings, list):
+            raise RuntimeError("Unexpected DashScope multimodal embedding response")
+
+        indexed: list[tuple[int, list[float]]] = []
+        for i, item in enumerate(raw_embeddings):
+            if isinstance(item, dict):
+                vector = item.get("embedding")
+                index = int(item.get("index", i))
+            else:
+                vector = item
+                index = i
+            if not isinstance(vector, list):
+                raise RuntimeError("DashScope multimodal response missing embedding vector")
+            indexed.append((index, vector))
+
+        return [vector for _, vector in sorted(indexed, key=lambda pair: pair[0])]
+
     def _call_api(self, texts: list[str]) -> list[list[float]]:
         """Call the OpenAI-compatible embeddings endpoint."""
         import json as _json
+
+        if self.name == "dashscope" and self._model == "qwen3-vl-embedding":
+            return self._call_dashscope_multimodal_api([{"text": text} for text in texts])
 
         key = self._get_key()
         if not key:
@@ -184,6 +256,38 @@ class APIEmbeddingProvider(EmbeddingProvider):
             return all_vecs
         except Exception as e:
             logger.warning("API batch embedding failed (%s): %s", self.name, e)
+            return []
+
+    def embed_items(self, items: list[dict[str, Any]]) -> list[bytes]:
+        if not (self.name == "dashscope" and self._model == "qwen3-vl-embedding"):
+            return super().embed_items(items)
+        try:
+            import numpy as np
+
+            all_vecs: list[bytes] = []
+            batch_size = 10
+            for i in range(0, len(items), batch_size):
+                batch = items[i:i + batch_size]
+                contents = []
+                for item in batch:
+                    content: dict[str, Any] = {}
+                    text = str(item.get("text") or "").strip()
+                    image = str(item.get("image") or "").strip()
+                    if text:
+                        content["text"] = text
+                    if image:
+                        content["image"] = image
+                    if not content:
+                        content["text"] = ""
+                    contents.append(content)
+                vecs = self._call_dashscope_multimodal_api(contents)
+                for v in vecs:
+                    arr = np.array(v, dtype=np.float32)
+                    arr = arr / (np.linalg.norm(arr) + 1e-9)
+                    all_vecs.append(numpy_to_bytes(arr))
+            return all_vecs
+        except Exception as e:
+            logger.warning("API structured embedding failed (%s): %s", self.name, e)
             return []
 
 
@@ -269,6 +373,13 @@ def embed_texts(texts: list[str]) -> list[bytes]:
     if p is None:
         return []
     return p.embed_batch(texts)
+
+
+def embed_items(items: list[dict[str, Any]]) -> list[bytes]:
+    p = _get_provider()
+    if p is None:
+        return []
+    return p.embed_items(items)
 
 
 def cosine_similarity(a_bytes: bytes, b_bytes: bytes) -> float:

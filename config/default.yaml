@@ -71,11 +71,10 @@ memory:
     provider: dashscope
     api_key_env: DASHSCOPE_API_KEY
     api_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    model: text-embedding-v4
-    dimensions: 1024
+    model: qwen3-vl-embedding
+    dimensions: 0
   rag:
     enabled: true
-    # Keep startup and first insight fast; RAG indexing begins in the background later.
     initial_delay_seconds: 600
     batch_size: 20
     embedding_batch_size: 32

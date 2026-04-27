@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from src.agents.base import AgentTask, BaseAgent
-from src.extractors import extract_content
+from src.extractors import encode_image_base64, extract_content, render_pdf_page_base64
 from src.memory.chunking import chunk_text
 
 logger = logging.getLogger("agent_sys.agents.rag_indexer")
@@ -77,16 +78,27 @@ class RagIndexerAgent(BaseAgent):
             path = file_info.get("path", "")
             try:
                 extracted = extract_content(path, max_chars=max_file_size_bytes)
-                if not extracted or extracted.get("type") != "text":
+                if not extracted:
                     skipped += 1
                     continue
-                content = str(extracted.get("content") or "")
-                chunks = chunk_text(
-                    content,
-                    path=path,
-                    chunk_size_chars=chunk_size,
-                    chunk_overlap_chars=chunk_overlap,
-                )
+                if extracted.get("type") == "text":
+                    content = str(extracted.get("content") or "")
+                    chunks = chunk_text(
+                        content,
+                        path=path,
+                        chunk_size_chars=chunk_size,
+                        chunk_overlap_chars=chunk_overlap,
+                    )
+                    for chunk in chunks:
+                        metadata = dict(chunk.get("metadata") or {})
+                        metadata.setdefault("modality", "text")
+                        metadata.setdefault("source_kind", "text")
+                        chunk["metadata"] = metadata
+                elif extracted.get("type") == "image":
+                    chunks = self._build_media_chunks(path, file_info, extracted)
+                else:
+                    skipped += 1
+                    continue
                 if not chunks:
                     skipped += 1
                     continue
@@ -117,13 +129,48 @@ class RagIndexerAgent(BaseAgent):
         logger.info("RAG indexer completed: %s", result)
         return result
 
+    def _build_media_chunks(
+        self,
+        path: str,
+        file_info: dict[str, Any],
+        extracted: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        summary = str(file_info.get("semantic_summary") or "").strip()
+        file_type = str(file_info.get("file_type") or Path(path).suffix.lower())
+        filename = Path(path).name
+        content = summary
+        if not content:
+            label = "PDF page image" if file_type == ".pdf" else "Image"
+            content = f"{label}: {filename}\nPath: {path}"
+
+        extracted_meta = extracted.get("metadata") if isinstance(extracted.get("metadata"), dict) else {}
+        source_kind = str(extracted_meta.get("source_kind") or ("scanned_pdf" if file_type == ".pdf" else "image"))
+        metadata: dict[str, Any] = {
+            "modality": "image",
+            "source_kind": source_kind,
+            "file_type": file_type,
+            "path_name": filename,
+            "preview_available": file_type != ".pdf",
+            "embedding_input": "image" if file_type != ".pdf" else "pdf_page_image",
+        }
+        if "page" in extracted_meta:
+            metadata["page"] = extracted_meta["page"]
+            metadata["preview_available"] = True
+        return [{
+            "chunk_index": 0,
+            "start_line": None,
+            "end_line": None,
+            "content": content,
+            "metadata": metadata,
+        }]
+
     async def _compute_pending_chunk_embeddings(self, memory, *, limit: int, deadline: float) -> int:
         if limit <= 0:
             return 0
         if time.time() >= deadline:
             return 0
         try:
-            from src.memory.embeddings import embed_texts, get_provider_info, is_available
+            from src.memory.embeddings import embed_items, get_provider_info, is_available
             if not is_available():
                 return 0
         except Exception:
@@ -133,8 +180,8 @@ class RagIndexerAgent(BaseAgent):
         chunks = await memory.get_chunks_needing_embedding(limit=limit, embedding_model=model_name)
         if not chunks:
             return 0
-        texts = [c["content"] for c in chunks]
-        embeddings = embed_texts(texts)
+        inputs = [self._embedding_input_for_chunk(chunk) for chunk in chunks]
+        embeddings = embed_items(inputs)
         if not embeddings or len(embeddings) != len(chunks):
             return 0
         await memory.batch_update_chunk_embeddings([
@@ -143,3 +190,22 @@ class RagIndexerAgent(BaseAgent):
         ])
         logger.info("Computed %d RAG chunk embeddings", len(embeddings))
         return len(embeddings)
+
+    def _embedding_input_for_chunk(self, chunk: dict[str, Any]) -> dict[str, Any]:
+        text = str(chunk.get("content") or "")
+        metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+        if metadata.get("modality") != "image":
+            return {"text": text}
+
+        path = str(chunk.get("path") or "")
+        image_data = None
+        if metadata.get("source_kind") == "scanned_pdf":
+            page = int(metadata.get("page") or 1)
+            image_data = render_pdf_page_base64(path, page_number=max(page - 1, 0))
+        else:
+            image_data = encode_image_base64(path)
+
+        item: dict[str, Any] = {"text": text}
+        if image_data:
+            item["image"] = image_data
+        return item
