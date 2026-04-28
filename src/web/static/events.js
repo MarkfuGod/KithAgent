@@ -14,6 +14,7 @@ const taskHistory = [];
 const llmLogs = [];
 const llmCallMap = new Map();
 const eventLog = [];
+let systemWaitState = null;
 
 function connectSSE() {
   if (sseSource) sseSource.close();
@@ -46,6 +47,7 @@ function connectSSE() {
     'behavior_insight.failed': handleBehaviorInsight,
     'rag_indexer.started': handleRagIndexerEvent,
     'rag_indexer.completed': handleRagIndexerEvent,
+    'system.waiting_for_first_insight': handleWaitingForFirstInsight,
   };
 
   for (const [etype, handler] of Object.entries(handlers)) {
@@ -69,6 +71,7 @@ function connectSSE() {
 }
 
 function handleTaskStarted(data) {
+  systemWaitState = null;
   activeTasks.set(data.task_id, { ...data, startedAt: Date.now() });
   taskHistory.push({ ...data, state: 'started', time: Date.now() });
   if (taskHistory.length > 200) taskHistory.splice(0, taskHistory.length - 200);
@@ -88,6 +91,15 @@ function renderActiveTasks() {
   const container = document.getElementById('liveActiveTasks');
   document.getElementById('liveRunningCount').textContent = activeTasks.size;
   if (activeTasks.size === 0) {
+    if (systemWaitState) {
+      const fallbackIn = Math.max(0, Math.round(systemWaitState.fallback_in_s || 0));
+      const fallbackText = fallbackIn > 0 ? `Fallback in ${Math.ceil(fallbackIn / 60)}m.` : 'Fallback window elapsed.';
+      container.innerHTML = `<div style="text-align:center;color:var(--accent-orange);padding:20px;">
+        Waiting for First Insight before cron/RAG runs.
+        <div style="color:var(--text-muted);font-size:12px;margin-top:6px;">${escapeHtml(systemWaitState.blocking_agent || 'scheduler')} paused. ${fallbackText}</div>
+      </div>`;
+      return;
+    }
     container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">No active tasks</div>';
     return;
   }
@@ -269,6 +281,18 @@ function handleRagIndexerEvent(data) {
   }
 }
 
+function handleWaitingForFirstInsight(data) {
+  systemWaitState = { ...data, receivedAt: Date.now() };
+  const target = document.getElementById('liveTaskHint');
+  if (target) {
+    const fallbackIn = Math.max(0, Math.round(data.fallback_in_s || 0));
+    const suffix = fallbackIn > 0 ? `fallback in ${Math.ceil(fallbackIn / 60)}m` : 'fallback elapsed';
+    target.textContent = `Waiting for First Insight (${suffix})`;
+    target.style.color = 'var(--accent-orange)';
+  }
+  renderActiveTasks();
+}
+
 function addEventLogEntry(parsed) {
   eventLog.push(parsed);
   if (eventLog.length > 300) eventLog.splice(0, eventLog.length - 300);
@@ -285,6 +309,7 @@ function addEventLogEntry(parsed) {
     'behavior_insight.failed': 'var(--accent-red)',
     'rag_indexer.started': 'var(--accent-orange)',
     'rag_indexer.completed': 'var(--accent-green)',
+    'system.waiting_for_first_insight': 'var(--accent-orange)',
   }[parsed.type] || 'var(--text-muted)';
   const line = document.createElement('div');
   line.style.cssText = 'padding:2px 0;border-bottom:1px solid var(--border);';

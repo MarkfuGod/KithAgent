@@ -1,5 +1,5 @@
 {
-  "name": "kith-jarvis-desktop",
+  "name": "kith-desktop",
   "version": "0.1.0",
   "private": true,
   "description": "Mac desktop companion for the local Kith personal memory daemon.",

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from aiohttp import web
+from aiohttp import ClientConnectionResetError, web
 
 from src.web._utils import DAEMON_HTTP_PORT
 
@@ -46,14 +46,17 @@ async def _stream_from_local_bus(event_bus, resp: web.StreamResponse) -> None:
     try:
         for evt in event_bus.recent_events(limit=30):
             line = json.dumps(evt, default=str)
-            await resp.write(f"event: {evt['type']}\ndata: {line}\n\n".encode())
+            if not await _safe_write(resp, f"event: {evt['type']}\ndata: {line}\n\n".encode()):
+                return
 
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=30)
-                await resp.write(event.to_sse().encode())
+                if not await _safe_write(resp, event.to_sse().encode()):
+                    break
             except asyncio.TimeoutError:
-                await resp.write(b": keepalive\n\n")
+                if not await _safe_write(resp, b": keepalive\n\n"):
+                    break
             except ConnectionResetError:
                 break
     finally:
@@ -70,19 +73,24 @@ async def _proxy_daemon_sse(resp: web.StreamResponse) -> None:
                 timeout=ah.ClientTimeout(total=0, sock_read=0),
             ) as upstream:
                 if upstream.status != 200:
-                    await resp.write(
-                        b"event: error\ndata: {\"msg\":\"Daemon not reachable for SSE proxy\"}\n\n"
-                    )
+                    await _safe_write(resp, b"event: error\ndata: {\"msg\":\"Daemon not reachable for SSE proxy\"}\n\n")
                     return
 
-                await resp.write(
-                    b"event: info\ndata: {\"msg\":\"Connected to daemon SSE (proxy mode)\"}\n\n"
-                )
+                if not await _safe_write(resp, b"event: info\ndata: {\"msg\":\"Connected to daemon SSE (proxy mode)\"}\n\n"):
+                    return
                 async for chunk in upstream.content.iter_any():
-                    try:
-                        await resp.write(chunk)
-                    except ConnectionResetError:
+                    if not await _safe_write(resp, chunk):
                         break
+    except (ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+        return
     except Exception as e:
         msg = json.dumps({"msg": f"SSE proxy failed: {e}"})
-        await resp.write(f"event: error\ndata: {msg}\n\n".encode())
+        await _safe_write(resp, f"event: error\ndata: {msg}\n\n".encode())
+
+
+async def _safe_write(resp: web.StreamResponse, payload: bytes) -> bool:
+    try:
+        await resp.write(payload)
+        return True
+    except (ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+        return False

@@ -133,6 +133,8 @@ class CronScheduler:
         self._tasks: list[asyncio.Task] = []
         self._last_run: dict[str, float] = {}
         self._started_at = time.time()
+        self._first_insight_wait_event_at = 0.0
+        self._first_insight_wait_reason = ""
 
     async def start(self) -> None:
         if not self.config.enabled:
@@ -210,6 +212,7 @@ class CronScheduler:
         while self._running:
             try:
                 if not await self._first_insight_ready():
+                    await self._emit_waiting_for_first_insight(reason="adaptive_scheduler")
                     await asyncio.sleep(30)
                     continue
 
@@ -638,6 +641,10 @@ class CronScheduler:
                                 "Cron: scan completed; deferring %s until First Insight is ready",
                                 agent_name,
                             )
+                            await self._emit_waiting_for_first_insight(
+                                reason="scan_completed",
+                                blocking_agent=agent_name,
+                            )
                             last_scan_time = current_scan
                             continue
                         logger.info("Cron: scan completed, triggering %s", agent_name)
@@ -648,8 +655,39 @@ class CronScheduler:
                             "Cron: initial scan completed; deferring %s so First Insight can run first",
                             agent_name,
                         )
+                        await self._emit_waiting_for_first_insight(
+                            reason="initial_scan_completed",
+                            blocking_agent=agent_name,
+                        )
                     first_scan_seen = True
                     last_scan_time = current_scan
+
+    async def _emit_waiting_for_first_insight(
+        self,
+        *,
+        reason: str,
+        blocking_agent: str | None = None,
+    ) -> None:
+        """Tell dashboards why cron/RAG may be idle without creating a task."""
+        event_bus = self.kernel.get_event_bus()
+        if not event_bus:
+            return
+        now = time.time()
+        # Keep reconnects informative without flooding the Live Activity log.
+        if reason == self._first_insight_wait_reason and now - self._first_insight_wait_event_at < 60:
+            return
+        self._first_insight_wait_reason = reason
+        self._first_insight_wait_event_at = now
+        fallback_after = 600
+        elapsed = max(0, now - self._started_at)
+        await event_bus.emit_dict("system.waiting_for_first_insight", {
+            "reason": reason,
+            "blocking_agent": blocking_agent,
+            "message": "Waiting for First Insight before automatic cron/RAG work continues.",
+            "elapsed_since_boot_s": round(elapsed, 1),
+            "fallback_after_s": fallback_after,
+            "fallback_in_s": max(0, round(fallback_after - elapsed, 1)),
+        })
 
     async def _first_insight_ready(self) -> bool:
         """Give the product onboarding path the first few minutes after boot."""

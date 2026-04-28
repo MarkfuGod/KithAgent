@@ -57,6 +57,8 @@ CRITICAL SIGNALS for "skip":
 - Files inside large known framework directories (e.g. PyTorch source, node_modules)
 - Auto-generated files (*.pb.go, *_generated.*, migrations with numeric prefixes)
 - Large dataset .txt/.csv with generic names (data_0001.txt, train.txt, labels.txt)
+- Always judge by parent directory before file extension. A file with no suffix
+  under a cache, extension, package, or dependency parent is still "skip".
 
 CRITICAL SIGNALS for "high":
 - Files in the user's own project root (README, main.py, setup.py they wrote)
@@ -100,7 +102,15 @@ _FALLBACK_SKIP_PATTERNS = [
     "/node_modules/",
     "/__pycache__/",
     "/.cursor/extensions/",
+    "/.cursor/projects/",
     "/.vscode/extensions/",
+    "/.cursor-server/",
+    "/miniconda3/pkgs/",
+    "/miniconda3/envs/",
+    "/anaconda3/pkgs/",
+    "/anaconda3/envs/",
+    "/.conda/pkgs/",
+    "/.conda/envs/",
 ]
 
 _DB_FETCH_BATCH = 500        # how many untriaged rows to pull from SQLite per round

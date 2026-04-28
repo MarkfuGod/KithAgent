@@ -26,6 +26,7 @@
 <div class="container">
   <div class="nav-tabs">
     <button class="nav-tab active" data-tab="overview">Overview</button>
+    <button class="nav-tab" data-tab="insights">Insights</button>
     <button class="nav-tab" data-tab="live">Live Activity</button>
     <button class="nav-tab" data-tab="files">Files &amp; Directories</button>
     <button class="nav-tab" data-tab="knowledge">Knowledge Base</button>
@@ -58,6 +59,29 @@
           <thead><tr><th>Path</th><th>Type</th><th>Size</th><th>Modified</th><th>Priority</th></tr></thead>
           <tbody id="recentTable"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- INSIGHTS TAB -->
+  <div class="tab-content" id="tab-insights">
+    <div id="insightsHero"></div>
+    <div class="insights-dashboard-grid">
+      <div class="data-card">
+        <div class="card-header"><h3>Recommended Actions</h3></div>
+        <div id="insightsSuggestions" class="insights-card-body"></div>
+      </div>
+      <div class="data-card">
+        <div class="card-header"><h3>File Organization</h3></div>
+        <div id="insightsFileOrg" class="insights-card-body"></div>
+      </div>
+      <div class="data-card">
+        <div class="card-header"><h3>Cleanup Candidates</h3></div>
+        <div id="insightsCleanup" class="insights-card-body"></div>
+      </div>
+      <div class="data-card">
+        <div class="card-header"><h3>Video &amp; Web Interests</h3></div>
+        <div id="insightsInterests" class="insights-card-body"></div>
       </div>
     </div>
   </div>
@@ -423,6 +447,7 @@
     4. app.js       — boots everything: tab listeners, loadAll, SSE connect
 -->
 <script src="/static/common.js"></script>
+<script src="/static/insights.js"></script>
 <script src="/static/overview.js"></script>
 <script src="/static/files.js"></script>
 <script src="/static/knowledge.js"></script>

@@ -330,11 +330,21 @@ class MemoryStore:
                     query[:60], e,
                 )
 
-        sql = """SELECT path, file_type, summary, size_bytes, priority,
-                        COALESCE(semantic_summary, '') as semantic_summary
-                 FROM file_index
-                 WHERE (path LIKE ? OR summary LIKE ? OR semantic_summary LIKE ?)"""
-        params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
+        terms = [t for t in re.split(r"\s+", query.strip()) if t]
+        if not terms:
+            return []
+
+        where_terms = []
+        params: list[Any] = []
+        for term in terms:
+            where_terms.append("(path LIKE ? OR summary LIKE ? OR semantic_summary LIKE ?)")
+            params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
+
+        sql = f"""SELECT path, file_type, summary, size_bytes, priority,
+                         COALESCE(semantic_summary, '') as semantic_summary,
+                         COALESCE(triage_status, '') as triage_status
+                  FROM file_index
+                  WHERE {' AND '.join(where_terms)}"""
         if file_type:
             sql += " AND file_type = ?"
             params.append(file_type)
@@ -343,7 +353,8 @@ class MemoryStore:
         rows = self._db.execute(sql, params).fetchall()
         return [
             {"path": r[0], "file_type": r[1], "summary": r[2],
-             "size_bytes": r[3], "priority": r[4], "semantic_summary": r[5]}
+             "size_bytes": r[3], "priority": r[4], "semantic_summary": r[5],
+             "triage_status": r[6], "triage": r[6]}
             for r in rows
         ]
 
@@ -493,7 +504,8 @@ class MemoryStore:
 
         def _do_search() -> list[dict]:
             rows = db.execute(
-                """SELECT path, file_type, semantic_summary, size_bytes, priority, embedding
+                """SELECT path, file_type, semantic_summary, size_bytes, priority,
+                          COALESCE(triage_status, '') as triage_status, embedding
                    FROM file_index
                    WHERE embedding IS NOT NULL AND length(embedding) > 0"""
             ).fetchall()
@@ -507,7 +519,7 @@ class MemoryStore:
                     return []
                 q_norm = float(np.linalg.norm(q)) + 1e-9
 
-                paths, ftypes, summaries, sizes, prios, scores = [], [], [], [], [], []
+                paths, ftypes, summaries, sizes, prios, triages, scores = [], [], [], [], [], [], []
                 # Process in chunks so a single giant matrix doesn't blow memory
                 chunk_size = 4096
                 for start in range(0, len(rows), chunk_size):
@@ -515,7 +527,7 @@ class MemoryStore:
                     vectors = []
                     vector_rows = []
                     for r in chunk:
-                        v = np.frombuffer(r[5], dtype=np.float32)
+                        v = np.frombuffer(r[6], dtype=np.float32)
                         if v.shape != q.shape or v.size == 0 or not np.isfinite(v).all():
                             continue
                         vectors.append(v)
@@ -529,12 +541,12 @@ class MemoryStore:
                         from src.memory.embeddings import cosine_similarity as _cs
                         for r in vector_rows:
                             try:
-                                s = _cs(query_embedding, r[5])
+                                s = _cs(query_embedding, r[6])
                             except Exception:
                                 continue
                             paths.append(r[0]); ftypes.append(r[1])
                             summaries.append(r[2]); sizes.append(r[3])
-                            prios.append(r[4]); scores.append(float(s))
+                            prios.append(r[4]); triages.append(r[5]); scores.append(float(s))
                         continue
                     norms = np.linalg.norm(mat, axis=1) + 1e-9
                     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
@@ -544,14 +556,15 @@ class MemoryStore:
                             continue
                         paths.append(r[0]); ftypes.append(r[1])
                         summaries.append(r[2]); sizes.append(r[3])
-                        prios.append(r[4]); scores.append(float(s))
+                        prios.append(r[4]); triages.append(r[5]); scores.append(float(s))
 
                 idx_sorted = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:limit]
                 return [
                     {
                         "path": paths[i], "file_type": ftypes[i],
                         "semantic_summary": summaries[i], "size_bytes": sizes[i],
-                        "priority": prios[i], "score": round(scores[i], 4),
+                        "priority": prios[i], "triage_status": triages[i],
+                        "triage": triages[i], "score": round(scores[i], 4),
                     }
                     for i in idx_sorted
                 ]
@@ -561,7 +574,7 @@ class MemoryStore:
                 scored = []
                 for r in rows:
                     try:
-                        score = cosine_similarity(query_embedding, r[5])
+                        score = cosine_similarity(query_embedding, r[6])
                         scored.append((score, r))
                     except Exception:
                         continue
@@ -569,7 +582,8 @@ class MemoryStore:
                 return [
                     {
                         "path": r[0], "file_type": r[1], "semantic_summary": r[2],
-                        "size_bytes": r[3], "priority": r[4], "score": round(score, 4),
+                        "size_bytes": r[3], "priority": r[4],
+                        "triage_status": r[5], "triage": r[5], "score": round(score, 4),
                     }
                     for score, r in scored[:limit]
                 ]
@@ -778,14 +792,20 @@ class MemoryStore:
             for r in rows
         ]
 
-    async def get_files_by_directory(self, directory: str) -> list[dict]:
+    async def get_files_by_directory(self, directory: str, limit: int | None = None) -> list[dict]:
         """Get all indexed files under a directory with their summaries."""
         assert self._db
+        params: tuple[Any, ...]
+        sql = """SELECT path, file_type, semantic_summary, size_bytes
+                 FROM file_index WHERE path LIKE ?
+                 ORDER BY priority ASC, modified_at DESC"""
+        params = (f"{directory}/%",)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (f"{directory}/%", int(limit))
         rows = self._db.execute(
-            """SELECT path, file_type, semantic_summary, size_bytes
-               FROM file_index WHERE path LIKE ?
-               ORDER BY priority ASC, modified_at DESC""",
-            (f"{directory}/%",),
+            sql,
+            params,
         ).fetchall()
         return [
             {"path": r[0], "file_type": r[1], "semantic_summary": r[2] or "", "size_bytes": r[3]}
@@ -908,8 +928,18 @@ class MemoryStore:
         if not statuses:
             statuses = ["high", "medium"]
         placeholders = ",".join("?" for _ in statuses)
+        supported_exts = (
+            ".pdf", ".docx", ".pptx", ".xlsx",
+            ".md", ".txt", ".rst", ".tex",
+            ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".sh",
+            ".java", ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift",
+            ".kt", ".scala", ".r", ".sql", ".xml", ".csv", ".json", ".yaml",
+            ".yml", ".toml", ".html", ".css", ".vue", ".svelte",
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+        )
+        ext_placeholders = ",".join("?" for _ in supported_exts)
         size_clause = "AND size_bytes <= ?" if max_file_size_bytes else ""
-        params: list[Any] = [*statuses]
+        params: list[Any] = [*statuses, *supported_exts]
         if max_file_size_bytes:
             params.append(max_file_size_bytes)
         params.append(limit)
@@ -919,6 +949,8 @@ class MemoryStore:
                        COALESCE(NULLIF(semantic_summary, ''), summary, '') as semantic_summary
                 FROM file_index fi
                 WHERE triage_status IN ({placeholders})
+                  AND lower(file_type) IN ({ext_placeholders})
+                  AND COALESCE(size_bytes, 0) > 0
                   {size_clause}
                   AND NOT EXISTS (
                     SELECT 1 FROM document_chunks dc
@@ -926,6 +958,13 @@ class MemoryStore:
                   )
                 ORDER BY
                   CASE triage_status WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                  CASE
+                    WHEN lower(file_type) IN ('.pdf', '.docx', '.pptx', '.xlsx') THEN 0
+                    WHEN lower(file_type) IN ('.md', '.txt', '.rst', '.tex') THEN 1
+                    WHEN lower(file_type) IN ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp') THEN 2
+                    WHEN path LIKE '%/dist/%' OR path LIKE '%/build/%' OR path LIKE '%/.next/%' THEN 6
+                    ELSE 3
+                  END,
                   modified_at DESC
                 LIMIT ?""",
             params,
@@ -1246,14 +1285,18 @@ class MemoryStore:
 
     async def batch_update_triage_by_prefix(self, prefix: str, status: str) -> int:
         """Mark all files under a directory prefix with the given triage status.
-        Returns the number of rows affected."""
+        Returns the number of rows affected.
+
+        Rules are allowed to reclaim old "unknown" rows because those were
+        parked by rules-only runs, not explicit user decisions.
+        """
         db = self._db
         assert db
 
         def _run() -> int:
             cursor = db.execute(
                 "UPDATE file_index SET triage_status = ? WHERE path LIKE ? "
-                "AND (triage_status = '' OR triage_status IS NULL)",
+                "AND (triage_status = '' OR triage_status IS NULL OR triage_status = 'unknown')",
                 (status, f"{prefix}%"),
             )
             db.commit()
@@ -1279,7 +1322,7 @@ class MemoryStore:
             cursor = db.execute(
                 f"UPDATE file_index SET triage_status = ? "
                 f"WHERE lower(file_type) IN ({placeholders}) "
-                "AND (triage_status = '' OR triage_status IS NULL)",
+                "AND (triage_status = '' OR triage_status IS NULL OR triage_status = 'unknown')",
                 (status, *normalized),
             )
             db.commit()
@@ -1298,7 +1341,8 @@ class MemoryStore:
 
         def _run() -> int:
             rows = db.execute(
-                "SELECT path FROM file_index WHERE triage_status = '' OR triage_status IS NULL"
+                "SELECT path FROM file_index "
+                "WHERE triage_status = '' OR triage_status IS NULL OR triage_status = 'unknown'"
             ).fetchall()
             updates: list[tuple[str, str]] = []
             for (path,) in rows:

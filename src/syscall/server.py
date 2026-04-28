@@ -328,6 +328,13 @@ class SyscallServer:
                 elapsed_ms=(time.time() - start) * 1000,
             )
 
+        # Model settings are control-plane reads/writes. Handle them before the
+        # scheduler so a busy scan/chat queue cannot block the settings UI.
+        if request.call_type == SyscallType.SETTINGS_MODEL_GET:
+            return await self._handle_settings_model_get(request, start)
+        if request.call_type == SyscallType.SETTINGS_MODEL:
+            return await self._handle_settings_model(request, start)
+
         # Map syscall → agent task
         agent_name = SYSCALL_TO_AGENT.get(request.call_type)
         if not agent_name:
@@ -395,6 +402,7 @@ class SyscallServer:
 
         assistant_actions = {
             SyscallType.ASSISTANT_CHAT: "chat",
+            SyscallType.ASSISTANT_INSIGHTS: "insights",
             SyscallType.PROFILE_SUMMARY: "profile_summary",
             SyscallType.MEMORY_REVIEW: "memory_review",
             SyscallType.MEMORY_FEEDBACK: "memory_feedback",
@@ -408,3 +416,48 @@ class SyscallServer:
             params["action"] = assistant_actions[request.call_type]
 
         return params
+
+    async def _handle_settings_model(self, request: SyscallRequest, start: float) -> SyscallResponse:
+        try:
+            from src.kernel.user_settings import save_model_settings
+
+            result = save_model_settings(request.params)
+            if request.params.get("scope") == "desktop":
+                result["reload_skipped"] = "desktop scope does not change backend router"
+            else:
+                try:
+                    reload_result = await self.kernel.reload_config()
+                    result["reload"] = reload_result
+                except Exception as e:
+                    result["reload_error"] = str(e)
+            return SyscallResponse(
+                request_id=request.request_id,
+                success=True,
+                data=result,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        except Exception as e:
+            return SyscallResponse(
+                request_id=request.request_id,
+                success=False,
+                error=str(e),
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+    async def _handle_settings_model_get(self, request: SyscallRequest, start: float) -> SyscallResponse:
+        try:
+            from src.kernel.user_settings import load_model_settings
+
+            return SyscallResponse(
+                request_id=request.request_id,
+                success=True,
+                data=load_model_settings(),
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        except Exception as e:
+            return SyscallResponse(
+                request_id=request.request_id,
+                success=False,
+                error=str(e),
+                elapsed_ms=(time.time() - start) * 1000,
+            )

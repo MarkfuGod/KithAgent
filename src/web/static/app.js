@@ -18,6 +18,7 @@ document.querySelectorAll('.nav-tab').forEach(tab => {
 async function loadAll() {
   const results = await Promise.allSettled([
     loadOverview(),
+    loadInsights(),
     loadRecentFiles(),
     loadDirectories(),
     loadKnowledge(),

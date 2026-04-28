@@ -26,6 +26,7 @@ _STOPWORDS = {
     "the", "and", "for", "with", "from", "you", "your", "about", "watch",
     "video", "search", "google", "login", "home", "page", "http", "https",
     "www", "com", "html", "utm", "index", "news",
+    "书签栏", "其他书签", "书签", "收藏夹", "收藏", "阅读列表", "未命名文件夹",
 }
 
 

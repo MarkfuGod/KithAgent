@@ -1,4 +1,4 @@
-"""Consumer-facing Jarvis agent for the desktop app."""
+"""Consumer-facing Kith assistant for the desktop app."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import hashlib
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from src.llm.base import LLMMessage
 logger = logging.getLogger("agent_sys.agents.assistant")
 
 _SYSTEM = """你是 Kith，一款本地优先的 Mac 个人助理。
-你的目标是像 Jarvis 一样基于用户授权的本地资料理解这个人，但必须保持谦逊：
+你的目标是基于用户授权的本地资料，温柔、准确地理解这个人，但必须保持谦逊：
 - 明确区分“用户确认的事实”和“从文件/行为推断出的可能性”。
 - 不要暴露 syscall、PID、token、SQLite 等开发者术语。
 - 回答要具体、温暖、可行动，避免神秘化或过度诊断。
@@ -33,6 +34,8 @@ class AssistantAgent(BaseAgent):
         action = task.input_data.get("action", "chat")
         if action == "chat":
             return await self._chat(task, context)
+        if action == "insights":
+            return await self._insights(task, context)
         if action == "profile_summary":
             return await self._profile_summary(task, context)
         if action == "memory_review":
@@ -71,6 +74,15 @@ class AssistantAgent(BaseAgent):
         knowledge = await memory.query_knowledge(limit=20)
         return {"facts": facts, "knowledge": knowledge}
 
+    async def _insights(self, task: AgentTask, context: dict[str, Any]) -> dict:
+        from src.insights import build_insights
+
+        memory = context["memory"]
+        limit = int(task.input_data.get("limit", 12))
+        async with memory._lock:
+            assert memory._db
+            return await asyncio.to_thread(build_insights, memory._db, limit=limit)
+
     async def _memory_feedback(self, task: AgentTask, context: dict[str, Any]) -> dict:
         memory = context["memory"]
         fact_id = task.input_data.get("fact_id", "")
@@ -81,18 +93,157 @@ class AssistantAgent(BaseAgent):
     async def _chat(self, task: AgentTask, context: dict[str, Any]) -> dict:
         memory = context["memory"]
         llm = context.get("llm")
+        event_bus = context.get("event_bus")
+        request_id = str(task.input_data.get("request_id") or task.task_id)
         message = str(task.input_data.get("message") or "").strip()
         history = task.input_data.get("history") or []
         if not message:
             return {"answer": "你可以直接问我：你觉得我是个什么样的人？"}
 
+        chat_llm = self._desktop_chat_llm(event_bus) or llm
+        await self._emit_progress(event_bus, request_id, "start", "收到问题，开始整理本地上下文。", 0.05)
+        await self._emit_progress(event_bus, request_id, "memory", "读取画像记忆、近期文件和历史摘要。", 0.18)
+        step_started = time.time()
         facts = await memory.list_profile_facts(limit=30)
+        await self._emit_tool_event(
+            event_bus,
+            request_id,
+            name="profile_facts",
+            label="读取画像事实",
+            status="completed",
+            detail=f"读取 {len(facts)} 条画像事实。",
+            started_at=step_started,
+        )
+        step_started = time.time()
         recent = await memory.get_recently_modified_files(hours=168, limit=30)
+        await self._emit_tool_event(
+            event_bus,
+            request_id,
+            name="recent_files",
+            label="读取近期文件",
+            status="completed",
+            detail=f"找到 {len(recent)} 个最近一周活跃文件。",
+            started_at=step_started,
+        )
+        step_started = time.time()
         profile_entries = await memory.query_knowledge(category="user_profile", limit=1)
+        await self._emit_tool_event(
+            event_bus,
+            request_id,
+            name="user_profile",
+            label="读取用户画像",
+            status="completed",
+            detail="命中 1 条画像记录。" if profile_entries else "没有找到已生成画像。",
+            started_at=step_started,
+        )
+        step_started = time.time()
         behavior_entries = await memory.query_knowledge(category="behavior_insight", limit=3)
         brief_entries = await memory.query_knowledge(category="context_brief", limit=2)
-        rag_evidence = await self._retrieve_rag_evidence(task, context, message)
+        await self._emit_tool_event(
+            event_bus,
+            request_id,
+            name="context_briefs",
+            label="读取行为洞察",
+            status="completed",
+            detail=f"行为洞察 {len(behavior_entries)} 条，上下文 brief {len(brief_entries)} 条。",
+            started_at=step_started,
+        )
+        quick_answer = self._quick_command_answer(
+            message,
+            facts=facts,
+            recent=recent,
+            profile=self._decode_entry(profile_entries[0]) if profile_entries else {},
+            behavior_insights=[self._decode_entry(e) for e in behavior_entries],
+            context_briefs=[self._decode_entry(e) for e in brief_entries],
+        )
+        if quick_answer:
+            await self._emit_progress(event_bus, request_id, "finalize", "已用本地画像和记忆生成快速回答。", 0.95)
+            return {
+                "answer": quick_answer,
+                "context": {
+                    "confirmed_facts": len([f for f in facts if f.get("status") == "confirmed"]),
+                    "inferred_facts": len([f for f in facts if f.get("status") == "inferred"]),
+                    "recent_files": len(recent),
+                    "retrieved_evidence": 0,
+                },
+                "sources": [],
+            }
+        step_started = time.time()
+        directory_context = await self._directory_context_from_message(memory, message)
+        await self._emit_tool_event(
+            event_bus,
+            request_id,
+            name="directory_context",
+            label="解析目录上下文",
+            status="completed",
+            detail=f"匹配 {len(directory_context)} 个已索引目录快照。",
+            started_at=step_started,
+        )
+        await self._emit_progress(event_bus, request_id, "file-search", "先做精确文件查找。", 0.34)
+        step_started = time.time()
+        file_evidence = await self._exact_file_evidence(memory, message)
+        await self._emit_tool_event(
+            event_bus,
+            request_id,
+            name="exact_file_search",
+            label="精确文件查找",
+            status="completed",
+            detail=f"命中 {len(file_evidence)} 个候选文件。",
+            started_at=step_started,
+        )
+        rag_evidence: list[dict] = []
+        if file_evidence:
+            if self._prefer_exact_evidence(message):
+                await self._emit_progress(
+                    event_bus,
+                    request_id,
+                    "file-search",
+                    f"精确查找命中 {len(file_evidence)} 个候选文件，优先使用精确证据。",
+                    0.44,
+                )
+                rag_evidence = file_evidence
+            else:
+                await self._emit_progress(
+                    event_bus,
+                    request_id,
+                    "retrieval",
+                    f"精确查找命中 {len(file_evidence)} 个候选文件；问题更像宽范围分析，继续 RAG 检索。",
+                    0.40,
+                )
+                step_started = time.time()
+                broad_evidence = await self._retrieve_rag_evidence(task, context, message)
+                await self._emit_tool_event(
+                    event_bus,
+                    request_id,
+                    name="rag_search",
+                    label="RAG 混合检索",
+                    status="completed",
+                    detail=f"补充检索 {len(broad_evidence)} 个证据片段。",
+                    started_at=step_started,
+                )
+                file_paths = {str(item.get("path")) for item in file_evidence}
+                rag_evidence = file_evidence + [item for item in broad_evidence if str(item.get("path")) not in file_paths]
+        else:
+            await self._emit_progress(event_bus, request_id, "retrieval", "精确查找未命中，改用宽范围 RAG 检索。", 0.40)
+            step_started = time.time()
+            rag_evidence = await self._retrieve_rag_evidence(task, context, message)
+            await self._emit_tool_event(
+                event_bus,
+                request_id,
+                name="rag_search",
+                label="RAG 混合检索",
+                status="completed",
+                detail=f"检索到 {len(rag_evidence)} 个证据片段。",
+                started_at=step_started,
+            )
 
+        await self._emit_progress(
+            event_bus,
+            request_id,
+            "compose",
+            f"整理 {len(facts)} 条记忆、{len(recent)} 个近期文件、{len(directory_context)} 个目录快照和 {len(rag_evidence)} 个证据片段。",
+            0.52,
+        )
         context_packet = {
             "confirmed_facts": [f for f in facts if f.get("status") == "confirmed"],
             "inferred_facts": [f for f in facts if f.get("status") == "inferred"][:18],
@@ -104,10 +255,12 @@ class AssistantAgent(BaseAgent):
                 for f in recent[:20]
             ],
             "retrieved_evidence": rag_evidence,
+            "indexed_directory_context": directory_context,
         }
 
-        if llm and llm.available_providers():
+        if chat_llm and chat_llm.available_providers():
             try:
+                await self._emit_progress(event_bus, request_id, "llm", "调用 Desktop 对话模型生成回答。", 0.7)
                 messages = [
                     LLMMessage(role="system", content=_SYSTEM),
                     LLMMessage(
@@ -115,6 +268,8 @@ class AssistantAgent(BaseAgent):
                         content=(
                             "这是你当前掌握的本地上下文。请只基于这些证据回答，"
                             "并在必要时说明哪些是推断。"
+                            "如果 indexed_directory_context 中有对应目录，请优先使用其中的 file_index 快照，"
+                            "不要声称完全无法查看该目录；但要说明它是已同步索引，不是实时文件系统列表。"
                             "如果使用 retrieved_evidence，请用 [S1] 这样的来源编号标注关键结论。\n\n"
                             f"{json.dumps(context_packet, ensure_ascii=False, indent=2)}"
                         ),
@@ -126,12 +281,18 @@ class AssistantAgent(BaseAgent):
                     if role in {"user", "assistant"} and content:
                         messages.append(LLMMessage(role=role, content=str(content)))
                 messages.append(LLMMessage(role="user", content=message))
-                resp = await llm.complete(
-                    messages=messages,
-                    task_type="assistant",
-                    max_tokens=900,
-                    temperature=0.35,
+                llm_timeout = float(task.input_data.get("llm_timeout", 30.0))
+                resp = await asyncio.wait_for(
+                    chat_llm.complete(
+                        messages=messages,
+                        task_type="assistant",
+                        max_tokens=900,
+                        temperature=0.35,
+                        trace_request_id=request_id,
+                    ),
+                    timeout=llm_timeout,
                 )
+                await self._emit_progress(event_bus, request_id, "finalize", "回答生成完成，正在附上可追溯来源。", 0.95)
                 return {
                     "answer": resp.content,
                     "context": self._context_digest(context_packet),
@@ -139,12 +300,353 @@ class AssistantAgent(BaseAgent):
                 }
             except Exception as e:
                 logger.warning("Assistant LLM response failed: %s", e)
+                await self._emit_tool_event(
+                    event_bus,
+                    request_id,
+                    name="desktop_llm",
+                    label="Desktop 模型调用",
+                    status="warning",
+                    detail=f"模型暂不可用，切换本地兜底：{e}",
+                )
 
+        await self._emit_progress(event_bus, request_id, "fallback", "模型暂不可用，使用本地规则生成备用回答。", 0.82)
         return {
             "answer": self._fallback_answer(message, context_packet),
             "context": self._context_digest(context_packet),
             "sources": rag_evidence,
         }
+
+    async def _exact_file_evidence(self, memory: Any, message: str) -> list[dict]:
+        terms = self._exact_search_terms(message)
+        if not terms:
+            return []
+
+        evidence: list[dict] = []
+        seen: set[str] = set()
+        for term in terms[:24]:
+            try:
+                results = await memory.search_files(term, limit=8)
+            except Exception:
+                continue
+            for item in results:
+                path = str(item.get("path") or "")
+                if not path or path in seen:
+                    continue
+                triage = str(item.get("triage_status") or item.get("triage") or "")
+                if triage in {"skip", "low", "unknown"}:
+                    continue
+                snippet = str(item.get("semantic_summary") or item.get("summary") or "").strip()
+                if not snippet:
+                    snippet = self._extract_file_preview(path)
+                evidence.append({
+                    "source_id": f"F{len(evidence) + 1}",
+                    "path": path,
+                    "file_type": item.get("file_type"),
+                    "modality": "text",
+                    "source_kind": "indexed_file",
+                    "snippet": snippet[:900] if snippet else Path(path).name,
+                    "score": None,
+                    "modes": ["exact_file_index"],
+                    "metadata": {"triage_status": triage, "keyword": term},
+                })
+                seen.add(path)
+                if len(evidence) >= 8:
+                    return evidence
+        return evidence
+
+    def _quick_command_answer(
+        self,
+        message: str,
+        *,
+        facts: list[dict],
+        recent: list[dict],
+        profile: Any,
+        behavior_insights: list[Any],
+        context_briefs: list[Any],
+    ) -> str | None:
+        command = message.strip().split(maxsplit=1)[0].lower()
+        if command not in {"/profile", "/focus", "/brief", "/plan"}:
+            return None
+
+        confirmed = [f for f in facts if f.get("status") == "confirmed"]
+        inferred = [f for f in facts if f.get("status") == "inferred"]
+        lines: list[str] = []
+
+        if command == "/profile":
+            lines.append("这是我现在对你的本地画像理解：")
+            if confirmed:
+                lines.append("\n你确认过的事实：")
+                lines.extend(f"- {fact.get('statement')}" for fact in confirmed[:6] if fact.get("statement"))
+            if inferred:
+                lines.append("\n我从资料里推断到的线索：")
+                lines.extend(f"- {fact.get('statement')}" for fact in inferred[:8] if fact.get("statement"))
+            if isinstance(profile, dict):
+                goals = profile.get("goals") or profile.get("current_focus") or []
+                if goals:
+                    lines.append(f"\n画像里记录的当前目标/关注：{self._short_json(goals)}")
+            if not confirmed and not inferred and not profile:
+                lines.append("现在画像证据还不够。你可以先完成 First Insight，或者在记忆页确认几条事实。")
+            return "\n".join(lines)
+
+        if command == "/focus":
+            lines.append("我看到你最近的注意力主要来自这些本地线索：")
+            if recent:
+                lines.append("\n最近活跃文件：")
+                for item in recent[:8]:
+                    path = str(item.get("path") or "")
+                    lines.append(f"- {Path(path).name or path} ({item.get('file_type') or 'file'})")
+            if behavior_insights:
+                lines.append(f"\n行为洞察：{self._short_json(behavior_insights[0])}")
+            if not recent and not behavior_insights:
+                lines.append("暂时没有足够近期活动。等索引完成或授权更多资料后会更准。")
+            return "\n".join(lines)
+
+        if command == "/brief":
+            lines.append("这是一个快速本地 brief：")
+            if context_briefs:
+                lines.append(self._short_json(context_briefs[0]))
+            elif profile or confirmed or inferred:
+                lines.append(self._fallback_answer(message, {
+                    "confirmed_facts": confirmed,
+                    "inferred_facts": inferred,
+                    "recent_files": recent,
+                }))
+            else:
+                lines.append("目前还没有足够的画像、行为洞察或上下文 brief。")
+            return "\n".join(lines)
+
+        lines.append("接下来 30 分钟我建议这样安排：")
+        if recent:
+            top_file = Path(str(recent[0].get("path") or "")).name
+            lines.append(f"- 先用 10 分钟回到最近活跃的资料：{top_file or '最近文件'}。")
+        else:
+            lines.append("- 先用 10 分钟明确今天最重要的一件事。")
+        lines.append("- 再用 15 分钟推进一个可完成的小步骤。")
+        lines.append("- 最后 5 分钟记录结果，并把需要我记住的事实发给我。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _short_json(value: Any, limit: int = 600) -> str:
+        text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+        return text if len(text) <= limit else f"{text[:limit]}..."
+
+    def _prefer_exact_evidence(self, message: str) -> bool:
+        broad_markers = (
+            "总结", "分析", "整体", "趋势", "风格", "画像", "最近",
+            "全部", "所有", "范围", "大概", "模式", "习惯", "主题",
+        )
+        if any(marker in message for marker in broad_markers):
+            return False
+        exact_markers = (
+            "/", "~", "路径", "在哪", "哪里", "找", "查找", "搜索",
+            "列出", "文件", "文档", "信", "有没有", "写过什么",
+        )
+        return any(marker in message for marker in exact_markers)
+
+    def _exact_search_terms(self, message: str) -> list[str]:
+        """Generic exact-search probes before broad RAG.
+
+        This intentionally does not know about any user's domain. It extracts
+        path-like strings, quoted phrases, Latin words, and short CJK ngrams so
+        exact filename/index lookup can catch precise asks before semantic RAG.
+        """
+        terms: list[str] = []
+
+        for match in re.findall(r"(?:~|/Users/[^\s`'\"，。；、]+)(?:/[^\s`'\"，。；、]+)*", message):
+            terms.append(str(Path(match).expanduser()))
+
+        for match in re.findall(r"[「『“\"]([^」』”\"]{2,80})[」』”\"]", message):
+            terms.append(match.strip())
+
+        for token in re.findall(r"[A-Za-z0-9_.-]{2,}", message):
+            terms.append(token)
+
+        cjk_spans = re.findall(r"[\u4e00-\u9fff]{2,40}", message)
+        cjk_stop_terms = {
+            "什么", "怎么", "如何", "哪些", "哪个", "是否", "有没有",
+            "我写", "写过", "帮我", "请问", "关于", "文件", "资料",
+        }
+        for span in cjk_spans:
+            if 2 <= len(span) <= 12:
+                terms.append(span)
+            for n in (4, 3, 2):
+                if len(span) < n:
+                    continue
+                for idx in range(0, len(span) - n + 1):
+                    piece = span[idx:idx + n]
+                    if piece not in cjk_stop_terms:
+                        terms.append(piece)
+
+        seen: set[str] = set()
+        unique = []
+        for term in terms:
+            term = term.strip()
+            if len(term) < 2 or term in seen:
+                continue
+            seen.add(term)
+            unique.append(term)
+        return unique[:32]
+
+    @staticmethod
+    def _extract_file_preview(path: str) -> str:
+        try:
+            from src.extractors import extract_content
+            extracted = extract_content(path, max_chars=1200)
+            if extracted and extracted.get("type") == "text":
+                return str(extracted.get("content") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _desktop_chat_llm(self, event_bus: Any | None = None) -> Any | None:
+        """Build a desktop-scope router for chat without changing backend jobs."""
+        try:
+            import os
+            import yaml  # type: ignore[import-untyped]
+            from src.kernel.user_settings import DESKTOP_LLM_CONFIG_PATH, LLM_CONFIG_PATH
+            from src.llm.router import create_router_from_config
+
+            config_path = DESKTOP_LLM_CONFIG_PATH if DESKTOP_LLM_CONFIG_PATH.exists() else LLM_CONFIG_PATH
+            if not config_path.exists():
+                return None
+            with open(config_path) as f:
+                saved = yaml.safe_load(f) or {}
+            scope = (saved.get("scopes") or {}).get("desktop") or {}
+            mode = str(scope.get("mode") or saved.get("desktop_mode") or "")
+            if not scope or mode == "local":
+                return None
+
+            provider = str(scope.get("provider") or "openai_compatible")
+            provider_config = dict(scope.get("provider_config") or {})
+            if not provider_config:
+                ui = scope.get("ui") or {}
+                provider_config = {
+                    "api_key_env": scope.get("api_key_env") or "OPENAI_COMPATIBLE_API_KEY",
+                    "models": {
+                        "fast": ui.get("model") or "qwen3.6-plus",
+                        "strong": ui.get("model") or "qwen3.6-plus",
+                        "vision": ui.get("model") or "qwen3.6-plus",
+                    },
+                }
+                if scope.get("base_url"):
+                    provider_config["base_url"] = scope["base_url"]
+
+            for key, value in (saved.get("env_vars") or {}).items():
+                if value:
+                    os.environ[key] = str(value)
+
+            router = create_router_from_config({
+                "default_provider": provider,
+                "providers": {provider: provider_config},
+            })
+            if event_bus:
+                router.set_event_bus(event_bus)
+            return router if router.available_providers() else None
+        except Exception as e:
+            logger.debug("Desktop chat LLM config unavailable: %s", e)
+            return None
+
+    async def _directory_context_from_message(self, memory: Any, message: str) -> list[dict[str, Any]]:
+        directories = self._extract_requested_directories(message)
+        snapshots: list[dict[str, Any]] = []
+        for directory in directories[:3]:
+            files = await memory.get_files_by_directory(directory, limit=80)
+            if not files:
+                snapshots.append({"directory": directory, "indexed_files": 0, "files": []})
+                continue
+            type_counts: dict[str, int] = {}
+            total_size = 0
+            for item in files:
+                file_type = str(item.get("file_type") or "unknown")
+                type_counts[file_type] = type_counts.get(file_type, 0) + 1
+                total_size += int(item.get("size_bytes") or 0)
+            snapshots.append(
+                {
+                    "directory": directory,
+                    "indexed_files_sampled": len(files),
+                    "total_sample_size_bytes": total_size,
+                    "file_type_counts": type_counts,
+                    "files": [
+                        {
+                            "path": item.get("path"),
+                            "file_type": item.get("file_type"),
+                            "size_bytes": item.get("size_bytes"),
+                            "summary": str(item.get("semantic_summary") or "")[:180],
+                        }
+                        for item in files[:30]
+                    ],
+                }
+            )
+        return snapshots
+
+    def _extract_requested_directories(self, message: str) -> list[str]:
+        home = Path.home()
+        aliases = {
+            "downloads": home / "Downloads",
+            "download": home / "Downloads",
+            "下载": home / "Downloads",
+            "documents": home / "Documents",
+            "文档": home / "Documents",
+            "desktop": home / "Desktop",
+            "桌面": home / "Desktop",
+        }
+        lowered = message.lower()
+        directories: list[str] = []
+
+        for token, path in aliases.items():
+            if token in lowered or token in message:
+                directories.append(str(path))
+
+        for match in re.findall(r"(?:~|/Users/[^\\s`'\"，。；、]+)(?:/[^\\s`'\"，。；、]+)*", message):
+            expanded = str(Path(match).expanduser())
+            if expanded not in directories:
+                directories.append(expanded)
+
+        return list(dict.fromkeys(directories))
+
+    async def _emit_progress(
+        self,
+        event_bus: Any,
+        request_id: str,
+        stage: str,
+        message: str,
+        progress: float,
+    ) -> None:
+        if not event_bus:
+            return
+        await event_bus.emit_dict(
+            "assistant.progress",
+            {
+                "request_id": request_id,
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+            },
+        )
+
+    async def _emit_tool_event(
+        self,
+        event_bus: Any,
+        request_id: str,
+        *,
+        name: str,
+        label: str,
+        status: str,
+        detail: str,
+        started_at: float | None = None,
+    ) -> None:
+        if not event_bus:
+            return
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "name": name,
+            "label": label,
+            "status": status,
+            "detail": detail,
+        }
+        if started_at is not None:
+            payload["elapsed_ms"] = round((time.time() - started_at) * 1000, 1)
+        await event_bus.emit_dict("assistant.tool", payload)
 
     async def _retrieve_rag_evidence(self, task: AgentTask, context: dict[str, Any], message: str) -> list[dict]:
         kernel = context.get("kernel")
@@ -205,13 +707,22 @@ class AssistantAgent(BaseAgent):
         saved = save_scan_settings(task.input_data.get("watch_paths") or [])
         if kernel:
             kernel.config.filesystem.watch_paths = [Path(p) for p in saved["watch_paths"]]
+        scan_triggered = False
+        filesystem = context.get("filesystem")
         pruned = await memory.prune_out_of_scope(saved["watch_paths"])
-        return {**saved, "pruned_files": pruned, "restart_recommended": True}
+        if filesystem and not filesystem.status().get("scan_in_progress"):
+            filesystem.config.watch_paths = [Path(p) for p in saved["watch_paths"]]
+            asyncio.create_task(filesystem._full_scan())
+            scan_triggered = True
+        return {**saved, "pruned_files": pruned, "scan_triggered": scan_triggered, "restart_recommended": not scan_triggered}
 
     async def _settings_model(self, task: AgentTask, context: dict[str, Any]) -> dict:
         from src.kernel.user_settings import save_model_settings
 
         result = save_model_settings(task.input_data)
+        if task.input_data.get("scope") == "desktop":
+            result["reload_skipped"] = "desktop scope does not change backend router"
+            return result
         kernel = context.get("kernel")
         if kernel:
             try:
@@ -371,6 +882,7 @@ class AssistantAgent(BaseAgent):
         current_focus = self._as_list(answers.get("current_focus"))
         planning_style = str(answers.get("planning_style") or "").strip()
         topics = [t["topic"] for t in browser_summary.get("topics", [])[:12] if t.get("topic")]
+        topics = [topic for topic in topics if not self._is_low_signal_browser_topic(topic)]
         domains = [d["domain"] for d in browser_summary.get("top_domains", [])[:8] if d.get("domain")]
 
         inferred_interests = list(dict.fromkeys(interests + topics[:8]))
@@ -495,7 +1007,7 @@ class AssistantAgent(BaseAgent):
 
         for topic in browser_summary.get("topics", [])[:10]:
             value = topic.get("topic")
-            if not value:
+            if not value or self._is_low_signal_browser_topic(str(value)):
                 continue
             statement = f"你最近可能在关注 {value}"
             fact_id = self._fact_id("interest.browser", statement)
@@ -690,7 +1202,7 @@ class AssistantAgent(BaseAgent):
         seen: set[str] = set()
         for topic in browser_summary.get("topics", [])[:12]:
             value = str(topic.get("topic") or "").strip()
-            if not value or value in seen:
+            if not value or value in seen or self._is_low_signal_browser_topic(value):
                 continue
             seen.add(value)
             topics.append({
@@ -711,6 +1223,22 @@ class AssistantAgent(BaseAgent):
                 "confidence": 0.9,
             })
         return topics[:12]
+
+    @staticmethod
+    def _is_low_signal_browser_topic(value: str) -> bool:
+        normalized = value.strip().lower()
+        return normalized in {
+            "书签栏",
+            "其他书签",
+            "书签",
+            "收藏夹",
+            "收藏",
+            "阅读列表",
+            "bookmarks",
+            "bookmark",
+            "favorites",
+            "reading list",
+        }
 
     def _first_insight_suggestions(
         self,
@@ -838,5 +1366,5 @@ class AssistantAgent(BaseAgent):
         if not confirmed and not inferred:
             lines.append("目前证据还不够。你可以先在 Sources & Privacy 里选择资料范围，然后生成画像。")
         lines.append("")
-        lines.append(f"关于“{message}”，我建议先生成或校正画像，这样我会更像真正了解你的 Jarvis。")
+        lines.append(f"关于“{message}”，我建议先生成或校正画像，这样 Kith 会更稳定地理解你。")
         return "\n".join(lines)

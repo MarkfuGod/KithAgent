@@ -48,11 +48,13 @@ class SyscallType(str, Enum):
 
     # Consumer assistant surface (desktop app)
     ASSISTANT_CHAT = "assistant.chat"
+    ASSISTANT_INSIGHTS = "assistant.insights"
     MEMORY_REVIEW = "memory.review"
     MEMORY_FEEDBACK = "memory.feedback"
     SOURCES_GET = "sources.get"
     SOURCES_CONFIGURE = "sources.configure"
     SETTINGS_MODEL = "settings.model"
+    SETTINGS_MODEL_GET = "settings.model.get"
     ONBOARDING_BOOTSTRAP = "onboarding.bootstrap"
     ASSISTANT_FIRST_INSIGHT = "assistant.first_insight"
 
@@ -86,6 +88,7 @@ SYSCALL_TO_AGENT: dict[str, str] = {
     SyscallType.PROFILE_GET: "profile_builder",
     SyscallType.PROFILE_SUMMARY: "assistant",
     SyscallType.ASSISTANT_CHAT: "assistant",
+    SyscallType.ASSISTANT_INSIGHTS: "assistant",
     SyscallType.MEMORY_REVIEW: "assistant",
     SyscallType.MEMORY_FEEDBACK: "assistant",
     SyscallType.SOURCES_GET: "assistant",

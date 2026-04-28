@@ -91,6 +91,7 @@ class ModelRouter:
         model: str | None = None,
         temperature: float = 0.3,
         max_tokens: int = 2048,
+        trace_request_id: str | None = None,
         **kwargs,
     ) -> LLMResponse:
         """Route a completion request with per-function provider/model resolution.
@@ -154,6 +155,7 @@ class ModelRouter:
                 "temperature": temperature,
                 "message_count": len(messages),
                 "prompt_preview": self._messages_preview(messages),
+                "request_id": trace_request_id,
             })
 
         try:
@@ -187,6 +189,7 @@ class ModelRouter:
                     "model": resolved_model or "default",
                     "error": str(e),
                     "elapsed_ms": round((_time.time() - _req_start) * 1000, 1),
+                    "request_id": trace_request_id,
                 })
             raise
 
@@ -209,6 +212,7 @@ class ModelRouter:
                 "content": content[:4000],
                 "content_truncated": len(content) > 4000,
                 "elapsed_ms": round((_time.time() - _req_start) * 1000, 1),
+                "request_id": trace_request_id,
             })
 
         return response

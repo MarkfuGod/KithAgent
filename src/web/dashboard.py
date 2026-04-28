@@ -30,6 +30,7 @@ from src.web.api import (
     clusters as clusters_api,
     daemon as daemon_api,
     events as events_api,
+    insights as insights_api,
     knowledge as knowledge_api,
     llm_config as llm_api,
     overview as overview_api,
@@ -87,10 +88,12 @@ def create_app(event_bus=None) -> web.Application:
 
     # Overview / files / directories / recent / summary-progress
     app.router.add_get("/api/overview", overview_api.overview)
+    app.router.add_get("/api/insights", insights_api.insights)
     app.router.add_get("/api/directories", overview_api.directory_tree)
     app.router.add_get("/api/recent", overview_api.recent_files)
     app.router.add_get("/api/summary-progress", overview_api.summary_progress)
     app.router.add_get("/api/file-clusters", clusters_api.file_clusters)
+    app.router.add_get("/api/file-clusters/files", clusters_api.file_cluster_files)
     app.router.add_post("/api/file-clusters/decision", clusters_api.file_cluster_decision)
 
     # Search

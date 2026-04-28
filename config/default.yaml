@@ -76,7 +76,7 @@ memory:
   rag:
     enabled: true
     initial_delay_seconds: 600
-    batch_size: 20
+    batch_size: 500
     embedding_batch_size: 32
     time_budget_seconds: 90
     chunk_size_chars: 1600
@@ -205,8 +205,17 @@ triage:
   - /.mypy_cache/
   - /.pytest_cache/
   - /.cursor/extensions/
+  - /.cursor/projects/
   - /.vscode/extensions/
   - /.cursor-server/
+  - /miniconda3/pkgs/
+  - /miniconda3/envs/
+  - /miniconda3/lib/
+  - /miniconda3/share/
+  - /anaconda3/pkgs/
+  - /anaconda3/envs/
+  - /.conda/pkgs/
+  - /.conda/envs/
   - /.gradle/caches/
   - /.m2/repository/
   - /go/pkg/
