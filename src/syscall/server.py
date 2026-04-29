@@ -324,7 +324,7 @@ class SyscallServer:
             return SyscallResponse(
                 request_id=request.request_id,
                 success=True,
-                data=self.kernel.status(),
+                data=await self._collect_system_status(),
                 elapsed_ms=(time.time() - start) * 1000,
             )
 
@@ -381,6 +381,84 @@ class SyscallServer:
                 error=completed.error or "Unknown error",
                 elapsed_ms=elapsed_ms,
             )
+
+    async def _collect_system_status(self) -> dict[str, Any]:
+        """Collect the richer backend health payload used by the CLI."""
+        data = self.kernel.status()
+
+        memory = self.kernel.get_memory()
+        if memory:
+            try:
+                memory_status = await memory.stats()
+                memory_status["summarized_files"] = await memory.count_summarized_files()
+                data["memory"] = memory_status
+            except Exception as e:
+                data["memory"] = {"error": str(e)}
+
+            try:
+                data["triage"] = await memory.get_triage_stats()
+            except Exception:
+                data["triage"] = {}
+
+            try:
+                runs = await memory.list_insight_runs(run_type="first_insight", limit=1)
+                latest = runs[0] if runs else None
+                data["first_insight"] = {
+                    "ready": bool(latest and latest.get("status") == "completed"),
+                    "latest_run": latest,
+                }
+            except Exception as e:
+                data["first_insight"] = {"ready": False, "error": str(e)}
+
+        scheduler = self.kernel.get_scheduler()
+        if scheduler and hasattr(scheduler, "status"):
+            data["scheduler"] = scheduler.status()
+
+        subsystems = getattr(self.kernel, "_subsystems", {}) or {}
+        cron = subsystems.get("cron")
+        if cron and hasattr(cron, "status"):
+            data["cron"] = cron.status()
+
+        llm = self.kernel.get_llm()
+        if llm:
+            data["llm"] = {
+                "available_providers": llm.available_providers(),
+                "total_calls": getattr(llm, "_total_calls", 0),
+                "total_tokens": getattr(llm, "_total_tokens", 0),
+            }
+
+        try:
+            from src.memory.embeddings import get_provider_info, is_available
+
+            data["embedding"] = {
+                **get_provider_info(),
+                "available": is_available(),
+            }
+        except Exception:
+            data["embedding"] = {}
+
+        config = getattr(self.kernel, "config", None)
+        memory_config = getattr(config, "memory", None)
+        rag_cfg = getattr(memory_config, "rag", None)
+        if rag_cfg:
+            rag_status: dict[str, Any] = {
+                "enabled": bool(getattr(rag_cfg, "enabled", True)),
+                "initial_delay_seconds": getattr(rag_cfg, "initial_delay_seconds", 600),
+            }
+            if memory:
+                try:
+                    pending = await memory.get_files_needing_rag_index(
+                        limit=1000,
+                        allowed_triage_statuses=getattr(rag_cfg, "allowed_triage_statuses", ["high", "medium"]),
+                        max_file_size_bytes=getattr(rag_cfg, "max_file_size_mb", 5) * 1024 * 1024,
+                    )
+                    rag_status["pending"] = len(pending)
+                    rag_status["chunks"] = await memory.count_document_chunks()
+                except Exception as e:
+                    rag_status["error"] = str(e)
+            data["rag"] = rag_status
+
+        return data
 
     def _build_input(self, request: SyscallRequest) -> dict:
         """Merge syscall-specific parameters into task input."""

@@ -16,6 +16,10 @@ from src.llm.base import LLMMessage, LLMProvider, LLMResponse
 logger = logging.getLogger("agent_sys.llm.openai")
 
 
+def _is_header_safe_ascii(value: str) -> bool:
+    return not any(ord(ch) > 127 or ch in "\r\n" for ch in value)
+
+
 class OpenAIAdapter(LLMProvider):
     name = "openai"
 
@@ -32,9 +36,16 @@ class OpenAIAdapter(LLMProvider):
         self._models = models or {"fast": "gpt-4o-mini", "strong": "gpt-4o"}
         self._extra_body = extra_body or {}
         self._client = None
+        self._api_key_env = api_key_env
+        self._key_is_header_safe = _is_header_safe_ascii(self._api_key)
+        if self._api_key and not self._key_is_header_safe:
+            logger.warning(
+                "%s contains non-ASCII or newline characters; provider disabled until the key is fixed.",
+                api_key_env,
+            )
 
     def available(self) -> bool:
-        return bool(self._api_key)
+        return bool(self._api_key and self._key_is_header_safe)
 
     def list_models(self) -> dict[str, str]:
         return dict(self._models)
@@ -48,6 +59,12 @@ class OpenAIAdapter(LLMProvider):
         **kwargs,
     ) -> LLMResponse:
         model = model or self._models.get("fast", "gpt-4o-mini")
+        if not self.available():
+            if self._api_key and not self._key_is_header_safe:
+                raise RuntimeError(
+                    f"{self._api_key_env} contains characters that cannot be sent as an HTTP header."
+                )
+            raise RuntimeError(f"{self._api_key_env} is not configured")
         msgs = []
         for m in messages:
             if isinstance(m.content, list):

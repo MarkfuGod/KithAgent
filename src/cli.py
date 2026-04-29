@@ -12,22 +12,30 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
+import time
 from pathlib import Path
+from typing import Any
+
+from src.cli_ui import CLIUI
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO", *, console: bool = False) -> None:
     log_dir = Path.home() / ".agent_sys" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(log_dir / "sysagent.log", encoding="utf-8"),
+    ]
+    if console:
+        handlers.insert(0, logging.StreamHandler(sys.stderr))
 
     logging.basicConfig(
         level=getattr(logging, level.upper()),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_dir / "sysagent.log"),
-        ],
+        handlers=handlers,
+        force=True,
     )
 
 
@@ -36,8 +44,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     from src.kernel.config import load_config
     from src.kernel.daemon import SysAgentKernel
 
+    ui = CLIUI()
     config = load_config(args.config)
-    setup_logging(config.kernel.log_level)
+    setup_logging(config.kernel.log_level, console=bool(getattr(args, "verbose", False)))
     logger = logging.getLogger("agent_sys.cli")
 
     pid_file = Path(str(config.kernel.pid_file))
@@ -68,7 +77,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                     _time.sleep(0.5)
                 pid_file.unlink(missing_ok=True)
             else:
-                print(
+                ui.print(
                     f"\nagent-sys is already running (PID {old_pid}).\n"
                     f"  - To see status:      agent-sys status\n"
                     f"  - To stop it first:   agent-sys stop\n"
@@ -86,33 +95,24 @@ def cmd_start(args: argparse.Namespace) -> None:
     config = _load_saved_llm_config(config)
 
     # First-run UX: ask about scan scope + LLM before we actually boot.
+    first_insight_payload: dict[str, Any] | None = None
     if not args.daemon:
         config = _prompt_scan_paths(config)
         config = _check_llm_and_prompt(config)
+        first_insight_payload = _maybe_collect_start_first_insight(args, ui)
 
     if args.daemon:
         _daemonize()
 
     kernel = SysAgentKernel(config)
 
-    print(f"""
-╔══════════════════════════════════════════╗
-║         agent-sys v{config.kernel.version}                   ║
-║                                          ║
-║  PID:        {os.getpid():<28}║
-║  Socket:     {str(config.kernel.socket_path):<27}║
-║  HTTP API:   http://127.0.0.1:{config.syscall.http_port:<11}║
-║  Logs:       ~/.agent_sys/logs/          ║
-║                                          ║
-║  Local file indexer + RPC surface for    ║
-║  LLM-powered agents. Ctrl-C to stop.     ║
-╚══════════════════════════════════════════╝
-    """)
-
     try:
-        asyncio.run(kernel.run())
+        if args.daemon:
+            asyncio.run(kernel.run())
+        else:
+            asyncio.run(_run_kernel_foreground(kernel, ui, first_insight_payload))
     except KeyboardInterrupt:
-        print("\nShutdown requested.")
+        ui.print("\nShutdown requested.")
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
@@ -159,17 +159,139 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     """Show system status via syscall."""
-    asyncio.run(_async_status())
+    asyncio.run(_async_status(json_output=bool(getattr(args, "json", False))))
 
 
-async def _async_status() -> None:
+async def _async_status(json_output: bool = False) -> None:
     from src.syscall.client import SysAgentClient
+    ui = CLIUI(json_output=json_output)
     try:
         async with SysAgentClient() as client:
             status = await client.status()
-            print(json.dumps(status, indent=2))
+            if json_output:
+                print(json.dumps(status, indent=2, ensure_ascii=False))
+            else:
+                _print_backend_status(status, ui)
     except (ConnectionRefusedError, FileNotFoundError):
-        print("SysAgent is not running. Start with: agent-sys start")
+        ui.print("SysAgent is not running. Start with: agent-sys start")
+
+
+def cmd_home(args: argparse.Namespace) -> None:
+    """Show the Kith command center."""
+    from src.kernel.config import load_config
+
+    config = load_config(args.config)
+    status = asyncio.run(_fetch_daemon_status())
+    _print_home(CLIUI(), config, status)
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """Run local environment and daemon checks."""
+    from src.kernel.config import load_config
+
+    config = load_config(args.config)
+    status = asyncio.run(_fetch_daemon_status())
+    _print_doctor(CLIUI(), config, status)
+
+
+def cmd_statusline(args: argparse.Namespace) -> None:
+    """Print a compact one-line status for shell prompts/status bars."""
+    status = asyncio.run(_fetch_daemon_status(timeout=1.2))
+    print(_format_statusline(status))
+
+
+async def _fetch_daemon_status(timeout: float = 2.0) -> dict | None:
+    from src.syscall.client import SysAgentClient
+
+    try:
+        async with SysAgentClient() as client:
+            return await asyncio.wait_for(client.status(), timeout=timeout)
+    except Exception:
+        return None
+
+
+def _print_home(ui: CLIUI, config, status: dict | None) -> None:
+    online = bool(status and status.get("running"))
+    fs = (status or {}).get("filesystem") or {}
+    memory = (status or {}).get("memory") or {}
+    llm = (status or {}).get("llm") or {}
+    insight = (status or {}).get("first_insight") or {}
+    ui.hero(
+        "Kith Agent",
+        "A quiet local memory backend for your personal agents.",
+        [
+            ("status", "online" if online else "offline"),
+            ("socket", config.kernel.socket_path),
+            ("files", memory.get("indexed_files", fs.get("files_indexed", 0))),
+            ("model", ", ".join(llm.get("available_providers") or []) or ("unknown" if online else "not connected")),
+            ("first insight", "ready" if insight.get("ready") else "pending"),
+        ],
+    )
+    ui.cards(
+        "Command Center",
+        [
+            ("Start", "Bring the local memory daemon online.", "agent-sys start"),
+            ("First Insight", "Seed your first correctable personal profile.", "agent-sys first-insight"),
+            ("Doctor", "Check daemon, model, logs, socket, and privacy basics.", "agent-sys doctor"),
+            ("Status", "Read the backend state without scrolling logs.", "agent-sys status"),
+            ("Dashboard", "Open the browser control panel.", "agent-sys dashboard"),
+            ("Logs", "Follow details in a separate terminal.", "agent-sys logs -f"),
+            ("Search", "Ask Kith's index where something lives.", 'agent-sys search "meeting notes"'),
+            ("Brief", "Give a new agent session the short version of you.", "agent-sys report brief"),
+            ("Statusline", "Use one compact line in your shell prompt.", "agent-sys statusline"),
+        ],
+    )
+    ui.info("Tip: keep `agent-sys start` clean, and open `agent-sys logs -f` in another terminal when debugging.")
+
+
+def _print_doctor(ui: CLIUI, config, status: dict | None) -> None:
+    log_path = Path(str(config.kernel.log_file)).expanduser()
+    token_path = Path(str(config.syscall.auth_token_path)).expanduser()
+    online = bool(status and status.get("running"))
+    llm = (status or {}).get("llm") or {}
+    embedding = (status or {}).get("embedding") or {}
+    first = (status or {}).get("first_insight") or {}
+    fs = (status or {}).get("filesystem") or {}
+    rows = [
+        ("python", sys.version.split()[0], _doctor_state("ok")),
+        ("daemon", f"pid={status.get('pid')}" if online and status else "offline", _doctor_state("ok" if online else "warn")),
+        ("socket", str(config.kernel.socket_path), _doctor_state("ok" if Path(str(config.kernel.socket_path)).exists() else "warn")),
+        ("http", f"127.0.0.1:{config.syscall.http_port}", _doctor_state("ok" if online else "warn")),
+        ("auth token", str(token_path), _doctor_state("ok" if token_path.exists() else "warn")),
+        ("logs", str(log_path), _doctor_state("ok" if log_path.exists() else "warn")),
+        ("llm", ", ".join(llm.get("available_providers") or []) or "none", _doctor_state("ok" if llm.get("available_providers") else "warn")),
+        ("embedding", embedding.get("provider", "unknown"), _doctor_state("ok" if embedding.get("available") else "warn")),
+        ("filesystem", "scanning" if fs.get("scan_in_progress") else "idle", _doctor_state("ok" if online else "warn")),
+        ("first insight", "ready" if first.get("ready") else "pending", _doctor_state("ok" if first.get("ready") else "warn")),
+    ]
+    ui.table("Doctor", ["check", "value", "state"], rows)
+    if not online:
+        ui.info("Start the backend with: agent-sys start")
+    elif not llm.get("available_providers"):
+        ui.warning("No LLM provider is available. Run `agent-sys start` interactively or edit ~/.agent_sys/llm_config.yaml.")
+
+
+def _doctor_state(state: str) -> str:
+    if state == "ok":
+        return "[ok] ok"
+    if state == "warn":
+        return "[warn] needs attention"
+    return state
+
+
+def _format_statusline(status: dict | None) -> str:
+    if not status or not status.get("running"):
+        return "Kith offline"
+    memory = status.get("memory") or {}
+    fs = status.get("filesystem") or {}
+    llm = status.get("llm") or {}
+    first = status.get("first_insight") or {}
+    files = memory.get("indexed_files", fs.get("files_indexed", 0))
+    providers = llm.get("available_providers") or []
+    provider = providers[0] if providers else "no-llm"
+    insight = "insight:ready" if first.get("ready") else "insight:pending"
+    scan = "scan:running" if fs.get("scan_in_progress") else "scan:idle"
+    return f"Kith online pid:{status.get('pid')} files:{files} {provider} {insight} {scan}"
 
 
 def cmd_ping(args: argparse.Namespace) -> None:
@@ -184,6 +306,440 @@ async def _async_ping() -> None:
             print(f"pong! (PID: {result.get('pid')})")
     except (ConnectionRefusedError, FileNotFoundError):
         print("SysAgent is not running.")
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    """Show daemon logs, optionally following in real time."""
+    from src.kernel.config import load_config
+
+    config = load_config(args.config)
+    log_path = Path(str(config.kernel.log_file)).expanduser()
+    _print_logs(log_path, lines=int(args.lines), follow=bool(args.follow))
+
+
+def _print_logs(log_path: Path, *, lines: int = 120, follow: bool = False) -> None:
+    ui = CLIUI()
+    if not log_path.exists():
+        ui.print(f"No log file yet: {log_path}")
+        ui.print("Start the daemon first: agent-sys start")
+        return
+
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        if lines > 0:
+            recent = f.readlines()[-lines:]
+            for line in recent:
+                print(line.rstrip("\n"))
+        if not follow:
+            return
+        ui.info(f"Following {log_path}. Press Ctrl-C to stop.")
+        f.seek(0, os.SEEK_END)
+        try:
+            while True:
+                line = f.readline()
+                if line:
+                    print(line.rstrip("\n"))
+                else:
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            ui.print("\nStopped following logs.")
+
+
+async def _run_kernel_foreground(kernel, ui: CLIUI, first_insight_payload: dict[str, Any] | None) -> None:
+    """Boot with CLI progress, optionally run First Insight, then stay alive."""
+    with ui.status("Booting Kith backend: memory, scheduler, filesystem, syscall API..."):
+        await kernel.boot()
+    _print_start_banner(ui, kernel.config)
+    ui.success("Daemon is online. Initial file scan continues in the background.")
+    ui.info("Open the control panel with: agent-sys dashboard")
+
+    if first_insight_payload:
+        try:
+            await _run_first_insight_payload(
+                first_insight_payload,
+                ui,
+                socket_path=str(kernel.config.kernel.socket_path),
+            )
+        except Exception as e:
+            ui.error(f"First Insight failed: {e}")
+            ui.info("The daemon is still running; retry with: agent-sys first-insight")
+
+    try:
+        while kernel._running:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await kernel.shutdown()
+
+
+def _print_start_banner(ui: CLIUI, config) -> None:
+    ui.hero(
+        "Kith backend is online",
+        f"agent-sys v{config.kernel.version}",
+        [
+            ("pid", os.getpid()),
+            ("socket", config.kernel.socket_path),
+            ("http", f"http://127.0.0.1:{config.syscall.http_port}"),
+            ("logs", "~/.agent_sys/logs/sysagent.log"),
+            ("panel", "agent-sys dashboard"),
+            ("next", "agent-sys doctor  |  agent-sys logs -f"),
+        ],
+    )
+
+
+def _maybe_collect_start_first_insight(args: argparse.Namespace, ui: CLIUI) -> dict[str, Any] | None:
+    mode = getattr(args, "first_insight", None)
+    if mode is False:
+        return None
+    if not sys.stdin.isatty():
+        if mode is True:
+            ui.warning("Cannot run interactive First Insight because stdin is not a TTY.")
+        return None
+    if mode is None:
+        should_run = ui.confirm(
+            "Run First Insight after the daemon comes online?",
+            default=True,
+        )
+        if not should_run:
+            ui.info("You can run it later with: agent-sys first-insight")
+            return None
+    return _prompt_first_insight_payload(ui)
+
+
+_ROLE_OPTIONS = [
+    "student / learner",
+    "researcher",
+    "creator",
+    "writer",
+    "designer / artist",
+    "developer / engineer",
+    "product / business",
+    "teacher / mentor",
+    "founder / freelancer",
+    "manager / operator",
+    "caregiver / parent",
+    "life organizer",
+]
+
+_GOAL_OPTIONS = [
+    "plan my day or week",
+    "remember what matters about me",
+    "organize files and notes",
+    "find past notes quickly",
+    "support study or research",
+    "manage projects and deadlines",
+    "prepare work or school tasks",
+    "track habits and routines",
+    "reflect on mood and energy",
+    "capture creative ideas",
+    "reduce digital clutter",
+    "suggest next actions gently",
+]
+
+_INTEREST_OPTIONS = [
+    "reading / books",
+    "music",
+    "film / video",
+    "games",
+    "fitness / health",
+    "food / cooking",
+    "travel",
+    "finance / business",
+    "design / art",
+    "writing",
+    "language learning",
+    "research / learning",
+    "AI tools",
+    "programming",
+]
+
+_FOCUS_OPTIONS = [
+    "today's priorities",
+    "this week's plan",
+    "a work project",
+    "a school or research task",
+    "a creative project",
+    "personal knowledge base",
+    "file cleanup",
+    "health / life routine",
+    "learning plan",
+    "career / portfolio",
+    "family / home logistics",
+    "reducing overwhelm",
+]
+
+
+def _prompt_first_insight_payload(ui: CLIUI) -> dict[str, Any]:
+    ui.hero(
+        "First Insight",
+        "Pick presets or write your own. Nothing here is permanent.",
+        [
+            ("privacy", "browser metadata is optional; no cookies, sessions, tokens, or page bodies"),
+            ("memory", "saved facts stay correctable later"),
+            ("pace", "answer quickly now, refine later"),
+        ],
+    )
+    answers = {
+        "roles": _choose_many(ui, "What roles describe you?", _ROLE_OPTIONS),
+        "goals": _choose_many(ui, "What should Kith help with?", _GOAL_OPTIONS),
+        "interests": _choose_many(ui, "What interests should Kith notice?", _INTEREST_OPTIONS),
+        "current_focus": _choose_many(ui, "What is your current focus?", _FOCUS_OPTIONS),
+        "planning_style": _choose_one(ui, "Planning style", ["lightweight", "balanced", "detailed", "quiet"]),
+        "suggestion_cadence": _choose_one(ui, "Suggestion cadence", ["daily", "weekly", "quiet"]),
+    }
+    include_browser = ui.confirm(
+        "Allow aggregated browser titles/domains/download metadata? No cookies, sessions, tokens, or page bodies are read.",
+        default=False,
+    )
+    return {
+        "answers": _normalize_first_insight_answers(answers),
+        "include_browser_history": include_browser,
+        "history_days": 30,
+        "history_limit": 500,
+    }
+
+
+def _choose_many(ui: CLIUI, label: str, options: list[str]) -> list[str]:
+    ui.choice_grid(label, options)
+    raw = ui.prompt("Choose numbers separated by commas, or o", default="")
+    selected: list[str] = []
+    wants_custom = False
+    for token in re.split(r"[\s,，;；/]+", raw):
+        cleaned = token.strip().lower()
+        if not cleaned:
+            continue
+        if cleaned in {"o", "other", "custom"}:
+            wants_custom = True
+            continue
+        if cleaned.isdigit():
+            idx = int(cleaned)
+            if 1 <= idx <= len(options):
+                selected.append(options[idx - 1])
+                continue
+        selected.extend(_split_cli_values(cleaned))
+    if wants_custom or not selected:
+        custom = ui.prompt("Other / custom (comma-separated, blank to skip)", default="")
+        selected.extend(_split_cli_values(custom))
+    return list(dict.fromkeys(item for item in selected if item))
+
+
+def _choose_one(ui: CLIUI, label: str, options: list[str]) -> str:
+    ui.print(f"\n{label}")
+    for idx, option in enumerate(options, 1):
+        ui.print(f"  [{idx}] {option}")
+    raw = ui.prompt("Choose one", default="1").strip().lower()
+    if raw.isdigit() and 1 <= int(raw) <= len(options):
+        return options[int(raw) - 1]
+    if raw in options:
+        return raw
+    return options[0]
+
+
+def _split_cli_values(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_items = [values]
+    else:
+        raw_items = [str(item) for item in values]
+    result: list[str] = []
+    for item in raw_items:
+        for part in re.split(r"[\n,，;；/]+", item):
+            cleaned = part.strip()
+            if cleaned and cleaned not in result:
+                result.append(cleaned)
+    return result
+
+
+def _normalize_first_insight_answers(answers: dict[str, Any]) -> dict[str, Any]:
+    cadence = str(answers.get("suggestion_cadence") or "daily").strip().lower()
+    if cadence not in {"daily", "weekly", "quiet"}:
+        cadence = "daily"
+    planning_style = str(answers.get("planning_style") or "lightweight").strip() or "lightweight"
+    return {
+        "roles": _split_cli_values(answers.get("roles")),
+        "goals": _split_cli_values(answers.get("goals")),
+        "interests": _split_cli_values(answers.get("interests")),
+        "current_focus": _split_cli_values(answers.get("current_focus")),
+        "planning_style": planning_style,
+        "suggestion_cadence": cadence,
+    }
+
+
+def _first_insight_payload_from_args(args: argparse.Namespace, ui: CLIUI) -> dict[str, Any]:
+    answers = _normalize_first_insight_answers({
+        "roles": getattr(args, "roles", []),
+        "goals": getattr(args, "goals", []),
+        "interests": getattr(args, "interests", []),
+        "current_focus": getattr(args, "current_focus", []),
+        "planning_style": getattr(args, "planning_style", "lightweight"),
+        "suggestion_cadence": getattr(args, "suggestion_cadence", "daily"),
+    })
+
+    has_answers = any(answers[key] for key in ("roles", "goals", "interests", "current_focus"))
+    interactive = (
+        not bool(getattr(args, "yes", False))
+        and not bool(getattr(args, "json", False))
+        and sys.stdin.isatty()
+    )
+    if interactive and not has_answers:
+        return _prompt_first_insight_payload(ui)
+
+    include_browser = getattr(args, "include_browser_history", None)
+    if include_browser is None:
+        include_browser = False
+        if interactive:
+            include_browser = ui.confirm(
+                "Allow aggregated browser titles/domains/download metadata?",
+                default=False,
+            )
+    return {
+        "answers": answers,
+        "include_browser_history": bool(include_browser),
+        "history_days": int(getattr(args, "history_days", 30)),
+        "history_limit": int(getattr(args, "history_limit", 500)),
+    }
+
+
+def cmd_first_insight(args: argparse.Namespace) -> None:
+    asyncio.run(_async_first_insight(args))
+
+
+async def _async_first_insight(args: argparse.Namespace) -> None:
+    ui = CLIUI(json_output=bool(getattr(args, "json", False)))
+    payload = _first_insight_payload_from_args(args, ui)
+    try:
+        result = await _run_first_insight_payload(payload, ui)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            _print_first_insight_result(result, ui)
+    except (ConnectionRefusedError, FileNotFoundError):
+        ui.print("SysAgent is not running. Start with: agent-sys start")
+
+
+async def _run_first_insight_payload(
+    payload: dict[str, Any],
+    ui: CLIUI,
+    *,
+    socket_path: str = "/tmp/agent_sys.sock",
+) -> dict:
+    from src.syscall.client import SysAgentClient
+
+    with ui.status("Generating First Insight from answers, local index, and authorized sources..."):
+        async with SysAgentClient(socket_path=socket_path) as client:
+            return await client.first_insight(
+                payload["answers"],
+                include_browser_history=bool(payload.get("include_browser_history")),
+                history_days=int(payload.get("history_days", 30)),
+                history_limit=int(payload.get("history_limit", 500)),
+            )
+
+
+def _print_first_insight_result(result: dict, ui: CLIUI) -> None:
+    profile = result.get("profile") or {}
+    identity = profile.get("identity") if isinstance(profile, dict) else {}
+    summary = identity.get("summary") if isinstance(identity, dict) else ""
+    browser = result.get("browser_history") or {}
+    ui.panel(
+        "First Insight Complete",
+        [
+            f"Run: {result.get('run_id', '?')}",
+            f"Elapsed: {result.get('elapsed_seconds', 0)}s",
+            f"Profile: {summary or 'first profile seeded'}",
+            f"Facts: {len(result.get('profile_facts') or [])}",
+            f"Browser entries: {browser.get('entries_count', 0)}",
+        ],
+    )
+
+    topics = result.get("topics") or []
+    if topics:
+        ui.table(
+            "Topics",
+            ["topic", "source", "confidence"],
+            [
+                (
+                    item.get("topic", ""),
+                    item.get("source_type", ""),
+                    item.get("confidence", ""),
+                )
+                for item in topics[:8]
+            ],
+        )
+
+    suggestions = result.get("suggestions") or []
+    if suggestions:
+        ui.table(
+            "Suggestions",
+            ["suggestion", "source"],
+            [
+                (
+                    item.get("statement", ""),
+                    item.get("source_type", ""),
+                )
+                for item in suggestions[:5]
+            ],
+        )
+
+    next_actions = result.get("next_actions") or []
+    if next_actions:
+        ui.panel("Next Actions", [f"- {action}" for action in next_actions])
+
+
+def _print_backend_status(status: dict, ui: CLIUI) -> None:
+    ui.panel(
+        "Kith Backend",
+        [
+            f"Name: {status.get('name', 'AgentOS')} v{status.get('version', '?')}",
+            f"PID: {status.get('pid', '?')}",
+            f"Running: {status.get('running', False)}",
+            f"Subsystems: {', '.join(status.get('subsystems', []))}",
+        ],
+    )
+
+    fs = status.get("filesystem") or {}
+    if fs:
+        ui.table(
+            "Filesystem",
+            ["indexed", "scan", "progress", "watcher"],
+            [[
+                fs.get("files_indexed", 0),
+                "running" if fs.get("scan_in_progress") else "idle",
+                fs.get("scan_progress", fs.get("scan_progress_files", 0)),
+                "on" if fs.get("realtime_watcher") or fs.get("realtime") else "off",
+            ]],
+        )
+
+    memory = status.get("memory") or {}
+    if memory:
+        ui.table(
+            "Memory",
+            ["files", "summaries", "knowledge", "chunks", "cache"],
+            [[
+                memory.get("indexed_files", 0),
+                memory.get("summarized_files", 0),
+                memory.get("knowledge_entries", 0),
+                memory.get("document_chunks", 0),
+                memory.get("cache_items", 0),
+            ]],
+        )
+
+    llm = status.get("llm") or {}
+    rag = status.get("rag") or {}
+    scheduler = status.get("scheduler") or {}
+    cron = status.get("cron") or {}
+    insight = status.get("first_insight") or {}
+    ui.table(
+        "Runtime",
+        ["llm", "scheduler", "cron", "rag", "first_insight"],
+        [[
+            ", ".join(llm.get("available_providers") or []) or "none",
+            f"{scheduler.get('active_tasks', 0)} active / {scheduler.get('queue_size', 0)} queued",
+            cron.get("strategy", "unknown") if cron else "unknown",
+            f"{rag.get('chunks', 0)} chunks, {rag.get('pending', 0)} pending" if rag else "unknown",
+            "ready" if insight.get("ready") else "pending",
+        ]],
+    )
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -741,14 +1297,20 @@ def _daemonize() -> None:
 
 _EPILOG = """\
 command groups:
-  daemon lifecycle:  start, stop, status, ping
+  command center:    home, doctor, statusline
+  daemon lifecycle:  start, stop, status, ping, logs
+  onboarding:        first-insight
   query/browse:      search, query, profile, report
   manual runs:       triage, summarize, analyze, classify
   ui:                dashboard
 
 examples:
+  agent-sys                        # open the Kith command center
+  agent-sys doctor                 # check environment and daemon health
   agent-sys start                  # start the daemon (first run will prompt)
   agent-sys start -d               # detach into background
+  agent-sys logs -f                # follow daemon logs
+  agent-sys first-insight          # seed the first correctable profile
   agent-sys search "redis config"  # search indexed files semantically
   agent-sys report daily           # generate today's report
   agent-sys dashboard              # launch the web UI
@@ -768,9 +1330,20 @@ def main() -> None:
     parser.add_argument("--config", "-c", help="Path to config YAML file")
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{start,stop,status,ping,search,query,profile,report,"
-                "triage,summarize,analyze,classify,dashboard}",
+        metavar="{home,doctor,statusline,start,stop,status,ping,search,query,"
+                "profile,report,first-insight,triage,summarize,analyze,"
+                "classify,dashboard,logs}",
     )
+
+    # ── Command center ──
+    p_home = sub.add_parser("home", aliases=["menu"], help="Show the Kith command center")
+    p_home.set_defaults(func=cmd_home)
+
+    p_doctor = sub.add_parser("doctor", help="Check local Kith backend health")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_statusline = sub.add_parser("statusline", help="Print compact one-line backend status")
+    p_statusline.set_defaults(func=cmd_statusline)
 
     # ── Daemon lifecycle ──
     p_start = sub.add_parser(
@@ -787,16 +1360,82 @@ def main() -> None:
         "-f", "--force", action="store_true",
         help="Terminate any existing agent-sys instance before starting",
     )
+    p_start.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Also stream daemon logs to stderr during foreground startup",
+    )
+    first_insight_group = p_start.add_mutually_exclusive_group()
+    first_insight_group.add_argument(
+        "--first-insight",
+        dest="first_insight",
+        action="store_true",
+        default=None,
+        help="Run the interactive First Insight flow after the daemon is online",
+    )
+    first_insight_group.add_argument(
+        "--no-first-insight",
+        dest="first_insight",
+        action="store_false",
+        help="Skip the First Insight prompt for this start",
+    )
     p_start.set_defaults(func=cmd_start)
 
     p_stop = sub.add_parser("stop", help="Stop the running daemon")
     p_stop.set_defaults(func=cmd_stop)
 
     p_status = sub.add_parser("status", help="Show kernel/scheduler/memory status")
+    p_status.add_argument("--json", action="store_true", help="Print raw JSON status")
     p_status.set_defaults(func=cmd_status)
 
     p_ping = sub.add_parser("ping", help="Check if the daemon is alive")
     p_ping.set_defaults(func=cmd_ping)
+
+    p_logs = sub.add_parser("logs", aliases=["log"], help="Show daemon logs")
+    p_logs.add_argument("-n", "--lines", type=int, default=120, help="Number of recent lines to show")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="Follow logs in real time")
+    p_logs.set_defaults(func=cmd_logs)
+
+    # ── Onboarding ──
+    p_first = sub.add_parser(
+        "first-insight",
+        help="Run backend First Insight onboarding from the CLI",
+        description=(
+            "Seed Kith's first correctable user profile from lightweight answers, "
+            "the local file index, and optional browser metadata aggregation."
+        ),
+    )
+    p_first.add_argument("--role", "--roles", dest="roles", action="append", default=[], help="Role(s), comma-separated or repeatable")
+    p_first.add_argument("--goal", "--goals", dest="goals", action="append", default=[], help="Goal(s), comma-separated or repeatable")
+    p_first.add_argument("--interest", "--interests", dest="interests", action="append", default=[], help="Interest keyword(s)")
+    p_first.add_argument("--focus", dest="current_focus", action="append", default=[], help="Current focus item(s)")
+    p_first.add_argument("--planning-style", default="lightweight", help="Planning style hint")
+    p_first.add_argument(
+        "--cadence",
+        dest="suggestion_cadence",
+        choices=["daily", "weekly", "quiet"],
+        default="daily",
+        help="Suggestion cadence",
+    )
+    browser_group = p_first.add_mutually_exclusive_group()
+    browser_group.add_argument(
+        "--browser-history",
+        dest="include_browser_history",
+        action="store_true",
+        default=None,
+        help="Allow aggregated Chromium-family titles/domains/download metadata",
+    )
+    browser_group.add_argument(
+        "--no-browser-history",
+        dest="include_browser_history",
+        action="store_false",
+        help="Do not read browser metadata",
+    )
+    p_first.add_argument("--history-days", type=int, default=30, help="Browser history lookback days")
+    p_first.add_argument("--history-limit", type=int, default=500, help="Browser metadata row limit")
+    p_first.add_argument("--yes", action="store_true", help="Do not prompt for missing answers")
+    p_first.add_argument("--json", action="store_true", help="Print raw First Insight JSON")
+    p_first.set_defaults(func=cmd_first_insight)
 
     # ── Query / browse ──
     p_search = sub.add_parser(
@@ -843,8 +1482,7 @@ def main() -> None:
 
     args = parser.parse_args()
     if not args.command:
-        parser.print_help()
-        sys.exit(1)
+        args.func = cmd_home
 
     args.func(args)
 

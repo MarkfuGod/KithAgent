@@ -58,7 +58,7 @@ class OpenAICompatibleAdapter(OpenAIAdapter):
             placeholder_keys.add("ollama")
         has_real_key = key not in placeholder_keys
         has_explicit_url = bool(self._explicit_url)
-        return has_real_key and has_explicit_url
+        return has_real_key and has_explicit_url and self._key_is_header_safe
 
 
 # Backward compat alias

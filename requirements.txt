@@ -1,5 +1,6 @@
 # Core
 pyyaml>=6.0
+rich>=13.7
 
 # Optional: real-time file watching (kqueue/FSEvents on macOS)
 watchdog>=4.0
