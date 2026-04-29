@@ -4,9 +4,6 @@
 
 # KithAgent
 
-<p align="center"><em>codename: <strong>Kith / 契</strong></em><br/>
-<sub>A local memory daemon for agents that should actually know you.</sub></p>
-
 **Languages / 语言:** [English](#english) · [中文](#中文)
 
 > Status: early and changing. APIs, config, and CLI may move before 1.0.
