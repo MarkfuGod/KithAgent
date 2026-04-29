@@ -54,17 +54,20 @@ CLI / dashboard / skills / syscall API
 
 ### Screenshots
 
-<p align="center">
-  <img src="assets/screenshots/cli.png" width="48%" />
-  <img src="assets/screenshots/triage.png" width="48%" />
-</p>
-<p align="center">
-  <img src="assets/screenshots/rag.png" width="48%" />
-  <img src="assets/screenshots/summary-progress.png" width="48%" />
-</p>
-<p align="center">
-  <img src="assets/screenshots/scheduling.png" width="70%" />
-</p>
+| CLI startup | LLM triage |
+| --- | --- |
+| <img src="assets/screenshots/cli.png" /> | <img src="assets/screenshots/triage.png" /> |
+| Clean backend startup, optional First Insight, and dashboard/log hints. | LLM/rule triage decides which files are worth summarizing and which are token-wasting noise. |
+
+| RAG control | Summary progress |
+| --- | --- |
+| <img src="assets/screenshots/rag.png" /> | <img src="assets/screenshots/summary-progress.png" /> |
+| Hybrid retrieval control room for chunking, embeddings, and debug search. | Summarization progress by file type, showing what has been understood and what remains. |
+
+| Adaptive scheduling |
+| --- |
+| <img src="assets/screenshots/scheduling.png" /> |
+| Choose how aggressively Kith runs background agents: aggressive, balanced, or quiet. |
 
 ### Quick Start
 
@@ -224,17 +227,20 @@ CLI / dashboard / skills / syscall API
 
 ### 截图
 
-<p align="center">
-  <img src="assets/screenshots/cli.png" width="48%" />
-  <img src="assets/screenshots/triage.png" width="48%" />
-</p>
-<p align="center">
-  <img src="assets/screenshots/rag.png" width="48%" />
-  <img src="assets/screenshots/summary-progress.png" width="48%" />
-</p>
-<p align="center">
-  <img src="assets/screenshots/scheduling.png" width="70%" />
-</p>
+| CLI 启动 | LLM 分诊 |
+| --- | --- |
+| <img src="assets/screenshots/cli.png" /> | <img src="assets/screenshots/triage.png" /> |
+| 干净的后端启动、可选 First Insight，以及 dashboard / logs 提示。 | LLM 和规则先判断哪些文件值得总结，哪些是浪费 token 的噪音。 |
+
+| RAG 控制台 | 总结进度 |
+| --- | --- |
+| <img src="assets/screenshots/rag.png" /> | <img src="assets/screenshots/summary-progress.png" /> |
+| 控制 chunk、embedding、RAG debug search 和后台索引。 | 按文件类型展示已总结和待总结内容，看到 Kith 理解到了哪里。 |
+
+| 自适应调度 |
+| --- |
+| <img src="assets/screenshots/scheduling.png" /> |
+| 选择后台 agent 的运行策略：积极、平衡或安静。 |
 
 ### 快速开始
 
