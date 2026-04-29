@@ -231,7 +231,7 @@ def _print_home(ui: CLIUI, config, status: dict | None) -> None:
         "Command Center",
         [
             ("Start", "Bring the local memory daemon online.", "agent-sys start"),
-            ("First Insight", "Seed your first correctable personal profile.", "agent-sys first-insight"),
+            ("First Insight", "Optional: helps Kith understand you faster.", "agent-sys first-insight"),
             ("Doctor", "Check daemon, model, logs, socket, and privacy basics.", "agent-sys doctor"),
             ("Status", "Read the backend state without scrolling logs.", "agent-sys status"),
             ("Dashboard", "Open the browser control panel.", "agent-sys dashboard"),
@@ -353,15 +353,12 @@ async def _run_kernel_foreground(kernel, ui: CLIUI, first_insight_payload: dict[
     ui.info("Open the control panel with: agent-sys dashboard")
 
     if first_insight_payload:
-        try:
-            await _run_first_insight_payload(
-                first_insight_payload,
-                ui,
-                socket_path=str(kernel.config.kernel.socket_path),
-            )
-        except Exception as e:
-            ui.error(f"First Insight failed: {e}")
-            ui.info("The daemon is still running; retry with: agent-sys first-insight")
+        asyncio.create_task(_run_optional_first_insight(
+            first_insight_payload,
+            ui,
+            socket_path=str(kernel.config.kernel.socket_path),
+        ))
+        ui.info("First Insight is running in the background; normal daemon features are already available.")
 
     try:
         while kernel._running:
@@ -397,11 +394,11 @@ def _maybe_collect_start_first_insight(args: argparse.Namespace, ui: CLIUI) -> d
         return None
     if mode is None:
         should_run = ui.confirm(
-            "Run First Insight after the daemon comes online?",
+            "Run optional First Insight now? It helps Kith understand you faster, but skipping keeps all normal features available.",
             default=True,
         )
         if not should_run:
-            ui.info("You can run it later with: agent-sys first-insight")
+            ui.info("No problem. Core indexing, search, reports, and dashboard still work. Run later with: agent-sys first-insight")
             return None
     return _prompt_first_insight_payload(ui)
 
@@ -476,7 +473,7 @@ def _prompt_first_insight_payload(ui: CLIUI) -> dict[str, Any]:
         [
             ("privacy", "browser metadata is optional; no cookies, sessions, tokens, or page bodies"),
             ("memory", "saved facts stay correctable later"),
-            ("pace", "answer quickly now, refine later"),
+            ("optional", "skipping does not block search, reports, dashboard, or indexing"),
         ],
     )
     answers = {
@@ -623,10 +620,12 @@ async def _run_first_insight_payload(
     ui: CLIUI,
     *,
     socket_path: str = "/tmp/agent_sys.sock",
+    show_status: bool = True,
 ) -> dict:
     from src.syscall.client import SysAgentClient
 
-    with ui.status("Generating First Insight from answers, local index, and authorized sources..."):
+    status_message = "Generating First Insight from answers, local index, and authorized sources..."
+    if not show_status:
         async with SysAgentClient(socket_path=socket_path) as client:
             return await client.first_insight(
                 payload["answers"],
@@ -634,6 +633,29 @@ async def _run_first_insight_payload(
                 history_days=int(payload.get("history_days", 30)),
                 history_limit=int(payload.get("history_limit", 500)),
             )
+    with ui.status(status_message):
+        async with SysAgentClient(socket_path=socket_path) as client:
+            return await client.first_insight(
+                payload["answers"],
+                include_browser_history=bool(payload.get("include_browser_history")),
+                history_days=int(payload.get("history_days", 30)),
+                history_limit=int(payload.get("history_limit", 500)),
+            )
+
+
+async def _run_optional_first_insight(
+    payload: dict[str, Any],
+    ui: CLIUI,
+    *,
+    socket_path: str,
+) -> None:
+    try:
+        result = await _run_first_insight_payload(payload, ui, socket_path=socket_path, show_status=False)
+        ui.success("First Insight completed. Kith will use this to personalize suggestions faster.")
+        _print_first_insight_result(result, ui)
+    except Exception as e:
+        ui.error(f"First Insight failed: {e}")
+        ui.info("The daemon is still running; retry when convenient with: agent-sys first-insight")
 
 
 def _print_first_insight_result(result: dict, ui: CLIUI) -> None:

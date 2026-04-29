@@ -211,11 +211,6 @@ class CronScheduler:
 
         while self._running:
             try:
-                if not await self._first_insight_ready():
-                    await self._emit_waiting_for_first_insight(reason="adaptive_scheduler")
-                    await asyncio.sleep(30)
-                    continue
-
                 snapshot = await self._gather_activity_snapshot()
                 decision = await self._llm_decide_schedule(snapshot)
 
@@ -636,29 +631,16 @@ class CronScheduler:
                 current_scan = fs._stats.get("last_scan", 0.0)
                 if current_scan > last_scan_time:
                     if first_scan_seen:
-                        if not await self._first_insight_ready():
-                            logger.info(
-                                "Cron: scan completed; deferring %s until First Insight is ready",
-                                agent_name,
-                            )
-                            await self._emit_waiting_for_first_insight(
-                                reason="scan_completed",
-                                blocking_agent=agent_name,
-                            )
-                            last_scan_time = current_scan
-                            continue
                         logger.info("Cron: scan completed, triggering %s", agent_name)
                         overrides = _after_scan_overrides.get(agent_name, {})
                         await self._dispatch(agent_name, input_data=overrides)
                     else:
                         logger.info(
-                            "Cron: initial scan completed; deferring %s so First Insight can run first",
+                            "Cron: initial scan completed, triggering %s; First Insight remains optional",
                             agent_name,
                         )
-                        await self._emit_waiting_for_first_insight(
-                            reason="initial_scan_completed",
-                            blocking_agent=agent_name,
-                        )
+                        overrides = _after_scan_overrides.get(agent_name, {})
+                        await self._dispatch(agent_name, input_data=overrides)
                     first_scan_seen = True
                     last_scan_time = current_scan
 
@@ -683,7 +665,7 @@ class CronScheduler:
         await event_bus.emit_dict("system.waiting_for_first_insight", {
             "reason": reason,
             "blocking_agent": blocking_agent,
-            "message": "Waiting for First Insight before automatic cron/RAG work continues.",
+            "message": "First Insight can improve personalization, but automatic cron/RAG work no longer waits for it.",
             "elapsed_since_boot_s": round(elapsed, 1),
             "fallback_after_s": fallback_after,
             "fallback_in_s": max(0, round(fallback_after - elapsed, 1)),

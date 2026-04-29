@@ -232,6 +232,8 @@ If the embedding key is missing, RAG still builds chunks and FTS search; vector 
 
 Kith's consumer path is optimized for **Time to First Insight**: a first useful profile in minutes, before full summarization or embeddings finish.
 
+First Insight is optional. It helps Kith understand you faster and personalize suggestions earlier, but skipping it does **not** block indexing, search, reports, the dashboard, or other backend syscalls. You can run it later whenever you want.
+
 The product-level syscall is `assistant.first_insight` (alias: `onboarding.bootstrap`). It combines:
 
 - explicit onboarding answers: role, goals, current focus, suggestion cadence, and content boundaries
@@ -796,6 +798,8 @@ memory:
 ### First Insight 首次洞察
 
 Kith 的消费端路径优先优化 **Time to First Insight**：先在几分钟内生成第一版有用画像，不等待完整总结或 embedding 全部完成。
+
+First Insight 是可选的。它能帮助 Kith 更快理解你、让建议更早贴近你，但跳过它不会阻塞索引、搜索、报告、dashboard 或其他后端 syscall。你随时可以之后再运行。
 
 产品级 syscall 是 `assistant.first_insight`（别名：`onboarding.bootstrap`）。它会组合：
 
