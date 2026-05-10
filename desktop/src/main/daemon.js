@@ -41,6 +41,8 @@ export function createDaemonBridge(options = {}) {
   const sleep = options.sleep || ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
   const caller = options.caller || 'electron';
   const statusTimeoutMs = options.statusTimeoutMs || 2500;
+  const defaultHttpTimeoutMs = options.httpTimeoutMs || 30000;
+  const defaultPythonTimeoutMs = options.pythonTimeoutMs || 30000;
   let ensurePromise = null;
 
   function describeError(error) {
@@ -126,9 +128,9 @@ export function createDaemonBridge(options = {}) {
     return { pid: child.pid };
   }
 
-  function runPythonJson(script, args = []) {
+  function runPythonJson(script, args = [], requestOptions = {}) {
     if (options.runPythonJsonImpl) {
-      return options.runPythonJsonImpl(script, args);
+      return options.runPythonJsonImpl(script, args, requestOptions);
     }
     return new Promise((resolvePromise, rejectPromise) => {
       const child = spawn(pythonCommand(), ['-c', script, ...args.map(String)], {
@@ -136,6 +138,20 @@ export function createDaemonBridge(options = {}) {
         env: { ...process.env, PYTHONPATH: repoRoot },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      const timeoutMs = requestOptions.timeoutMs || defaultPythonTimeoutMs;
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        fn(value);
+      };
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+          child.kill('SIGKILL');
+          finish(rejectPromise, new Error(`python helper timed out after ${timeoutMs}ms`));
+        }, timeoutMs)
+        : null;
 
       let stdout = '';
       let stderr = '';
@@ -145,16 +161,17 @@ export function createDaemonBridge(options = {}) {
       child.stderr.on('data', (chunk) => {
         stderr += chunk.toString();
       });
-      child.on('error', rejectPromise);
+      child.on('error', (error) => finish(rejectPromise, error));
       child.on('close', (code) => {
+        if (settled) return;
         if (code !== 0) {
-          rejectPromise(new Error(stderr || stdout || `python exited with ${code}`));
+          finish(rejectPromise, new Error(stderr || stdout || `python exited with ${code}`));
           return;
         }
         try {
-          resolvePromise(JSON.parse(stdout || '{}'));
+          finish(resolvePromise, JSON.parse(stdout || '{}'));
         } catch (error) {
-          rejectPromise(new Error(`Invalid Python JSON output: ${describeError(error)}`));
+          finish(rejectPromise, new Error(`Invalid Python JSON output: ${describeError(error)}`));
         }
       });
     });
@@ -164,7 +181,7 @@ export function createDaemonBridge(options = {}) {
     if (!fetchImpl) {
       throw new Error('fetch is not available');
     }
-    const timeoutMs = requestOptions.timeoutMs || options.httpTimeoutMs || 0;
+    const timeoutMs = requestOptions.timeoutMs || defaultHttpTimeoutMs;
     const controller = timeoutMs > 0 ? new AbortController() : null;
     const timeout = controller
       ? setTimeout(() => controller.abort(new Error(`HTTP request timed out after ${timeoutMs}ms`)), timeoutMs)
@@ -184,7 +201,7 @@ export function createDaemonBridge(options = {}) {
     if (!fetchImpl) {
       throw new Error('fetch is not available');
     }
-    const timeoutMs = requestOptions.timeoutMs || options.httpTimeoutMs || 0;
+    const timeoutMs = requestOptions.timeoutMs || defaultHttpTimeoutMs;
     const controller = timeoutMs > 0 ? new AbortController() : null;
     const timeout = controller
       ? setTimeout(() => controller.abort(new Error(`HTTP request timed out after ${timeoutMs}ms`)), timeoutMs)
@@ -269,7 +286,7 @@ export function createDaemonBridge(options = {}) {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-      }, { timeoutMs: requestOptions.httpTimeoutMs || requestOptions.timeoutMs });
+      }, { timeoutMs: requestOptions.httpTimeoutMs || requestOptions.timeoutMs || defaultHttpTimeoutMs });
       if (!response.success) {
         throw new Error(response.error || 'Kith request failed');
       }

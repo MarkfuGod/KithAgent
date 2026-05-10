@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppShell } from './components/AppShell';
-import { ChatView, starterPrompts } from './features/chat/ChatView';
+import { ChatView } from './features/chat/ChatView';
+import { starterPrompts } from './features/chat/starterPrompts';
 import { DiagnosticsView } from './features/diagnostics/DiagnosticsView';
 import { MemoryView } from './features/memory/MemoryView';
 import { FirstInsightModal } from './features/onboarding/FirstInsight';
@@ -68,7 +69,7 @@ const initialDesktopModelDraft: ModelDraft = {
 const welcomeMessage: ChatMessageView = {
   id: 'assistant-welcome',
   role: 'assistant',
-  content: '我会先理解你允许我读取的本地资料，再用人话回答关于你的问题。你可以从“你觉得我是个什么样的人？”开始。',
+  content: 'Ask me about your approved files, projects, notes, and recent work. I will cite the local evidence I used and tell you when something was not searched.',
 };
 
 function errorMessage(error: unknown) {
@@ -95,6 +96,9 @@ export function App() {
   const [backendModelDraft, setBackendModelDraft] = useState<ModelDraft>(initialModelDraft);
   const [triageClusters, setTriageClusters] = useState<TriageCluster[]>([]);
   const [isTriageReviewLoading, setIsTriageReviewLoading] = useState(false);
+  const [capabilities, setCapabilities] = useState<Awaited<ReturnType<KithApi['capabilities']['list']>> | null>(null);
+  const [isCapabilitiesLoading, setIsCapabilitiesLoading] = useState(false);
+  const [capabilitiesStatus, setCapabilitiesStatus] = useState('');
   const [loadState, setLoadState] = useState(initialLoadState);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [sectionErrors, setSectionErrors] = useState<SectionErrors>({});
@@ -356,9 +360,10 @@ export function App() {
     }
   }
 
-  async function submitChat(event?: FormEvent) {
+  async function submitChat(event?: FormEvent, promptOverride?: string) {
     event?.preventDefault();
-    const message = draft.trim();
+    if (loadState.chat) return;
+    const message = (promptOverride ?? draft).trim();
     if (!message) return;
 
     const nextMessages: ChatMessageView[] = [...messages, { id: createId('user'), role: 'user', content: message }];
@@ -374,6 +379,7 @@ export function App() {
     setMessages(nextMessages);
     setLastUserPrompt(message);
     setDraft('');
+    setActiveTab('chat');
     setLoading('chat', true);
 
     try {
@@ -401,6 +407,7 @@ export function App() {
           role: 'assistant',
           content: `我现在没法回答：${error instanceof Error ? error.message : String(error)}`,
           failed: true,
+          retryable: true,
         },
       ]);
     } finally {
@@ -418,8 +425,79 @@ export function App() {
 
   function retryLastPrompt() {
     if (!lastUserPrompt) return;
-    setDraft(lastUserPrompt);
+    void submitChat(undefined, lastUserPrompt);
+  }
+
+  async function createAgentHandoff() {
+    if (loadState.chat) return;
+    const requestId = createId('handoff-run');
+    activeChatRequestRef.current = requestId;
     setActiveTab('chat');
+    setStreamedChatAnswer('');
+    setChatProgress({
+      requestId,
+      stage: 'handoff',
+      message: '正在打包可交给外部 agent 的本地上下文。',
+      progress: 0.12,
+    });
+    setMessages((current) => [
+      ...current,
+      {
+        id: createId('user-handoff'),
+        role: 'user',
+        content: 'Create an agent context handoff for my current workspace.',
+      },
+    ]);
+    setLoading('chat', true);
+    pushNotice('正在生成外部 agent 可用的 Kith 上下文包。');
+    try {
+      const workspace = sources.watch_paths?.[0] || sourceDraft.split('\n').map((line) => line.trim()).find(Boolean) || '';
+      setChatProgress({
+        requestId,
+        stage: 'retrieval',
+        message: workspace ? `正在读取 ${workspace} 的高价值文件和记忆。` : '没有指定 workspace，正在生成全局上下文包。',
+        progress: 0.38,
+      });
+      const brief = await window.kith.context.agentBrief({
+        caller: 'desktop',
+        session_id: createId('desktop-handoff'),
+        workspace,
+        task: 'Help the next AI agent understand my local work before acting.',
+        surface: 'desktop',
+      });
+      setChatProgress({
+        requestId,
+        stage: 'finalize',
+        message: 'Agent handoff 已生成，正在整理成可复制的说明。',
+        progress: 0.9,
+      });
+      setMessages((current) => [
+        ...current,
+        {
+          id: createId('assistant-handoff'),
+          role: 'assistant',
+          content: formatAgentHandoff(brief),
+          sources: brief.workspace_files?.slice(0, 8),
+        },
+      ]);
+      pushNotice('Agent context handoff 已生成。', 'success');
+    } catch (error) {
+      setMessages((current) => [
+        ...current,
+        {
+          id: createId('assistant-handoff-error'),
+          role: 'assistant',
+          content: `Agent context handoff 生成失败：${errorMessage(error)}\n\n请确认本地大脑已启动，并且 Privacy 里至少有一个授权资料范围。`,
+          failed: true,
+          retryable: false,
+        },
+      ]);
+      pushNotice(`生成 agent context handoff 失败：${errorMessage(error)}`, 'error');
+    } finally {
+      activeChatRequestRef.current = null;
+      setChatProgress(null);
+      setLoading('chat', false);
+    }
   }
 
   async function generateProfile() {
@@ -446,15 +524,22 @@ export function App() {
   }
 
   async function saveSources() {
+    const watch_paths = [...new Set(sourceDraft
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean))];
+    if (!watch_paths.length) {
+      setSourceSaveStatus('请至少保留一个资料范围，Kith 不会在没有授权目录时扫描。');
+      pushNotice('请至少保留一个资料范围。', 'error');
+      return;
+    }
+
     setLoading('sources', true);
-    setSourceSaveStatus('正在把资料范围发送到本地 daemon...');
+    setSourceSaveStatus(`正在保存 ${watch_paths.length} 个授权目录，并通知本地 daemon...`);
     try {
-      const watch_paths = sourceDraft
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean);
       const updated = await window.kith.sources.configure({ watch_paths });
       setSources(updated);
+      setSourceDraft((updated.watch_paths?.length ? updated.watch_paths : watch_paths).join('\n'));
       setSourceSaveStatus(updated.scan_triggered ? '已保存，并已通知后端开始后台重扫。' : '已保存；后端已接收，必要时重启后继续扫描。');
       pushNotice(updated.scan_triggered ? '资料范围已保存，后台重扫已开始。' : '资料范围已保存。', 'success');
     } catch (error) {
@@ -511,14 +596,16 @@ export function App() {
     return result.models || [];
   }
 
-  const refreshTriageReview = useCallback(async () => {
+  const refreshTriageReview = useCallback(async (options: { notifySuccess?: boolean } = {}) => {
     setIsTriageReviewLoading(true);
     setTriageSyncStatus('正在向后端同步待确认目录...');
     try {
       const result = await window.kith.triage.clusters({ depth: 2, limit: 80 });
       setTriageClusters(result.clusters || []);
       setTriageSyncStatus(`已同步 ${result.clusters?.length || 0} 个待确认/建议排除目录。`);
-      pushNotice(`待确认目录已同步：${result.clusters?.length || 0} 个。`, 'success');
+      if (options.notifySuccess !== false) {
+        pushNotice(`待确认目录已同步：${result.clusters?.length || 0} 个。`, 'success');
+      }
     } catch (error) {
       setTriageSyncStatus(`同步失败：${errorMessage(error)}`);
       pushNotice(`同步待确认目录失败：${errorMessage(error)}`, 'error');
@@ -531,6 +618,26 @@ export function App() {
     return window.kith.triage.files({ prefix, limit: 200 });
   }, []);
 
+  const refreshCapabilities = useCallback(async () => {
+    if (!daemon.running) {
+      setCapabilities(null);
+      setCapabilitiesStatus('启动本地大脑后才能读取能力节点。');
+      return;
+    }
+    setIsCapabilitiesLoading(true);
+    setCapabilitiesStatus('正在读取 Kith 能力节点...');
+    try {
+      const result = await window.kith.capabilities.list();
+      setCapabilities(result);
+      setCapabilitiesStatus(`已加载 ${result.capabilities.length} 个能力节点。`);
+    } catch (error) {
+      setCapabilitiesStatus(`能力节点读取失败：${errorMessage(error)}`);
+      pushNotice(`能力节点读取失败：${errorMessage(error)}`, 'error');
+    } finally {
+      setIsCapabilitiesLoading(false);
+    }
+  }, [daemon.running, pushNotice]);
+
   async function applyTriageDecision(prefix: string | string[], status: 'high' | 'skip') {
     const prefixes = Array.isArray(prefix)
       ? [...new Set(prefix.map((item) => item.trim()).filter(Boolean))]
@@ -540,6 +647,7 @@ export function App() {
       return;
     }
     setIsTriageReviewLoading(true);
+    setTriageSyncStatus(`正在更新 ${prefixes.length} 个${status === 'high' ? '纳入总结' : '排除噪音'}决策...`);
     try {
       const results = await Promise.all(
         prefixes.map((item) => window.kith.triage.clusterDecision({ prefix: item, status })),
@@ -549,10 +657,12 @@ export function App() {
         throw new Error(failed.error || '目录决策失败');
       }
       const updated = results.reduce((sum, result) => sum + (result.updated || 0), 0);
+      setTriageSyncStatus(`${status === 'high' ? '已纳入总结' : '已排除噪音'}：${updated} 个文件。`);
       pushNotice(`${status === 'high' ? '已纳入总结' : '已排除噪音'}：${updated} 个文件。`, 'success');
-      await refreshTriageReview();
+      await refreshTriageReview({ notifySuccess: false });
       await refreshAll(false);
     } catch (error) {
+      setTriageSyncStatus(`更新失败：${errorMessage(error)}`);
       pushNotice(`更新目录决策失败：${errorMessage(error)}`, 'error');
     } finally {
       setIsTriageReviewLoading(false);
@@ -563,10 +673,19 @@ export function App() {
     if (activeTab !== 'privacy' || !daemon.running) {
       return;
     }
-    refreshTriageReview().catch((error) => {
+    refreshTriageReview({ notifySuccess: false }).catch((error) => {
       pushNotice(`同步待确认目录失败：${errorMessage(error)}`, 'error');
     });
   }, [activeTab, daemon.running, pushNotice, refreshTriageReview]);
+
+  useEffect(() => {
+    if (activeTab !== 'diagnostics') {
+      return;
+    }
+    refreshCapabilities().catch((error) => {
+      pushNotice(`能力节点读取失败：${errorMessage(error)}`, 'error');
+    });
+  }, [activeTab, refreshCapabilities, pushNotice]);
 
   async function runOnboardingBootstrap() {
     setLoading('firstInsight', true);
@@ -645,11 +764,15 @@ export function App() {
     <>
       <AppShell
         activeTab={activeTab}
+        commandDisabled={loadState.chat}
+        commandDraft={draft}
         daemon={daemon}
         daemonStartProgress={daemonStartProgress}
         firstInsightNeedsAttention={firstInsightNeedsAttention}
         loadState={loadState}
         notices={notices}
+        onCommandDraftChange={setDraft}
+        onCommandSubmit={submitChat}
         onDismissNotice={dismissNotice}
         onRefresh={() => refreshAll(false)}
         onStartDaemon={startDaemon}
@@ -666,7 +789,8 @@ export function App() {
             onAskKith={askKith}
             onOpenFirstInsight={() => setIsFirstInsightOpen(true)}
             onOpenDashboard={openDashboard}
-            onRefresh={() => refreshAll(false)}
+            onCreateAgentHandoff={createAgentHandoff}
+            onOpenPrivacy={() => setActiveTab('privacy')}
             onReviewMemory={() => setActiveTab('memory')}
             onSuggestionAction={handleSuggestion}
             profile={profile}
@@ -736,9 +860,13 @@ export function App() {
 
         {activeTab === 'diagnostics' && (
           <DiagnosticsView
+            capabilities={capabilities}
+            capabilitiesStatus={capabilitiesStatus}
             daemon={daemon}
             events={daemonEvents}
+            isCapabilitiesLoading={isCapabilitiesLoading}
             onOpenDashboard={openDashboard}
+            onRefreshCapabilities={refreshCapabilities}
             onStopDaemon={stopDaemon}
           />
         )}
@@ -766,4 +894,37 @@ export function App() {
       )}
     </>
   );
+}
+
+function formatAgentHandoff(brief: Awaited<ReturnType<KithApi['context']['agentBrief']>>) {
+  const workspaceFiles = brief.workspace_files?.slice(0, 6).map((file) => `- ${String(file.path || file.title || file.source || 'local evidence')}`) || [];
+  const recentFiles = brief.recent_files?.slice(0, 4).map((file) => `- ${String(file.path || file.title || file.source || 'recent file')}`) || [];
+  const contextApis = brief.context_apis?.slice(0, 5).map((item) => `- ${item.name} (${item.syscall})`) || [];
+  const evidence = brief.evidence;
+  const evidenceLines = evidence ? [
+    `- status: ${evidence.status}`,
+    `- workspace files: ${evidence.workspace_file_count}`,
+    `- recent files: ${evidence.recent_file_count}`,
+    evidence.warnings.length ? `- warnings: ${evidence.warnings.join(', ')}` : '',
+  ].filter(Boolean) : [];
+  return [
+    '## Agent Context Handoff',
+    '',
+    brief.contract_version ? `Contract: ${brief.contract_version}` : '',
+    `Session key: ${brief.session_key}`,
+    brief.workspace ? `Workspace: ${brief.workspace}` : '',
+    brief.task ? `Task: ${brief.task}` : '',
+    evidenceLines.length ? '### Evidence Status' : '',
+    ...evidenceLines,
+    '',
+    '### Handoff Prompt',
+    brief.handoff_prompt,
+    '',
+    workspaceFiles.length ? '### Workspace Evidence' : '',
+    ...workspaceFiles,
+    !workspaceFiles.length && recentFiles.length ? '### Recent Evidence' : '',
+    ...(!workspaceFiles.length ? recentFiles : []),
+    contextApis.length ? '### Kith Context APIs' : '',
+    ...contextApis,
+  ].filter(Boolean).join('\n');
 }

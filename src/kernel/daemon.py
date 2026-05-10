@@ -30,6 +30,7 @@ class SysAgentKernel:
     def __init__(self, config: AgentOSConfig | None = None):
         self.config = config or load_config()
         self._running = False
+        self._shutting_down = False
         self._subsystems: dict[str, object] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -124,8 +125,8 @@ class SysAgentKernel:
 
     async def run(self) -> None:
         """Main event loop — keeps kernel alive and processes internal tasks."""
-        await self.boot()
         try:
+            await self.boot()
             while self._running:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
@@ -135,19 +136,29 @@ class SysAgentKernel:
 
     async def shutdown(self) -> None:
         """Graceful shutdown — reverse boot order. Safe to call multiple times."""
-        if not self._running:
+        if self._shutting_down:
             return
+        if not self._running and not self._subsystems:
+            return
+
+        self._shutting_down = True
         logger.info("Kernel shutting down...")
         self._running = False
 
-        for name in reversed(list(self._subsystems)):
-            sub = self._subsystems[name]
-            if hasattr(sub, "stop"):
-                logger.info("[shutdown] Stopping %s", name)
-                await sub.stop()
-
-        self._remove_pid()
-        logger.info("Kernel shutdown complete.")
+        try:
+            for name in reversed(list(self._subsystems)):
+                sub = self._subsystems.pop(name, None)
+                if not sub or not hasattr(sub, "stop"):
+                    continue
+                try:
+                    logger.info("[shutdown] Stopping %s", name)
+                    await sub.stop()
+                except Exception:
+                    logger.exception("[shutdown] Failed to stop %s", name)
+        finally:
+            self._remove_pid()
+            self._shutting_down = False
+            logger.info("Kernel shutdown complete.")
 
     # ── subsystem access (used by syscall handlers) ───────────
 
@@ -268,7 +279,8 @@ class SysAgentKernel:
         pid_path.unlink(missing_ok=True)
 
     def _install_signal_handlers(self) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        self._loop = loop
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 

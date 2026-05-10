@@ -1,16 +1,30 @@
-import type { ReactNode } from 'react';
+import { useState, type FormEvent, type ReactNode } from 'react';
 import { tabs, type DaemonStartProgress, type LoadState, type TabId } from '../types';
 import { ToastStack } from './ToastStack';
 import type { Notice } from '../types';
 
+type SpeechRecognitionConstructor = new () => {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onend: (() => void) | null;
+  onerror: (() => void) | null;
+  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+  start: () => void;
+};
+
 export function AppShell({
   activeTab,
   children,
+  commandDisabled,
+  commandDraft,
   daemon,
   daemonStartProgress,
   firstInsightNeedsAttention,
   loadState,
   notices,
+  onCommandDraftChange,
+  onCommandSubmit,
   onDismissNotice,
   onRefresh,
   onStartDaemon,
@@ -18,16 +32,21 @@ export function AppShell({
 }: {
   activeTab: TabId;
   children: ReactNode;
+  commandDisabled: boolean;
+  commandDraft: string;
   daemon: DaemonStatus;
   daemonStartProgress: DaemonStartProgress | null;
   firstInsightNeedsAttention: boolean;
   loadState: LoadState;
   notices: Notice[];
+  onCommandDraftChange: (draft: string) => void;
+  onCommandSubmit: (event?: FormEvent) => void;
   onDismissNotice: (id: string) => void;
   onRefresh: () => void;
   onStartDaemon: () => void;
   onTabChange: (tab: TabId) => void;
 }) {
+  const [isListening, setIsListening] = useState(false);
   const active = tabs.find((tab) => tab.id === activeTab) || tabs[0];
   const daemonBusy = loadState.daemon || loadState.refresh;
   const statusText = daemonBusy
@@ -38,6 +57,37 @@ export function AppShell({
       ? '索引、画像和记忆服务可用'
       : '启动后才会读取授权资料';
 
+  function startVoiceInput() {
+    const speechWindow = window as unknown as {
+      SpeechRecognition?: SpeechRecognitionConstructor;
+      webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    };
+    const Recognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      onCommandDraftChange(commandDraft || '语音输入暂不可用，请直接输入：帮我把这个想法整理成一个可继续编辑的 Artifact。');
+      return;
+    }
+
+    const recognition = new Recognition();
+    recognition.lang = 'zh-CN';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .flatMap((result) => Array.from(result))
+        .map((item) => item.transcript)
+        .join('')
+        .trim();
+      if (transcript) {
+        onCommandDraftChange(commandDraft ? `${commandDraft} ${transcript}` : transcript);
+      }
+    };
+    recognition.onerror = () => setIsListening(false);
+    recognition.onend = () => setIsListening(false);
+    setIsListening(true);
+    recognition.start();
+  }
+
   return (
     <>
       <main className="shell">
@@ -46,11 +96,11 @@ export function AppShell({
             <div className="brand">
               <div className="orb" />
               <div>
-                <p className="eyebrow">Kith</p>
-                <h1>本地小助理</h1>
+                <p className="eyebrow">Private AI Memory</p>
+                <h1>Kith</h1>
               </div>
             </div>
-            <p className="mission">一个安静陪你整理本地线索的小助理。只在你授权的范围里理解、记住，并轻轻提醒下一步。</p>
+            <p className="mission">Kith remembers what matters on your computer, cites the sources it used, and helps you continue where you left off.</p>
           </div>
 
           <div className="sidebar-nav-scroll">
@@ -109,7 +159,7 @@ export function AppShell({
         <section className="content">
           <header className="topbar">
             <div>
-              <p className="eyebrow">Kith personal space</p>
+              <p className="eyebrow">Local memory · Under your control</p>
               <h2>{active.label}</h2>
               <small>{active.hint}</small>
             </div>
@@ -120,6 +170,34 @@ export function AppShell({
           {children}
         </section>
       </main>
+      <form className="global-command-bar" onSubmit={onCommandSubmit}>
+        <div className="command-spark" aria-hidden="true">K</div>
+        <textarea
+          aria-label="Ask Kith about your approved local context"
+          disabled={commandDisabled}
+          onChange={(event) => onCommandDraftChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
+              onCommandSubmit();
+            }
+          }}
+          placeholder="Ask Kith... 例如：我最近在做什么？哪些文件能解释这个项目？"
+          rows={1}
+          value={commandDraft}
+        />
+        <button
+          aria-label="语音输入入口"
+          className={`voice-button ${isListening ? 'listening' : ''}`}
+          onClick={startVoiceInput}
+          type="button"
+        >
+          ◉
+        </button>
+        <button className="primary" disabled={commandDisabled || !commandDraft.trim()} type="submit">
+          {commandDisabled ? 'Thinking' : 'Ask'}
+        </button>
+      </form>
       <ToastStack notices={notices} onDismiss={onDismissNotice} />
     </>
   );

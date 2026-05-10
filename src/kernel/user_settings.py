@@ -51,13 +51,19 @@ def normalize_openai_base_url(raw_host: str, raw_path: str = "") -> str:
     path = str(raw_path or "").strip()
     if not host:
         return ""
-    if path and not host.endswith(path.rstrip("/")) and path != "/chat/completions":
-        host = f"{host}/{path.lstrip('/')}".rstrip("/")
-    for suffix in ("/chat/completions", "/responses", "/completions"):
-        if host.endswith(suffix):
-            host = host[: -len(suffix)]
-            break
-    return host.rstrip("/")
+
+    def strip_completion_endpoint(value: str) -> str:
+        base = value.rstrip("/")
+        for suffix in ("/chat/completions", "/responses", "/completions"):
+            if base.endswith(suffix):
+                return base[: -len(suffix)].rstrip("/")
+        return base
+
+    host = strip_completion_endpoint(host)
+    normalized_path = path.strip("/").rstrip("/")
+    if normalized_path and path != "/chat/completions" and not host.endswith(f"/{normalized_path}"):
+        host = strip_completion_endpoint(f"{host}/{normalized_path}")
+    return strip_completion_endpoint(host)
 
 
 def _read_yaml_config(path: Path) -> dict[str, Any]:

@@ -32,6 +32,8 @@ class SyscallType(str, Enum):
     # Context / session management
     CONTEXT_SAVE = "context.save"
     CONTEXT_LOAD = "context.load"
+    CONTEXT_AGENT_BRIEF = "context.agent_brief"
+    CAPABILITIES_LIST = "capabilities.list"
 
     # Agent management
     AGENT_SUBMIT = "agent.submit"
@@ -80,6 +82,8 @@ SYSCALL_TO_AGENT: dict[str, str] = {
     SyscallType.KNOWLEDGE_STORE: "knowledge_store",
     SyscallType.CONTEXT_SAVE: "context",
     SyscallType.CONTEXT_LOAD: "context",
+    SyscallType.CONTEXT_AGENT_BRIEF: "agent_context_brief",
+    SyscallType.CAPABILITIES_LIST: "capabilities_list",
     SyscallType.AGENT_SUBMIT: "agent_submit",
     SyscallType.AGENT_STATUS: "agent_task_status",
     SyscallType.REPORT_DAILY: "report_generator",
@@ -94,6 +98,7 @@ SYSCALL_TO_AGENT: dict[str, str] = {
     SyscallType.SOURCES_GET: "assistant",
     SyscallType.SOURCES_CONFIGURE: "assistant",
     SyscallType.SETTINGS_MODEL: "assistant",
+    SyscallType.SETTINGS_MODEL_GET: "assistant",
     SyscallType.ONBOARDING_BOOTSTRAP: "assistant",
     SyscallType.ASSISTANT_FIRST_INSIGHT: "assistant",
     SyscallType.ANALYZE_BEHAVIOR: "behavior_analyzer",
@@ -114,12 +119,30 @@ class SyscallRequest:
     priority: int = 1
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self))
+        return json.dumps(asdict(self), default=str, ensure_ascii=False)
 
     @classmethod
     def from_json(cls, data: str | bytes) -> SyscallRequest:
         d = json.loads(data)
-        return cls(**d)
+        if not isinstance(d, dict):
+            raise ValueError("syscall request must be a JSON object")
+        params = d.get("params")
+        try:
+            timestamp = float(d.get("timestamp", time.time()))
+        except (TypeError, ValueError):
+            timestamp = time.time()
+        try:
+            priority = int(d.get("priority", 1))
+        except (TypeError, ValueError):
+            priority = 1
+        return cls(
+            call_type=str(d.get("call_type") or ""),
+            params=params if isinstance(params, dict) else {},
+            caller=str(d.get("caller") or "unknown"),
+            request_id=str(d.get("request_id") or uuid.uuid4().hex[:12]),
+            timestamp=timestamp,
+            priority=priority,
+        )
 
 
 @dataclass
@@ -133,9 +156,24 @@ class SyscallResponse:
     timestamp: float = field(default_factory=time.time)
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self))
+        return json.dumps(asdict(self), default=str, ensure_ascii=False)
 
     @classmethod
     def from_json(cls, data: str | bytes) -> SyscallResponse:
         d = json.loads(data)
-        return cls(**d)
+        try:
+            elapsed_ms = float(d.get("elapsed_ms", 0))
+        except (TypeError, ValueError):
+            elapsed_ms = 0
+        try:
+            timestamp = float(d.get("timestamp", time.time()))
+        except (TypeError, ValueError):
+            timestamp = time.time()
+        return cls(
+            request_id=str(d.get("request_id") or ""),
+            success=d.get("success") is True,
+            data=d.get("data"),
+            error=None if d.get("error") is None else str(d.get("error")),
+            elapsed_ms=elapsed_ms,
+            timestamp=timestamp,
+        )

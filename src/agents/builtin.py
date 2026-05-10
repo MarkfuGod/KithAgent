@@ -7,7 +7,11 @@ common tasks that any external caller might need.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
+import time
+from pathlib import Path
 from typing import Any
 
 from src.agents.base import AgentTask, BaseAgent
@@ -57,10 +61,16 @@ class KnowledgeStoreAgent(BaseAgent):
 
     async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
         memory = context["memory"]
+        category = str(task.input_data.get("category") or "").strip()
+        content = str(task.input_data.get("content") or "").strip()
+        if not category:
+            raise ValueError("knowledge.store requires non-empty 'category'")
+        if not content:
+            raise ValueError("knowledge.store requires non-empty 'content'")
         await memory.store_knowledge(
             knowledge_id=task.input_data.get("id", task.task_id),
-            category=task.input_data["category"],
-            content=task.input_data["content"],
+            category=category,
+            content=content,
             source_path=task.input_data.get("source", ""),
             metadata=task.input_data.get("metadata"),
         )
@@ -87,6 +97,190 @@ class ContextAgent(BaseAgent):
         else:
             ctx = await memory.load_context(session_id)
             return {"session_id": session_id, "context": ctx}
+
+
+class CapabilitiesListAgent(BaseAgent):
+    """Expose Kith's gateway-style capabilities as explicit, auditable nodes."""
+    name = "capabilities_list"
+
+    async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
+        return {
+            "contract_version": "kith.capabilities.v1",
+            "version": "0.1",
+            "generated_at": time.time(),
+            "capabilities": [
+                {
+                    "id": "local_memory.profile",
+                    "status": "available",
+                    "sensitivity": "personal",
+                    "commands": ["profile.summary", "memory.review", "memory.feedback"],
+                    "permission": "User can review, confirm, reject, or hide memories.",
+                },
+                {
+                    "id": "local_evidence.files",
+                    "status": "available",
+                    "sensitivity": "source_scoped",
+                    "commands": ["sources.get", "file.search", "file.read", "knowledge.query"],
+                    "permission": "Only user-approved source folders are indexed.",
+                },
+                {
+                    "id": "agent_context.handoff",
+                    "status": "available",
+                    "sensitivity": "workspace_context",
+                    "commands": ["context.agent_brief", "report.brief", "report.project"],
+                    "permission": "Callers receive source-backed context, not hidden filesystem access.",
+                },
+                {
+                    "id": "model_routing.tasks",
+                    "status": "available",
+                    "sensitivity": "configuration",
+                    "commands": ["settings.model", "settings.model.get"],
+                    "permission": "Local/API model routing remains explicit and user controlled.",
+                },
+                {
+                    "id": "external_events.normalized",
+                    "status": "planned",
+                    "sensitivity": "platform_messages",
+                    "commands": ["external.event.ingest"],
+                    "permission": "Future messaging/device events should be normalized before scheduling.",
+                },
+                {
+                    "id": "media_evidence.ingest",
+                    "status": "planned",
+                    "sensitivity": "media",
+                    "commands": ["media.ingest", "media.transcribe", "media.summarize"],
+                    "permission": "Media should become local evidence objects with retention controls.",
+                },
+                {
+                    "id": "device_nodes.capture",
+                    "status": "planned_sensitive",
+                    "sensitivity": "camera_microphone_screen_location",
+                    "commands": ["screen.snapshot", "camera.snap", "mic.record", "browser.current_tab"],
+                    "permission": "Must require explicit opt-in, foreground indicators, payload limits, and audit logs.",
+                },
+            ],
+        }
+
+
+class AgentContextBriefAgent(BaseAgent):
+    """Build a Hermes-style session-aware handoff for external agents."""
+    name = "agent_context_brief"
+
+    async def execute(self, task: AgentTask, context: dict[str, Any]) -> Any:
+        memory = context.get("memory")
+        caller = str(task.input_data.get("caller") or task.caller or "external-agent")
+        workspace = str(task.input_data.get("workspace") or "").strip()
+        user_task = str(task.input_data.get("task") or "").strip()
+        session_id = str(task.input_data.get("session_id") or task.task_id)
+        surface = str(task.input_data.get("surface") or "agent")
+        workspace_path = _expand_path(workspace) if workspace else ""
+        workspace_hash = hashlib.sha1((workspace_path or "global").encode()).hexdigest()[:10]
+        session_key = f"kith:{surface}:{caller}:{workspace_hash}:{session_id}"
+
+        warnings: list[str] = []
+        facts = await _safe_memory_list(memory, "list_profile_facts", warnings, limit=20)
+        recent = await _safe_memory_list(memory, "get_recently_modified_files", warnings, hours=168, limit=50)
+        context_briefs = await _safe_memory_list(memory, "query_knowledge", warnings, category="context_brief", limit=2)
+        behavior = await _safe_memory_list(memory, "query_knowledge", warnings, category="behavior_insight", limit=2)
+
+        workspace_files = await _safe_memory_list(
+            memory,
+            "list_workspace_files",
+            warnings,
+            workspace_path,
+            limit=24,
+        ) if workspace_path else []
+        if not workspace_files and workspace_path:
+            workspace_files = [
+                file for file in recent
+                if str(file.get("path", "")).startswith(workspace_path)
+            ][:24]
+
+        confirmed = [fact for fact in facts if fact.get("status") == "confirmed"]
+        inferred = [fact for fact in facts if fact.get("status") == "inferred"]
+        payload = {
+            "contract_version": "kith.context_brief.v1",
+            "session_key": session_key,
+            "session": {
+                "key": session_key,
+                "source_type": "desktop" if surface == "desktop" else "agent",
+                "platform": surface,
+                "caller": caller,
+                "workspace_hash": workspace_hash,
+                "session_id": session_id,
+            },
+            "caller": caller,
+            "surface": surface,
+            "workspace": workspace_path or workspace,
+            "task": user_task,
+            "generated_at": time.time(),
+            "evidence_policy": {
+                "scope": "approved_sources_only",
+                "workspace_scoped": bool(workspace_path),
+                "rule": "Use only returned evidence unless the user explicitly asks Kith to search more.",
+            },
+            "evidence": {
+                "status": _evidence_status(memory, workspace_path, workspace_files),
+                "workspace_file_count": len(workspace_files),
+                "recent_file_count": len(recent),
+                "profile_fact_count": len(facts),
+                "warnings": warnings,
+            },
+            "context_apis": [
+                {"name": "kith_brief", "syscall": "context.agent_brief", "status": "available"},
+                {"name": "kith_search_files", "syscall": "file.search", "status": "available"},
+                {"name": "kith_read_evidence", "syscall": "file.read", "status": "available"},
+                {"name": "kith_profile", "syscall": "profile.summary", "status": "available"},
+                {"name": "kith_recent_focus", "syscall": "assistant.insights", "status": "available"},
+            ],
+            "profile": {
+                "confirmed_facts": confirmed[:8],
+                "inferred_facts": inferred[:8],
+            },
+            "recent_files": recent[:12],
+            "workspace_files": workspace_files,
+            "context_briefs": [_decode_knowledge(entry) for entry in context_briefs],
+            "behavior_insights": [_decode_knowledge(entry) for entry in behavior],
+        }
+        payload["handoff_prompt"] = self._handoff_prompt(payload)
+        return payload
+
+    def _handoff_prompt(self, payload: dict[str, Any]) -> str:
+        workspace_files = payload["workspace_files"][:8]
+        recent_files = payload["recent_files"][:8]
+        facts = payload["profile"]["confirmed_facts"] or payload["profile"]["inferred_facts"]
+        lines = [
+            "Use this Kith local-memory brief before acting.",
+            f"Contract: {payload.get('contract_version', 'kith.context_brief.v1')}",
+            f"Session key: {payload['session_key']}",
+            f"Caller: {payload['caller']}",
+        ]
+        if payload.get("workspace"):
+            lines.append(f"Workspace: {payload['workspace']}")
+        if payload.get("task"):
+            lines.append(f"User task: {payload['task']}")
+        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        if evidence.get("status"):
+            lines.append(f"Evidence status: {evidence['status']}")
+        if workspace_files:
+            lines.append("Important workspace files:")
+            lines.extend(f"- {file.get('path')}" for file in workspace_files)
+        elif recent_files:
+            lines.append("Recent local files:")
+            lines.extend(f"- {file.get('path')}" for file in recent_files)
+        if facts:
+            lines.append("User memory signals:")
+            lines.extend(f"- {fact.get('statement')}" for fact in facts[:6])
+        context_apis = payload.get("context_apis") or []
+        if context_apis:
+            lines.append("Available Kith context APIs:")
+            lines.extend(
+                f"- {item.get('name')} via {item.get('syscall')}"
+                for item in context_apis[:6]
+                if isinstance(item, dict)
+            )
+        lines.append("Rules: cite local evidence when you use it; ask before broad scanning; do not assume files outside approved sources were searched.")
+        return "\n".join(lines)
 
 
 class FileListAgent(BaseAgent):
@@ -210,6 +404,56 @@ class SystemStatusAgent(BaseAgent):
         return status
 
 
+def _expand_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+async def _safe_memory_list(
+    memory: Any,
+    method_name: str,
+    warnings: list[str],
+    *args: Any,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    if not memory:
+        warning = "memory_unavailable"
+        if warning not in warnings:
+            warnings.append(warning)
+        return []
+    method = getattr(memory, method_name, None)
+    if not callable(method):
+        warnings.append(f"{method_name}_unavailable")
+        return []
+    try:
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if isinstance(result, list) else []
+    except Exception as exc:
+        warnings.append(f"{method_name}_failed:{exc}")
+        return []
+
+
+def _evidence_status(memory: Any, workspace_path: str, workspace_files: list[dict[str, Any]]) -> str:
+    if not memory:
+        return "memory_unavailable"
+    if not workspace_path:
+        return "no_workspace"
+    if workspace_files:
+        return "workspace_evidence"
+    return "empty_workspace"
+
+
+def _decode_knowledge(entry: dict[str, Any]) -> Any:
+    content = entry.get("content")
+    if not isinstance(content, str):
+        return entry
+    try:
+        return json.loads(content)
+    except Exception:
+        return content
+
+
 from src.agents.summarizer import SummarizerAgent
 from src.agents.analyzer import BehaviorAnalyzerAgent
 from src.agents.prioritizer import PriorityClassifierAgent
@@ -228,6 +472,8 @@ BUILTIN_AGENTS: list[BaseAgent] = [
     KnowledgeQueryAgent(),
     KnowledgeStoreAgent(),
     ContextAgent(),
+    CapabilitiesListAgent(),
+    AgentContextBriefAgent(),
     SystemStatusAgent(),
     # v0.2 — LLM-powered smart agents
     SummarizerAgent(),

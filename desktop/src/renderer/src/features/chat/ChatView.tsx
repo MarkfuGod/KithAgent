@@ -1,13 +1,7 @@
 import type { FormEvent } from 'react';
 import { valueText } from '../../lib/format';
 import type { ChatMessageView, ChatProgress } from '../../types';
-
-export const starterPrompts = [
-  '/profile 你现在如何理解我？',
-  '/focus 我最近的注意力在哪里？',
-  '/brief 总结我的工作、学习和生活线索。',
-  '/plan 基于今日建议，安排接下来 30 分钟。',
-];
+import { starterPrompts } from './starterPrompts';
 
 export function ChatView({
   draft,
@@ -26,8 +20,8 @@ export function ChatView({
   messages: ChatMessageView[];
   onClear: () => void;
   onDraftChange: (draft: string) => void;
-  onRetry: () => void;
-  onSubmit: (event?: FormEvent) => void;
+  onRetry: () => void | Promise<void>;
+  onSubmit: (event?: FormEvent) => void | Promise<void>;
   progress: ChatProgress | null;
   streamedAnswer: string;
   traceEvents: DaemonEvent[];
@@ -36,9 +30,9 @@ export function ChatView({
     <section className="chat-console">
       <div className="console-hero">
         <div>
-          <p className="eyebrow">Talk with Kith</p>
-          <h3>把想法说给 Kith，它会先温柔回应，需要时再整理本地线索。</h3>
-          <p>你可以直接描述今天的困惑、计划或想整理的内容。Kith 会在需要画像、记忆或洞察时，轻轻展开处理过程。</p>
+          <p className="eyebrow">Ask My Computer</p>
+          <h3>Ask Kith about your files, projects, notes, and recent work.</h3>
+          <p>Kith searches only the sources you allowed, explains the context it used, and keeps the retrieval trail visible.</p>
         </div>
         <button className="ghost" onClick={onClear} type="button">清空对话</button>
       </div>
@@ -84,9 +78,9 @@ export function ChatView({
         )}
       </div>
 
-      {messages.some((message) => message.failed) && (
-        <button className="ghost retry-button" onClick={onRetry} type="button">
-          重试上一条问题
+      {messages.some((message) => message.failed && message.retryable !== false) && (
+        <button className="ghost retry-button" disabled={isLoading} onClick={onRetry} type="button">
+          {isLoading ? '正在重试...' : '重新提交上一条问题'}
         </button>
       )}
 
@@ -102,11 +96,11 @@ export function ChatView({
               onSubmit();
             }
           }}
-          placeholder="输入一个意图，例如：帮我判断今天最该推进什么。Shift + Enter 换行。"
+          placeholder="Ask a local question, for example: what should I continue next? Shift + Enter for a new line."
           rows={3}
         />
         <button className="primary" disabled={isLoading || !draft.trim()} type="submit">
-          {isLoading ? '分析中...' : '执行'}
+          {isLoading ? 'Searching...' : 'Ask Kith'}
         </button>
       </form>
     </section>
@@ -239,6 +233,7 @@ function stageLabel(stage: string) {
     finalize: '整理来源',
     fallback: '备用回答',
     'backend-skills': '请求后端技能',
+    handoff: '生成上下文包',
   };
   return labels[stage] || stage;
 }

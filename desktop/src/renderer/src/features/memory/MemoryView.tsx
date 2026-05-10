@@ -22,25 +22,25 @@ export function MemoryView({
     <section className="memory-page">
       <article className="panel profile-panel">
         <div>
-          <p className="eyebrow">关于我</p>
-          <h3>Kith 当前对你的理解</h3>
-          <p>画像不是永久标签。你可以随时重新生成，也可以逐条确认、纠正或隐藏记忆。</p>
+          <p className="eyebrow">Correctable memory</p>
+          <h3>Things Kith thinks are true</h3>
+          <p>Memory is not a permanent label. Confirm what is right, hide what is noisy, and reject anything Kith misunderstood.</p>
         </div>
         <button className="primary" onClick={onGenerateProfile} disabled={isLoading} type="button">
-          {isLoading ? '更新中...' : '生成 / 更新我的画像'}
+          {isLoading ? 'Updating...' : 'Regenerate memory'}
         </button>
         {profileOverview ? (
           <ProfileOverview overview={profileOverview} raw={profile.profile} />
         ) : (
-          <p className="empty">还没有画像。完成 First Insight 后，我会基于已授权资料建立第一版理解。</p>
+          <p className="empty">No profile yet. Finish First Insight to create the first correctable understanding from approved sources.</p>
         )}
       </article>
 
       <article className="panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">可校正记忆</p>
-            <h3>{facts.length} 条画像记忆，{confirmedFacts} 条已确认</h3>
+            <p className="eyebrow">Review queue</p>
+            <h3>{facts.length} memories, {confirmedFacts} confirmed</h3>
           </div>
         </div>
         <FactList facts={facts} onUpdate={onUpdateFact} />

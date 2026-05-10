@@ -34,6 +34,12 @@ contextBridge.exposeInMainWorld('kith', {
     review: (payload) => invoke('memory:review', payload),
     feedback: (payload) => invoke('memory:feedback', payload),
   },
+  capabilities: {
+    list: () => invoke('capabilities:list'),
+  },
+  context: {
+    agentBrief: (payload) => invoke('context:agentBrief', payload),
+  },
   sources: {
     get: () => invoke('sources:get'),
     configure: (payload) => invoke('sources:configure', payload),

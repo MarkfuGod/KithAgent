@@ -591,13 +591,18 @@ class MemoryStore:
         return await asyncio.to_thread(_do_search)
 
     async def update_file_priority(self, path: str, priority: int) -> None:
-        async with self._lock:
-            assert self._db
-            self._db.execute(
+        db = self._db
+        assert db
+
+        def _run() -> None:
+            db.execute(
                 "UPDATE file_index SET priority = ? WHERE path = ?",
                 (priority, path),
             )
-            self._db.commit()
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
 
     async def batch_update_priorities(self, updates: list[tuple[str, int]]) -> None:
         """Bulk update priorities: [(path, priority), ...]"""
@@ -619,18 +624,24 @@ class MemoryStore:
 
     async def get_file_modification_stats(self) -> list[dict]:
         """Aggregate file modification data for behavior analysis."""
-        assert self._db
-        rows = self._db.execute(
-            """SELECT
-                 file_type,
-                 COUNT(*) as file_count,
-                 AVG(size_bytes) as avg_size,
-                 MAX(modified_at) as latest_modified,
-                 MIN(modified_at) as earliest_modified
-               FROM file_index
-               GROUP BY file_type
-               ORDER BY file_count DESC"""
-        ).fetchall()
+        db = self._db
+        assert db
+
+        def _run() -> list:
+            return db.execute(
+                """SELECT
+                     file_type,
+                     COUNT(*) as file_count,
+                     AVG(size_bytes) as avg_size,
+                     MAX(modified_at) as latest_modified,
+                     MIN(modified_at) as earliest_modified
+                   FROM file_index
+                   GROUP BY file_type
+                   ORDER BY file_count DESC"""
+            ).fetchall()
+
+        async with self._lock:
+            rows = await asyncio.to_thread(_run)
         return [
             {
                 "file_type": r[0], "file_count": r[1], "avg_size": r[2],
@@ -641,17 +652,56 @@ class MemoryStore:
 
     async def get_recently_modified_files(self, hours: float = 24, limit: int = 100) -> list[dict]:
         """Files modified in the last N hours, for behavior analysis."""
-        assert self._db
+        db = self._db
+        assert db
         cutoff = time.time() - (hours * 3600)
-        rows = self._db.execute(
-            """SELECT path, file_type, modified_at, size_bytes, priority
-               FROM file_index WHERE modified_at > ?
-               ORDER BY modified_at DESC LIMIT ?""",
-            (cutoff, limit),
-        ).fetchall()
+
+        def _run() -> list:
+            return db.execute(
+                """SELECT path, file_type, modified_at, size_bytes, priority
+                   FROM file_index WHERE modified_at > ?
+                   ORDER BY modified_at DESC LIMIT ?""",
+                (cutoff, limit),
+            ).fetchall()
+
+        async with self._lock:
+            rows = await asyncio.to_thread(_run)
         return [
             {"path": r[0], "file_type": r[1], "modified_at": r[2], "size_bytes": r[3], "priority": r[4]}
             for r in rows
+        ]
+
+    async def list_workspace_files(self, workspace_path: str, limit: int = 24) -> list[dict[str, Any]]:
+        """Return high-signal indexed files for an approved workspace prefix."""
+        assert self._db
+        prefix = str(workspace_path or "").strip()
+        if not prefix:
+            return []
+        rows = self._db.execute(
+            """SELECT path, file_type, size_bytes, modified_at, priority, triage_status,
+                      COALESCE(NULLIF(semantic_summary, ''), summary, '') as summary
+               FROM file_index
+               WHERE path = ? OR path LIKE ?
+               ORDER BY
+                 CASE WHEN triage_status = 'high' THEN 0
+                      WHEN triage_status = 'medium' THEN 1
+                      WHEN triage_status = 'low' THEN 2
+                      ELSE 3 END,
+                 modified_at DESC
+               LIMIT ?""",
+            (prefix, f"{prefix}/%", max(1, min(int(limit or 24), 200))),
+        ).fetchall()
+        return [
+            {
+                "path": row[0],
+                "file_type": row[1],
+                "size_bytes": row[2],
+                "modified_at": row[3],
+                "priority": row[4],
+                "triage_status": row[5],
+                "summary": row[6],
+            }
+            for row in rows
         ]
 
     async def get_directory_activity(self, depth: int = 3) -> list[dict]:
@@ -1438,21 +1488,26 @@ class MemoryStore:
             return changed
 
     async def remove_file(self, path: str) -> None:
-        async with self._lock:
-            assert self._db
-            ids = [r[0] for r in self._db.execute(
+        db = self._db
+        assert db
+
+        def _run() -> None:
+            ids = [r[0] for r in db.execute(
                 "SELECT id FROM document_chunks WHERE path = ?",
                 (path,),
             ).fetchall()]
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 try:
-                    self._db.execute(f"DELETE FROM document_chunks_fts WHERE id IN ({placeholders})", ids)
+                    db.execute(f"DELETE FROM document_chunks_fts WHERE id IN ({placeholders})", ids)
                 except sqlite3.OperationalError:
                     pass
-                self._db.execute(f"DELETE FROM document_chunks WHERE id IN ({placeholders})", ids)
-            self._db.execute("DELETE FROM file_index WHERE path = ?", (path,))
-            self._db.commit()
+                db.execute(f"DELETE FROM document_chunks WHERE id IN ({placeholders})", ids)
+            db.execute("DELETE FROM file_index WHERE path = ?", (path,))
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
             self._cache.invalidate(f"file:{path}")
 
     # ── Knowledge operations ──────────────────────────────────
@@ -1476,29 +1531,39 @@ class MemoryStore:
             knowledge_id = kid
         if knowledge_id is None:
             raise TypeError("store_knowledge requires 'knowledge_id'")
-        async with self._lock:
+        db = self._db
+        assert db
+
+        def _run() -> None:
             now = time.time()
-            assert self._db
-            self._db.execute(
+            db.execute(
                 """INSERT OR REPLACE INTO knowledge
                    (id, category, content, source_path, created_at, updated_at, metadata)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (knowledge_id, category, content, source_path, now, now, json.dumps(metadata or {})),
             )
-            self._db.commit()
+            db.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_run)
 
     async def query_knowledge(self, category: str | None = None, limit: int = 50) -> list[dict]:
-        assert self._db
-        if category:
-            rows = self._db.execute(
-                "SELECT id, category, content, source_path FROM knowledge WHERE category = ? ORDER BY updated_at DESC LIMIT ?",
-                (category, limit),
-            ).fetchall()
-        else:
-            rows = self._db.execute(
+        db = self._db
+        assert db
+
+        def _run() -> list:
+            if category:
+                return db.execute(
+                    "SELECT id, category, content, source_path FROM knowledge WHERE category = ? ORDER BY updated_at DESC LIMIT ?",
+                    (category, limit),
+                ).fetchall()
+            return db.execute(
                 "SELECT id, category, content, source_path FROM knowledge ORDER BY updated_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+
+        async with self._lock:
+            rows = await asyncio.to_thread(_run)
         return [{"id": r[0], "category": r[1], "content": r[2], "source": r[3]} for r in rows]
 
     # ── Correctable profile facts ──────────────────────────────

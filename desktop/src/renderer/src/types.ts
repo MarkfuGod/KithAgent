@@ -1,10 +1,10 @@
 export const tabs = [
-  { id: 'today', label: '今日', hint: '建议与本地理解' },
-  { id: 'chat', label: '对话', hint: '带上下文追问' },
-  { id: 'memory', label: '记忆', hint: '确认、纠正、隐藏' },
-  { id: 'privacy', label: '资料权限', hint: '来源与分诊' },
-  { id: 'settings', label: '设置', hint: '模型配置' },
-  { id: 'diagnostics', label: '诊断', hint: '状态、事件、高级工具' },
+  { id: 'today', label: 'Today', hint: '继续、简报、下一步' },
+  { id: 'chat', label: 'Ask', hint: '向授权资料提问' },
+  { id: 'memory', label: 'Memory', hint: '确认、纠正、隐藏' },
+  { id: 'privacy', label: 'Privacy', hint: '来源、跳过、可见范围' },
+  { id: 'settings', label: 'Models', hint: '本地 / API / 路由' },
+  { id: 'diagnostics', label: 'Advanced', hint: '状态、事件、开发工具' },
 ] as const;
 
 export type TabId = (typeof tabs)[number]['id'];
@@ -39,6 +39,7 @@ export type ChatMessageView = {
   content: string;
   sources?: Array<Record<string, unknown>>;
   failed?: boolean;
+  retryable?: boolean;
 };
 
 export type ChatProgress = {

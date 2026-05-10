@@ -1,24 +1,13 @@
-const DEFAULT_CHAT_PATH = '/chat/completions';
+import { DEFAULT_CHAT_PATH, normalizeApiBaseUrl } from './apiBaseUrl.js';
+
+export { normalizeApiBaseUrl } from './apiBaseUrl.js';
+
+const DEFAULT_DESKTOP_LLM_TIMEOUT_MS = 90000;
 const SAVED_DESKTOP_MODEL_SCRIPT = `
 import json
 from src.kernel.user_settings import load_desktop_runtime_model_settings
 print(json.dumps(load_desktop_runtime_model_settings(), ensure_ascii=False))
 `;
-
-function normalizeApiBaseUrl(rawHost, rawPath = DEFAULT_CHAT_PATH) {
-  let host = String(rawHost || '').trim().replace(/\/+$/, '');
-  const path = String(rawPath || '').trim();
-  if (!host) return '';
-  if (path && path !== DEFAULT_CHAT_PATH && !host.endsWith(path.replace(/\/+$/, ''))) {
-    host = `${host}/${path.replace(/^\/+/, '')}`.replace(/\/+$/, '');
-  }
-  for (const suffix of ['/chat/completions', '/responses', '/completions']) {
-    if (host.endsWith(suffix)) {
-      return host.slice(0, -suffix.length).replace(/\/+$/, '');
-    }
-  }
-  return host;
-}
 
 function completionEndpoint(settings) {
   const baseUrl = normalizeApiBaseUrl(settings.base_url || settings.api_host, settings.api_path);
@@ -40,6 +29,35 @@ function assertHeaderSafe(value, label) {
   for (let index = 0; index < value.length; index += 1) {
     if (value.charCodeAt(index) > 255) {
       throw new Error(`${label} 包含非 ASCII 字符。请检查是否把中文说明或别的文本填进了 API Key。`);
+    }
+  }
+}
+
+function timeoutError(label, timeoutMs) {
+  return new Error(`${label} timed out after ${timeoutMs}ms`);
+}
+
+async function withDeadline(promise, controller, deadlineAt, label) {
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) {
+    controller.abort(timeoutError(label, 0));
+    throw timeoutError(label, 0);
+  }
+  let timeout = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          const error = timeoutError(label, remainingMs);
+          controller.abort(error);
+          reject(error);
+        }, remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
     }
   }
 }
@@ -216,7 +234,11 @@ async function streamDesktopCompletion({ settings, messages, requestId, sendEven
     },
   });
 
-  const response = await fetch(endpoint, {
+  const timeoutMs = Number(settings.timeout_ms || settings.request_timeout_ms || DEFAULT_DESKTOP_LLM_TIMEOUT_MS)
+    || DEFAULT_DESKTOP_LLM_TIMEOUT_MS;
+  const deadlineAt = Date.now() + Math.max(1, timeoutMs);
+  const controller = new AbortController();
+  const response = await withDeadline(fetch(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -229,7 +251,8 @@ async function streamDesktopCompletion({ settings, messages, requestId, sendEven
       temperature: 0.35,
       max_tokens: Number(settings.max_output_tokens || 1200) || 1200,
     }),
-  });
+    signal: controller.signal,
+  }), controller, deadlineAt, 'Desktop LLM request');
 
   if (!response.ok || !response.body) {
     const body = await response.text().catch(() => '');
@@ -266,7 +289,12 @@ async function streamDesktopCompletion({ settings, messages, requestId, sendEven
   };
 
   while (true) {
-    const { value, done } = await reader.read();
+    const { value, done } = await withDeadline(
+      reader.read(),
+      controller,
+      deadlineAt,
+      'Desktop LLM stream',
+    );
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     buffer = parseSseLines(buffer, handleData);

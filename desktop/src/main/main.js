@@ -1,16 +1,25 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_CHAT_PATH, normalizeApiBaseUrl } from './apiBaseUrl.js';
 import { createDaemonBridge, DEFAULT_DAEMON_BASE_URL } from './daemon.js';
 import { runFrontendChat } from './frontendChat.js';
+import { parseSseEvent } from './sse.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '../../..');
 const daemon = createDaemonBridge({ repoRoot });
+const SHORT_SYSCALL_TIMEOUT_MS = 30000;
+const INSIGHTS_HTTP_TIMEOUT_MS = 45000;
+const INSIGHTS_UNIX_TIMEOUT_MS = 60000;
 const LONG_SYSCALL_TIMEOUT_MS = 180000;
 const ONBOARDING_SYSCALL_TIMEOUT_MS = 600000;
+const DASHBOARD_FETCH_TIMEOUT_MS = 15000;
 const DASHBOARD_BASE_URL = 'http://127.0.0.1:7438';
-const DEFAULT_CHAT_PATH = '/chat/completions';
+const DEV_SERVER_URL = 'http://127.0.0.1:5173';
+const RENDERER_INDEX_PATH = join(repoRoot, 'desktop/dist/renderer/index.html');
+const MEMORY_FACT_STATUSES = new Set(['inferred', 'confirmed', 'rejected', 'hidden']);
 const MODEL_SETTINGS_GET_SCRIPT = `
 import json
 from src.kernel.user_settings import load_model_settings
@@ -101,19 +110,111 @@ print(json.dumps({
 let mainWindow = null;
 let eventAbortController = null;
 
-function normalizeApiBaseUrl(rawHost, rawPath = DEFAULT_CHAT_PATH) {
-  let host = String(rawHost || '').trim().replace(/\/+$/, '');
-  const path = String(rawPath || '').trim();
-  if (!host) return '';
-  if (path && path !== DEFAULT_CHAT_PATH && !host.endsWith(path.replace(/\/+$/, ''))) {
-    host = `${host}/${path.replace(/^\/+/, '')}`.replace(/\/+$/, '');
+function ensurePlainObject(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} 格式不正确。`);
   }
-  for (const suffix of ['/chat/completions', '/responses', '/completions']) {
-    if (host.endsWith(suffix)) {
-      return host.slice(0, -suffix.length).replace(/\/+$/, '');
-    }
+  return value;
+}
+
+function boundedString(value, label, maxLength = 2000, required = false) {
+  const text = String(value ?? '').trim();
+  if (required && !text) {
+    throw new Error(`${label} 不能为空。`);
   }
-  return host;
+  if (text.length > maxLength) {
+    throw new Error(`${label} 过长。`);
+  }
+  return text;
+}
+
+function boundedNumber(value, fallback, min, max, label) {
+  const number = Number(value ?? fallback);
+  if (!Number.isFinite(number)) {
+    throw new Error(`${label} 必须是数字。`);
+  }
+  return Math.max(min, Math.min(Math.round(number), max));
+}
+
+function assertHeaderSafe(value, label) {
+  if (/[\r\n]/.test(value) || Array.from(value).some((char) => char.charCodeAt(0) > 255)) {
+    throw new Error(`${label} 不能包含换行或非 ASCII 字符。`);
+  }
+}
+
+function assertHttpUrl(value, label) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} 不是有效 URL。`);
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error(`${label} 只支持 http 或 https。`);
+  }
+}
+
+function sanitizeSourcesPayload(payload) {
+  const input = ensurePlainObject(payload, '资料范围');
+  if (!Array.isArray(input.watch_paths)) {
+    throw new Error('资料范围必须是路径列表。');
+  }
+  const watchPaths = [...new Set(input.watch_paths.map((item) => boundedString(item, '资料路径', 2000)).filter(Boolean))];
+  if (!watchPaths.length) {
+    throw new Error('请至少保留一个资料范围。');
+  }
+  return { watch_paths: watchPaths };
+}
+
+function sanitizeTriageDecisionPayload(payload) {
+  const input = ensurePlainObject(payload, '目录决策');
+  const status = boundedString(input.status, '目录决策状态', 20, true);
+  if (!['high', 'medium', 'low', 'skip'].includes(status)) {
+    throw new Error('目录决策状态无效。');
+  }
+  return {
+    prefix: boundedString(input.prefix, '目录前缀', 2000, true),
+    status,
+  };
+}
+
+function sanitizeAgentBriefPayload(payload) {
+  const input = ensurePlainObject(payload, 'Agent handoff');
+  return {
+    caller: boundedString(input.caller || 'desktop', '调用方', 80) || 'desktop',
+    session_id: boundedString(input.session_id, '会话 ID', 160),
+    workspace: boundedString(input.workspace, 'Workspace', 2000),
+    task: boundedString(input.task, '任务描述', 4000),
+    surface: boundedString(input.surface || 'desktop', 'Surface', 80) || 'desktop',
+  };
+}
+
+function sanitizeModelListPayload(payload) {
+  const input = ensurePlainObject(payload, '模型列表请求');
+  const sanitized = {
+    mode: boundedString(input.mode || 'api', '模型模式', 20),
+    scope: boundedString(input.scope, '模型范围', 20),
+    provider: boundedString(input.provider, '模型 provider', 100),
+    base_url: boundedString(input.base_url, '模型 API base URL', 2000),
+    api_host: boundedString(input.api_host, '模型 API 主机', 2000),
+    api_path: boundedString(input.api_path || DEFAULT_CHAT_PATH, '模型 API 路径', 500) || DEFAULT_CHAT_PATH,
+    api_key: boundedString(input.api_key, '模型 API Key', 4000),
+    api_key_env: boundedString(input.api_key_env, '模型 API Key 环境变量', 160),
+  };
+  if (sanitized.api_key) {
+    assertHeaderSafe(sanitized.api_key, '模型 API Key');
+  }
+  return sanitized;
+}
+
+function sanitizeMemoryFeedbackPayload(payload) {
+  const input = ensurePlainObject(payload, '记忆反馈');
+  const factId = boundedString(input.fact_id, '记忆 ID', 200, true);
+  const status = boundedString(input.status, '记忆状态', 40, true);
+  if (!MEMORY_FACT_STATUSES.has(status)) {
+    throw new Error('记忆状态不支持。');
+  }
+  return { fact_id: factId, status };
 }
 
 function sendDaemonEvent(event) {
@@ -123,12 +224,59 @@ function sendDaemonEvent(event) {
   mainWindow.webContents.send('daemon:event', event);
 }
 
+function fallbackRendererHtml(message) {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Kith</title>
+        <style>
+          body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            background: #080b10;
+            color: #f5f7fb;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          }
+          main {
+            max-width: 560px;
+            padding: 32px;
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 24px;
+            background: rgba(255,255,255,0.06);
+          }
+          code {
+            color: #9bdcff;
+          }
+        </style>
+      </head>
+      <body>
+        <main>
+          <h1>Kith renderer is not available</h1>
+          <p>${message}</p>
+          <p>Use <code>npm run dev</code> for Vite development, or <code>npm run build && npm start</code> for the built renderer.</p>
+        </main>
+      </body>
+    </html>
+  `)}`;
+}
+
+function loadBuiltRendererOrError(message) {
+  if (existsSync(RENDERER_INDEX_PATH)) {
+    return mainWindow.loadFile(RENDERER_INDEX_PATH);
+  }
+  return mainWindow.loadURL(fallbackRendererHtml(message));
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1220,
-    height: 820,
+    width: 1024,
+    height: 560,
     minWidth: 980,
-    minHeight: 680,
+    minHeight: 560,
     title: 'Kith',
     backgroundColor: '#080b10',
     titleBarStyle: 'hiddenInset',
@@ -141,12 +289,17 @@ function createWindow() {
     },
   });
 
-  if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else if (!app.isPackaged) {
-    mainWindow.loadURL('http://127.0.0.1:5173');
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL || (!app.isPackaged ? DEV_SERVER_URL : '');
+  if (devServerUrl) {
+    mainWindow.webContents.once('did-fail-load', (_event, _code, _description, validatedURL, isMainFrame) => {
+      if (isMainFrame === false || !String(validatedURL || '').startsWith(devServerUrl)) {
+        return;
+      }
+      loadBuiltRendererOrError(`Could not reach the Vite dev server at ${devServerUrl}.`);
+    });
+    mainWindow.loadURL(devServerUrl);
   } else {
-    mainWindow.loadFile(join(repoRoot, 'desktop/dist/renderer/index.html'));
+    loadBuiltRendererOrError('The built renderer file is missing.');
   }
 }
 
@@ -161,34 +314,49 @@ ipcMain.handle('daemon:openDashboard', async () => {
 
 async function fetchDashboardJson(path, init = {}) {
   await daemon.ensureDashboard();
-  const response = await fetch(`${DASHBOARD_BASE_URL}${path}`, init);
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.error || `Dashboard HTTP ${response.status}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new Error(`Dashboard request timed out after ${DASHBOARD_FETCH_TIMEOUT_MS}ms`)),
+    DASHBOARD_FETCH_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(`${DASHBOARD_BASE_URL}${path}`, {
+      ...init,
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || `Dashboard HTTP ${response.status}`);
+    }
+    return payload;
+  } finally {
+    clearTimeout(timeout);
   }
-  return payload;
 }
 
 ipcMain.handle('triage:clusters', async (_event, payload = {}) => {
-  const depth = Number(payload.depth || 3);
-  const limit = Number(payload.limit || 80);
+  const input = ensurePlainObject(payload, '目录聚类请求');
+  const depth = boundedNumber(input.depth, 3, 1, 8, '目录聚类深度');
+  const limit = boundedNumber(input.limit, 80, 1, 300, '目录聚类数量');
   return fetchDashboardJson(`/api/file-clusters?depth=${encodeURIComponent(depth)}&limit=${encodeURIComponent(limit)}`);
 });
 
 ipcMain.handle('triage:files', async (_event, payload = {}) => {
-  const prefix = String(payload.prefix || '');
-  const limit = Number(payload.limit || 200);
-  return daemon.runPythonJson(TRIAGE_FILES_SCRIPT, [prefix, limit]);
+  const input = ensurePlainObject(payload, '目录文件请求');
+  const prefix = boundedString(input.prefix, '目录前缀', 2000, true);
+  const limit = boundedNumber(input.limit, 200, 1, 300, '目录文件数量');
+  return daemon.runPythonJson(TRIAGE_FILES_SCRIPT, [prefix, limit], { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS });
 });
 
 ipcMain.handle('triage:clusterDecision', async (_event, payload = {}) => {
+  const decision = sanitizeTriageDecisionPayload(payload);
   return fetchDashboardJson('/api/file-clusters/decision', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'X-Kith-Dashboard': '1',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(decision),
   });
 });
 ipcMain.handle('daemon:events:start', async () => {
@@ -245,34 +413,16 @@ ipcMain.handle('daemon:events:stop', async () => {
   return { stopped: true };
 });
 
-function parseSseEvent(chunk) {
-  const lines = chunk.split('\n');
-  let type = 'message';
-  let data = '';
-  for (const line of lines) {
-    if (line.startsWith('event:')) {
-      type = line.slice(6).trim();
-    } else if (line.startsWith('data:')) {
-      data += line.slice(5).trim();
-    }
-  }
-  if (!data) {
-    return null;
-  }
-  try {
-    return { type, data: JSON.parse(data) };
-  } catch {
-    return { type, data };
-  }
-}
-
 ipcMain.handle('kith:chat', async (_event, payload) => {
   return runFrontendChat({ daemon, payload, sendEvent: sendDaemonEvent });
 });
 
 ipcMain.handle('insights:get', async (_event, payload = {}) => {
   await daemon.ensureDaemon();
-  return daemon.syscall('assistant.insights', payload, 1);
+  return daemon.syscall('assistant.insights', payload, 1, {
+    httpTimeoutMs: INSIGHTS_HTTP_TIMEOUT_MS,
+    unixTimeoutMs: INSIGHTS_UNIX_TIMEOUT_MS,
+  });
 });
 
 ipcMain.handle('onboarding:bootstrap', async (_event, payload = {}) => {
@@ -307,12 +457,22 @@ ipcMain.handle('profile:summary', async (_event, payload = {}) => {
 
 ipcMain.handle('memory:review', async (_event, payload = {}) => {
   await daemon.ensureDaemon();
-  return daemon.syscall('memory.review', payload, 1);
+  return daemon.syscall('memory.review', payload, 1, { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS });
 });
 
-ipcMain.handle('memory:feedback', async (_event, payload) => {
+ipcMain.handle('memory:feedback', async (_event, payload = {}) => {
   await daemon.ensureDaemon();
-  return daemon.syscall('memory.feedback', payload, 1);
+  return daemon.syscall('memory.feedback', sanitizeMemoryFeedbackPayload(payload), 1, { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS });
+});
+
+ipcMain.handle('capabilities:list', async () => {
+  await daemon.ensureDaemon();
+  return daemon.syscall('capabilities.list', {}, 1, { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS });
+});
+
+ipcMain.handle('context:agentBrief', async (_event, payload = {}) => {
+  await daemon.ensureDaemon();
+  return daemon.syscall('context.agent_brief', sanitizeAgentBriefPayload(payload), 1, { timeoutMs: LONG_SYSCALL_TIMEOUT_MS });
 });
 
 ipcMain.handle('sources:get', async () => {
@@ -322,32 +482,37 @@ ipcMain.handle('sources:get', async () => {
 
 ipcMain.handle('sources:configure', async (_event, payload) => {
   await daemon.ensureDaemon();
-  return daemon.syscall('sources.configure', payload, 0, { httpTimeoutMs: 10000, unixTimeoutMs: 20000 });
+  return daemon.syscall('sources.configure', sanitizeSourcesPayload(payload), 0, { httpTimeoutMs: 10000, unixTimeoutMs: 20000 });
 });
 
 ipcMain.handle('settings:model', async (_event, payload) => {
   if (payload?.scope === 'desktop') {
-    return daemon.runPythonJson(MODEL_SETTINGS_SAVE_SCRIPT, [JSON.stringify(payload)]);
+    return daemon.runPythonJson(MODEL_SETTINGS_SAVE_SCRIPT, [JSON.stringify(payload)], { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS });
   }
   await daemon.ensureDaemon();
   return daemon.syscall('settings.model', payload, 0, { httpTimeoutMs: 10000, unixTimeoutMs: 20000 });
 });
 
 ipcMain.handle('settings:model:get', async () => {
-  return daemon.runPythonJson(MODEL_SETTINGS_GET_SCRIPT);
+  return daemon.runPythonJson(MODEL_SETTINGS_GET_SCRIPT, [], { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS });
 });
 
 ipcMain.handle('settings:model:list', async (_event, payload = {}) => {
-  const baseUrl = normalizeApiBaseUrl(payload.base_url || payload.api_host, payload.api_path);
+  const modelPayload = sanitizeModelListPayload(payload);
+  const baseUrl = normalizeApiBaseUrl(modelPayload.base_url || modelPayload.api_host, modelPayload.api_path);
   if (!baseUrl) {
     throw new Error('请先填写 provider API 主机。');
   }
+  assertHttpUrl(baseUrl, '模型 API 主机');
 
-  const apiKeyEnv = String(payload.api_key_env || '');
-  let apiKey = String(payload.api_key || (apiKeyEnv ? process.env[apiKeyEnv] : '') || '').trim();
-  if (!apiKey && payload.scope === 'desktop') {
-    const savedDesktop = await daemon.runPythonJson(DESKTOP_RUNTIME_MODEL_SCRIPT).catch(() => ({}));
+  const apiKeyEnv = modelPayload.api_key_env;
+  let apiKey = String(modelPayload.api_key || (apiKeyEnv ? process.env[apiKeyEnv] : '') || '').trim();
+  if (!apiKey && modelPayload.scope === 'desktop') {
+    const savedDesktop = await daemon.runPythonJson(DESKTOP_RUNTIME_MODEL_SCRIPT, [], { timeoutMs: SHORT_SYSCALL_TIMEOUT_MS }).catch(() => ({}));
     apiKey = String(savedDesktop.api_key || '').trim();
+  }
+  if (apiKey) {
+    assertHeaderSafe(apiKey, '模型 API Key');
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error('model list request timed out')), 15000);

@@ -164,9 +164,24 @@ class SyscallServer:
                 length_bytes = await reader.readexactly(4)
                 length = struct.unpack(">I", length_bytes)[0]
                 if length > 10 * 1024 * 1024:  # 10MB safety limit
+                    response = SyscallResponse(
+                        request_id="",
+                        success=False,
+                        error="request payload too large; maximum is 10MB",
+                    )
+                    await self._write_unix_response(writer, response)
                     break
                 payload = await reader.readexactly(length)
-                request = SyscallRequest.from_json(payload)
+                try:
+                    request = SyscallRequest.from_json(payload)
+                except Exception as e:
+                    response = SyscallResponse(
+                        request_id="",
+                        success=False,
+                        error=f"malformed syscall request: {e}",
+                    )
+                    await self._write_unix_response(writer, response)
+                    continue
                 auth_err = self._check_auth(request, transport="unix")
                 if auth_err:
                     response = SyscallResponse(
@@ -176,9 +191,7 @@ class SyscallServer:
                     )
                 else:
                     response = await self._dispatch(request)
-                resp_bytes = response.to_json().encode()
-                writer.write(struct.pack(">I", len(resp_bytes)) + resp_bytes)
-                await writer.drain()
+                await self._write_unix_response(writer, response)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         except Exception as e:
@@ -186,6 +199,11 @@ class SyscallServer:
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def _write_unix_response(self, writer: asyncio.StreamWriter, response: SyscallResponse) -> None:
+        resp_bytes = response.to_json().encode()
+        writer.write(struct.pack(">I", len(resp_bytes)) + resp_bytes)
+        await writer.drain()
 
     # ── HTTP handler (optional, for easier debugging/integration) ─
 
@@ -213,7 +231,7 @@ class SyscallServer:
         from aiohttp import web
         try:
             body = await request.json()
-            req = SyscallRequest(**body)
+            req = SyscallRequest.from_json(json.dumps(body))
             http_token = request.headers.get("X-Agent-Token")
             auth_err = self._check_auth(req, transport="http", http_token=http_token)
             if auth_err:
@@ -364,6 +382,13 @@ class SyscallServer:
 
         # Submit and wait
         scheduler = self.kernel.get_scheduler()
+        if not scheduler:
+            return SyscallResponse(
+                request_id=request.request_id,
+                success=False,
+                error="scheduler unavailable",
+                elapsed_ms=(time.time() - start) * 1000,
+            )
         completed = await scheduler.submit_and_wait(task, context)
 
         elapsed_ms = (time.time() - start) * 1000

@@ -221,8 +221,8 @@ class AssistantAgent(BaseAgent):
                     detail=f"补充检索 {len(broad_evidence)} 个证据片段。",
                     started_at=step_started,
                 )
-                file_paths = {str(item.get("path")) for item in file_evidence}
-                rag_evidence = file_evidence + [item for item in broad_evidence if str(item.get("path")) not in file_paths]
+                rag_paths = {str(item.get("path")) for item in broad_evidence}
+                rag_evidence = broad_evidence + [item for item in file_evidence if str(item.get("path")) not in rag_paths]
         else:
             await self._emit_progress(event_bus, request_id, "retrieval", "精确查找未命中，改用宽范围 RAG 检索。", 0.40)
             step_started = time.time()

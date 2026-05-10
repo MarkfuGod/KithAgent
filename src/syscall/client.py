@@ -128,6 +128,36 @@ class SysAgentClient:
             return resp.data.get("context")
         return None
 
+    async def capabilities_list(self) -> dict:
+        """List explicit Kith capability nodes and their permission posture."""
+        resp = await self._call(SyscallType.CAPABILITIES_LIST)
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def agent_context_brief(
+        self,
+        workspace: str | None = None,
+        task: str | None = None,
+        session_id: str | None = None,
+        surface: str = "agent",
+    ) -> dict:
+        """Build a session-aware handoff for Cursor, Claude Code, Codex, or MCP callers."""
+        params: dict[str, Any] = {
+            "caller": self.caller,
+            "surface": surface,
+        }
+        if workspace:
+            params["workspace"] = workspace
+        if task:
+            params["task"] = task
+        if session_id:
+            params["session_id"] = session_id
+        resp = await self._call(SyscallType.CONTEXT_AGENT_BRIEF, params)
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
     # ── v0.2: Smart Agent APIs ────────────────────────────────
 
     async def report_daily(self) -> dict:
@@ -160,6 +190,20 @@ class SysAgentClient:
 
     async def profile_summary(self, rebuild: bool = False) -> dict:
         resp = await self._call(SyscallType.PROFILE_SUMMARY, {"rebuild": rebuild, "timeout": 300})
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def settings_model(self, settings: dict[str, Any], priority: int = 0) -> dict:
+        """Persist backend or desktop model settings through the control-plane syscall."""
+        resp = await self._call(SyscallType.SETTINGS_MODEL, settings, priority=priority)
+        if resp.success:
+            return resp.data
+        raise RuntimeError(resp.error)
+
+    async def settings_model_get(self) -> dict:
+        """Read saved model settings without exposing API key values."""
+        resp = await self._call(SyscallType.SETTINGS_MODEL_GET, {}, priority=0)
         if resp.success:
             return resp.data
         raise RuntimeError(resp.error)
@@ -309,6 +353,25 @@ class SyncSysAgentClient:
     def context_load(self, session_id: str) -> dict | None:
         return self._get_loop().run_until_complete(self._async_client.context_load(session_id))
 
+    def capabilities_list(self) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.capabilities_list())
+
+    def agent_context_brief(
+        self,
+        workspace: str | None = None,
+        task: str | None = None,
+        session_id: str | None = None,
+        surface: str = "agent",
+    ) -> dict:
+        return self._get_loop().run_until_complete(
+            self._async_client.agent_context_brief(
+                workspace=workspace,
+                task=task,
+                session_id=session_id,
+                surface=surface,
+            )
+        )
+
     # v0.2 smart agent methods
     def report_daily(self) -> dict:
         return self._get_loop().run_until_complete(self._async_client.report_daily())
@@ -324,6 +387,12 @@ class SyncSysAgentClient:
 
     def profile_summary(self, rebuild: bool = False) -> dict:
         return self._get_loop().run_until_complete(self._async_client.profile_summary(rebuild))
+
+    def settings_model(self, settings: dict[str, Any], priority: int = 0) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.settings_model(settings, priority))
+
+    def settings_model_get(self) -> dict:
+        return self._get_loop().run_until_complete(self._async_client.settings_model_get())
 
     def assistant_chat(self, message: str, history: list[dict] | None = None) -> dict:
         return self._get_loop().run_until_complete(self._async_client.assistant_chat(message, history))

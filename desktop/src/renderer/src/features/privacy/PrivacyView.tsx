@@ -206,10 +206,10 @@ export function PrivacyView({
   return (
     <section className="privacy-page">
       <article className="panel trust-panel">
-        <p className="eyebrow">资料权限</p>
-        <h3>Kith 只理解你允许的范围。</h3>
+        <p className="eyebrow">Privacy control room</p>
+        <h3>Kith only understands the sources you approve.</h3>
         <p>
-          每行一个目录。建议从 Documents、Desktop、学习资料目录开始。浏览历史只会在 First Insight 中按标题、域名和统计聚合。
+          Start narrow: Documents, Desktop, Downloads, or one current project. Browser history is optional and only summarized as titles, domains, and aggregate signals.
         </p>
         <div className="source-presets" aria-label="常用索引目录预设">
           {sourcePresets.map((preset) => (
@@ -226,21 +226,21 @@ export function PrivacyView({
           ))}
         </div>
         <button className="ghost source-recommended" onClick={useRecommendedSet} type="button">
-          使用推荐组合：Documents + Desktop + Downloads
+          Use safe starter set: Documents + Desktop + Downloads
         </button>
         <textarea value={sourceDraft} onChange={(event) => onSourceDraftChange(event.target.value)} rows={8} />
         <button className="primary" disabled={isSourcesSaving} onClick={onSaveSources} type="button">
           {isSourcesSaving ? '保存中...' : '保存资料范围'}
         </button>
         {sourceSaveStatus ? <small className="inline-operation-status">{sourceSaveStatus}</small> : null}
-        <small>当前已配置 {sources.watch_paths?.length || 0} 个目录。保存后可能需要重新扫描或重启服务。</small>
+        <small>{sources.watch_paths?.length || 0} approved source folders. Kith will explain what it scanned, skipped, and prepared for search.</small>
       </article>
 
       <article className="panel trust-panel triage-review-panel">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">索引分诊</p>
-            <h3>需要你确认的目录</h3>
+            <p className="eyebrow">What Kith skipped</p>
+            <h3>Review noisy folders before they become memory</h3>
           </div>
           <button className="ghost" disabled={isTriageReviewLoading} onClick={onRefreshTriageReview} type="button">
             {isTriageReviewLoading ? '同步中...' : '同步'}
@@ -248,8 +248,8 @@ export function PrivacyView({
         </div>
         {triageSyncStatus ? <small className="inline-operation-status">{triageSyncStatus}</small> : null}
         <p>
-          像文件清理工具一样处理：Kith 认为明显是工具、缓存、依赖的目录会默认打勾；边界目录默认不勾，需要你确认。
-          点击“排除已勾选”后，这些目录会被标成 skip，不再进入总结。
+          Kith can identify cache, dependency, generated, and tool folders before they pollute summaries.
+          Review the explanation, then approve what should be excluded.
         </p>
         {cleanupClusters.length ? (
           <>

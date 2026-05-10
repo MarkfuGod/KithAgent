@@ -243,6 +243,7 @@ export function SettingsView({
 }: SettingsViewProps) {
   const backendStatus = describeModelStatus(backendModelMode, backendModelDraft, daemon);
   const [activeScope, setActiveScope] = useState<ModelScope>('desktop');
+  const [activeSettingsNav, setActiveSettingsNav] = useState<'providers' | 'model'>('providers');
   const [providerFocusToken, setProviderFocusToken] = useState(0);
   const activeDraft = activeScope === 'desktop' ? desktopModelDraft : backendModelDraft;
   const activeMode = activeScope === 'desktop' ? desktopModelMode : backendModelMode;
@@ -309,28 +310,36 @@ export function SettingsView({
     setProviderFocusToken((value) => value + 1);
   }
 
+  function scrollToSettingsSection(section: 'providers' | 'model') {
+    setActiveSettingsNav(section);
+    document.getElementById(`settings-${section}-section`)?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    });
+  }
+
   return (
     <section className="settings-page settings-workbench">
       <aside className="settings-nav-rail" aria-label="设置分类">
-        <button className="active" type="button">
+        <button className={activeSettingsNav === 'providers' ? 'active' : ''} onClick={() => scrollToSettingsSection('providers')} type="button">
           <span>模型提供方</span>
           <small>连接谁的 API</small>
         </button>
-        <button type="button">
+        <button className={activeSettingsNav === 'model' ? 'active' : ''} onClick={() => scrollToSettingsSection('model')} type="button">
           <span>模型</span>
           <small>当前 provider 的模型</small>
         </button>
-        <button type="button">
+        <button disabled title="MCP 接入会在 Agent Context Provider 阶段启用" type="button">
           <span>MCP</span>
-          <small>后续接外部工具</small>
+          <small>下一阶段启用</small>
         </button>
-        <button type="button">
+        <button disabled title="资料范围请到隐私页管理" type="button">
           <span>知识库</span>
           <small>资料范围在隐私页管理</small>
         </button>
       </aside>
 
-      <aside className="provider-column" aria-label="模型提供方列表">
+      <aside className="provider-column" id="settings-providers-section" aria-label="模型提供方列表">
         <div className="provider-column-heading">
           <strong>模型提供方</strong>
           <div className="mini-segmented" role="tablist" aria-label="模型作用域">
@@ -383,6 +392,7 @@ export function SettingsView({
         onSave={() => onSaveModel(activeScope, activeMode, activeDraft)}
         onToggle={() => setActiveScope(activeScope === 'desktop' ? 'backend' : 'desktop')}
         providerFocusToken={providerFocusToken}
+        sectionId="settings-model-section"
         scope={activeScope}
         showProviderPresets={false}
         status={activeStatus}
@@ -424,6 +434,7 @@ function ModelConfigSection({
   onSave,
   onToggle,
   providerFocusToken,
+  sectionId,
   scope,
   showProviderPresets = true,
   status: modelStatus,
@@ -439,6 +450,7 @@ function ModelConfigSection({
   onSave: () => Promise<void>;
   onToggle: () => void;
   providerFocusToken: number;
+  sectionId?: string;
   scope: ModelScope;
   showProviderPresets?: boolean;
   status: { title: string; detail: string };
@@ -553,7 +565,7 @@ function ModelConfigSection({
   }
 
   return (
-      <article className="panel settings-model-panel">
+      <article className="panel settings-model-panel" id={sectionId}>
         <div className="model-section-heading">
           <div>
             <p className="eyebrow">模型设置</p>

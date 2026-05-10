@@ -1,14 +1,22 @@
 export type DiagnosticsViewProps = {
+  capabilities: Awaited<ReturnType<KithApi['capabilities']['list']>> | null;
+  capabilitiesStatus: string;
   daemon: DaemonStatus;
   events: DaemonEvent[];
+  isCapabilitiesLoading: boolean;
   onOpenDashboard: () => Promise<void>;
+  onRefreshCapabilities: () => Promise<void>;
   onStopDaemon: () => Promise<void>;
 };
 
 export function DiagnosticsView({
+  capabilities,
+  capabilitiesStatus,
   daemon,
   events,
+  isCapabilitiesLoading,
   onOpenDashboard,
+  onRefreshCapabilities,
   onStopDaemon,
 }: DiagnosticsViewProps) {
   return (
@@ -17,6 +25,37 @@ export function DiagnosticsView({
         <p className="eyebrow">诊断</p>
         <h3>本地服务状态</h3>
         <pre className="profile-json">{JSON.stringify(daemon.status || daemon, null, 2)}</pre>
+      </article>
+      <article className="panel">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Capability nodes</p>
+            <h3>后端明确暴露了哪些能力</h3>
+          </div>
+          <button className="ghost" disabled={!daemon.running || isCapabilitiesLoading} onClick={() => onRefreshCapabilities()} type="button">
+            {isCapabilitiesLoading ? '读取中...' : '刷新能力'}
+          </button>
+        </div>
+        {capabilitiesStatus ? <p className="empty">{capabilitiesStatus}</p> : null}
+        {capabilities?.capabilities.length ? (
+          <div className="event-list">
+            {capabilities.capabilities.map((capability) => (
+              <div className={`event-row ${capability.status.includes('planned') ? 'warning' : 'success'}`} key={capability.id}>
+                <div className="event-row-header">
+                  <strong>{capability.id}</strong>
+                  <span>{capability.status}</span>
+                </div>
+                <p>{capability.permission}</p>
+                <div className="event-meta">
+                  <small>{capability.sensitivity}</small>
+                  {capability.commands.slice(0, 4).map((command) => (
+                    <small key={command}>{command}</small>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </article>
       <article className="panel">
         <p className="eyebrow">实时事件</p>

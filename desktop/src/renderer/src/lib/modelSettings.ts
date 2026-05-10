@@ -29,15 +29,24 @@ export function normalizeApiBaseUrl(rawHost: string, rawPath = '/chat/completion
   let host = (rawHost || '').trim().replace(/\/+$/, '');
   const path = (rawPath || '').trim();
   if (!host) return '';
-  if (path && path !== '/chat/completions' && !host.endsWith(path.replace(/\/+$/, ''))) {
-    host = `${host}/${path.replace(/^\/+/, '')}`.replace(/\/+$/, '');
-  }
-  for (const suffix of ['/chat/completions', '/responses', '/completions']) {
-    if (host.endsWith(suffix)) {
-      return host.slice(0, -suffix.length).replace(/\/+$/, '');
+
+  const stripCompletionEndpoint = (value: string) => {
+    let base = value.replace(/\/+$/, '');
+    for (const suffix of ['/chat/completions', '/responses', '/completions']) {
+      if (base.endsWith(suffix)) {
+        base = base.slice(0, -suffix.length).replace(/\/+$/, '');
+        break;
+      }
     }
+    return base;
+  };
+
+  host = stripCompletionEndpoint(host);
+  const normalizedPath = path.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (normalizedPath && path !== '/chat/completions' && !host.endsWith(`/${normalizedPath}`)) {
+    host = stripCompletionEndpoint(`${host}/${normalizedPath}`);
   }
-  return host;
+  return stripCompletionEndpoint(host);
 }
 
 export function buildModelSettingsPayload(mode: ModelMode, draft: ModelDraft) {

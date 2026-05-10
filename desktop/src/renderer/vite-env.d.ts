@@ -4,6 +4,7 @@ declare global {
   type DaemonStatus = {
     running: boolean;
     status?: Record<string, unknown>;
+    transport?: 'http' | 'unix_socket' | string;
     error?: string;
   };
 
@@ -16,6 +17,14 @@ declare global {
   type ChatMessage = {
     role: 'user' | 'assistant';
     content: string;
+  };
+
+  type ChatSource = {
+    id?: string;
+    title?: string;
+    kind: 'backend_skill' | 'backend_skill_error' | string;
+    result?: unknown;
+    error?: string;
   };
 
   type ProfileFact = {
@@ -189,7 +198,7 @@ declare global {
       status: () => Promise<DaemonStatus>;
       start: () => Promise<DaemonStatus>;
       stop: () => Promise<{ stopped: boolean }>;
-      openDashboard: () => Promise<void>;
+      openDashboard: () => Promise<{ running: boolean; url: string; pid?: number; opened?: unknown }>;
       events: {
         start: () => Promise<{ started: boolean }>;
         stop: () => Promise<{ stopped: boolean }>;
@@ -202,7 +211,7 @@ declare global {
         history: ChatMessage[];
         request_id?: string;
         model_settings?: Record<string, unknown>;
-      }) => Promise<{ answer: string; context?: unknown; sources?: Array<Record<string, unknown>> }>;
+      }) => Promise<{ answer: string; context?: unknown; sources?: ChatSource[] }>;
     };
     insights: {
       get: (payload?: { limit?: number }) => Promise<KithInsights>;
@@ -221,6 +230,60 @@ declare global {
     memory: {
       review: (payload?: { status?: string; limit?: number }) => Promise<MemoryReview>;
       feedback: (payload: { fact_id: string; status: ProfileFact['status'] }) => Promise<{ updated: boolean }>;
+    };
+    capabilities: {
+      list: () => Promise<{
+        contract_version?: string;
+        version: string;
+        generated_at?: number;
+        capabilities: Array<{
+          id: string;
+          status: string;
+          sensitivity: string;
+          commands: string[];
+          permission: string;
+        }>;
+      }>;
+    };
+    context: {
+      agentBrief: (payload?: {
+        caller?: string;
+        workspace?: string;
+        task?: string;
+        session_id?: string;
+        surface?: string;
+      }) => Promise<{
+        contract_version?: string;
+        session_key: string;
+        session?: {
+          key: string;
+          source_type: string;
+          platform: string;
+          caller: string;
+          workspace_hash: string;
+          session_id: string;
+        };
+        caller: string;
+        surface: string;
+        workspace: string;
+        task: string;
+        generated_at: number;
+        evidence_policy?: Record<string, unknown>;
+        evidence?: {
+          status: string;
+          workspace_file_count: number;
+          recent_file_count: number;
+          profile_fact_count: number;
+          warnings: string[];
+        };
+        context_apis?: Array<{ name: string; syscall: string; status: string }>;
+        profile: Record<string, unknown>;
+        recent_files: Array<Record<string, unknown>>;
+        workspace_files: Array<Record<string, unknown>>;
+        context_briefs: unknown[];
+        behavior_insights: unknown[];
+        handoff_prompt: string;
+      }>;
     };
     sources: {
       get: () => Promise<SourceSettings>;
