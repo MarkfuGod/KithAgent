@@ -14,7 +14,11 @@
 
 KithAgent is a backend-first personal memory system. You choose local knowledge scopes, Kith indexes them, lets LLMs decide what is worth understanding, summarizes the important parts, builds RAG, and exposes everything to your tools through a local daemon API.
 
-It is not trying to be another chat UI. The point is to give Cursor, Claude Code, Codex, custom agents, and your own scripts a durable local memory layer.
+It is not trying to be another chat UI. The point is to give Cursor, Claude Code, Codex, OpenClaw, custom agents, and your own scripts a durable local memory layer.
+
+> **One line:** KithAgent gives your AI tools memory of your real local work, under your control.
+
+Install once — every agent you use can ask what you are working on, what matters in your files, and what context to carry into the next session.
 
 ### Why Kith
 
@@ -46,11 +50,30 @@ CLI / dashboard / skills / syscall API
 
 ### What Makes It Different
 
-**Compared with Hermes-style agents:** Hermes is a general agent shell: chat, tools, sessions, automations, gateways. Kith is the local memory backend those agents can lean on.
+**Compared with Hermes / OpenClaw-style agents:** Hermes and OpenClaw are general agent shells — chat, tools, sessions, gateways, and channel integrations. Kith is the local memory backend those agents can lean on. See [OpenClaw integration](#openclaw-integration) below.
 
 **Compared with cloud memory:** Kith lets you pick local source scopes and run the memory pipeline on your machine. The durable store is local SQLite under `~/.agent_sys/`.
 
 **Compared with simple file search:** Kith does not sort by filename or size only. It asks LLMs which files reveal your projects, habits, interests, and priorities, then spends summarization/RAG budget there first.
+
+### Positioning vs OpenClaw & Hermes
+
+OpenClaw and [Hermes Agent](https://github.com/NousResearch/hermes-agent) are **agent shells**: gateway, channels (WhatsApp, Telegram, Slack…), tool loops, skills, and sessions. KithAgent is **local memory infrastructure** those shells can call — not a fork of either project.
+
+| Layer | OpenClaw / Hermes | KithAgent |
+| --- | --- | --- |
+| Primary job | Route messages, run agents, connect platforms | Index local files, triage, summarize, hybrid RAG, profile |
+| User feeling | "Chat with my agent anywhere" | "My agents already know my workspace" |
+| Integration | Channels + gateway control plane | Syscall API + `SKILL.md` skills (Cursor, Claude Code, OpenClaw) |
+| Memory | Session transcripts + workspace markdown | User-chosen scan roots + LLM triage + evidence-backed retrieval |
+
+**What Kith borrows:** normalized events, session-aware context, gateway-style daemon API, OpenClaw-compatible skills, per-task model routing (triage vs summary vs RAG).
+
+**What Kith does not chase (yet):** full channel plugin matrix, generic chat UI, ungated camera/mic — messaging and device nodes only after the memory core proves value.
+
+Full architecture study and product roadmap: **[OPENCLAW_HERMES_RESEARCH.md](./OPENCLAW_HERMES_RESEARCH.md)** (~1,100 lines — gateway patterns, competitive assessment, demo scripts, phased roadmap).
+
+**Quick demo for reviewers:** `agent-sys start` → `agent-sys report brief` → show skills calling `http://127.0.0.1:7437` with local evidence citations.
 
 ### Screenshots
 
@@ -128,6 +151,47 @@ done
 
 Claude Code uses the same skill format under `~/.claude/skills/`.
 
+### OpenClaw Integration
+
+KithAgent is **not** an OpenClaw fork. It is a **local memory substrate** that OpenClaw-style agents can call through the same `SKILL.md` pattern OpenClaw uses. OpenClaw focuses on the gateway, channels, and agent loop; Kith focuses on indexing local files, triage, hybrid RAG, and cross-session context.
+
+For a deeper architecture comparison (gateway, sessions, skills, memory plugins), see [OPENCLAW_HERMES_RESEARCH.md](./OPENCLAW_HERMES_RESEARCH.md). Summary: OpenClaw owns the control plane; Kith owns **local evidence and cross-session context** that any gateway-based agent can query before it acts.
+
+**Prerequisites:** start the daemon first (`agent-sys start`). Syscall requests from OpenClaw should use `"caller": "openclaw"` — that caller is already allowed in `config/default.yaml`.
+
+**Install skills into OpenClaw** (pick one scope):
+
+```bash
+# From this repo — workspace scope (active OpenClaw workspace only)
+openclaw skills install ./skills/agent-sys-user-context
+openclaw skills install ./skills/agent-sys-file-search
+openclaw skills install ./skills/agent-sys-admin
+
+# Shared across all local OpenClaw agents
+openclaw skills install --global ./skills/agent-sys-user-context
+openclaw skills install --global ./skills/agent-sys-file-search
+openclaw skills install --global ./skills/agent-sys-admin
+```
+
+OpenClaw skill load order (highest precedence first): workspace `skills/` → `.agents/skills` → `~/.agents/skills` → `~/.openclaw/skills` → bundled. See [OpenClaw skills docs](https://docs.openclaw.ai/tools/skills).
+
+**Symlink alternative** (useful while developing KithAgent from a git clone):
+
+```bash
+mkdir -p ~/.openclaw/skills
+for s in agent-sys-user-context agent-sys-file-search agent-sys-admin; do
+  ln -sfn "$(pwd)/skills/$s" "$HOME/.openclaw/skills/$s"
+done
+```
+
+After install, start a **new OpenClaw session** so the skill snapshot refreshes. The skills call Kith's HTTP API at `http://127.0.0.1:7437` with `X-Agent-Token` from `~/.agent_sys/auth_token`.
+
+| Skill | Use when the agent needs to… |
+| --- | --- |
+| `agent-sys-user-context` | Load profile, recent work, behavior reports, or personalized answers |
+| `agent-sys-file-search` | Search indexed local files with citation-ready evidence |
+| `agent-sys-admin` | Inspect daemon health, trigger triage/RAG, or debug setup |
+
 ### API
 
 Kith exposes a local syscall API over Unix socket and HTTP.
@@ -187,7 +251,11 @@ desktop/                 # Electron companion app
 
 KithAgent 是一个后端优先的本地记忆系统。你选择本地知识范围，Kith 扫描这些文件，让 LLM 判断哪些值得理解、哪些应该跳过，再总结高价值内容、建立 RAG、形成用户画像，并通过本地 daemon API 提供给你的 Agent 工具调用。
 
-它不是要再做一个聊天界面。它的核心价值是：给 Cursor、Claude Code、Codex、自定义 agent 和脚本一个稳定的本地记忆层。
+它不是要再做一个聊天界面。它的核心价值是：给 Cursor、Claude Code、Codex、OpenClaw、自定义 agent 和脚本一个稳定的本地记忆层。
+
+> **一句话：** KithAgent 让你在本地掌控的前提下，给 AI 工具装上对你真实工作的记忆。
+
+装一次，你用的每个 agent 都能问：你最近在做什么、哪些文件重要、下一 session 该带什么上下文。
 
 ### 为什么需要 Kith
 
@@ -219,11 +287,30 @@ CLI / dashboard / skills / syscall API
 
 ### 和其他东西的不同
 
-**和 Hermes 这类 Agent Shell 不同：** Hermes 更像通用 agent 入口，强调聊天、工具、会话、自动化和 gateway。Kith 是这些 agent 背后的本地记忆后端。
+**和 Hermes / OpenClaw 这类 Agent Shell 不同：** Hermes 和 OpenClaw 是通用 agent 入口，强调聊天、工具、会话、gateway 和渠道集成。Kith 是这些 agent 背后的本地记忆后端。见下方 [OpenClaw 接入](#openclaw-接入)。
 
 **和 Cloud Memory 不同：** Kith 让你自己选择本地来源范围，记忆库默认在本机 `~/.agent_sys/` 下。
 
 **和普通文件搜索不同：** Kith 不只是按文件名、大小、时间排序。它让 LLM 判断哪些文件真正能体现你的项目、习惯、兴趣和优先级，再优先花 token 理解这些文件。
+
+### 与 OpenClaw / Hermes 的定位
+
+OpenClaw 和 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 是 **Agent Shell**：gateway、渠道（WhatsApp、Telegram、Slack…）、tool loop、skills、session。KithAgent 是这些 shell 可以调用的 **本地记忆基础设施**，不是二者的 fork。
+
+| 层次 | OpenClaw / Hermes | KithAgent |
+| --- | --- | --- |
+| 核心职责 | 路由消息、跑 agent、连平台 | 索引本地文件、分诊、摘要、混合 RAG、画像 |
+| 用户感受 | 「在哪都能跟 agent 聊」 | 「agent 已经懂我的工作区」 |
+| 集成方式 | 渠道 + gateway 控制面 | Syscall API + `SKILL.md` skills（Cursor、Claude Code、OpenClaw） |
+| 记忆模型 | Session  transcript + workspace markdown | 用户自选 scan root + LLM triage + 可引用证据检索 |
+
+**Kith 借鉴什么：** 事件标准化、session-aware context、daemon 式 API、OpenClaw 同款 skills、按任务分模型（triage / summary / RAG）。
+
+**Kith 暂不追逐什么：** 全渠道 plugin 矩阵、通用 chat UI、无权限 camera/mic — messaging 和设备 node 等 memory 核心跑通后再加。
+
+完整架构研究与产品路线图：**[OPENCLAW_HERMES_RESEARCH.md](./OPENCLAW_HERMES_RESEARCH.md)**（约 1100 行 — gateway 模式、竞争分析、demo 脚本、分阶段 roadmap）。
+
+**给 reviewer 的快速 demo：** `agent-sys start` → `agent-sys report brief` → 展示 skills 调用 `http://127.0.0.1:7437` 并返回本地证据引用。
 
 ### 截图
 
@@ -300,6 +387,47 @@ done
 ```
 
 Claude Code 也使用同样的 skill 格式，目录是 `~/.claude/skills/`。
+
+### OpenClaw 接入
+
+KithAgent **不是** OpenClaw 的 fork，而是 OpenClaw 类 agent 可以调用的 **本地记忆底层**：沿用 OpenClaw 同款的 `SKILL.md` 格式，通过 HTTP syscall 提供跨 session 的本地上下文。OpenClaw 负责 gateway、渠道和 agent loop；Kith 负责本地文件索引、分诊、混合 RAG 和画像。
+
+更完整的架构对比（gateway、session、skills、memory plugin）见 [OPENCLAW_HERMES_RESEARCH.md](./OPENCLAW_HERMES_RESEARCH.md)。摘要：OpenClaw 管控制面；Kith 管 **本地证据与跨 session 上下文**，任何 gateway agent 行动前都可先查询。
+
+**前置条件：** 先启动 daemon（`agent-sys start`）。从 OpenClaw 发起的 syscall 请使用 `"caller": "openclaw"`，`config/default.yaml` 已允许该 caller。
+
+**安装 skills 到 OpenClaw**（任选一种范围）：
+
+```bash
+# 从本仓库安装 — 仅当前 OpenClaw workspace
+openclaw skills install ./skills/agent-sys-user-context
+openclaw skills install ./skills/agent-sys-file-search
+openclaw skills install ./skills/agent-sys-admin
+
+# 本机所有 OpenClaw agent 共享
+openclaw skills install --global ./skills/agent-sys-user-context
+openclaw skills install --global ./skills/agent-sys-file-search
+openclaw skills install --global ./skills/agent-sys-admin
+```
+
+OpenClaw skills 加载优先级（高 → 低）：workspace `skills/` → `.agents/skills` → `~/.agents/skills` → `~/.openclaw/skills` → 内置。详见 [OpenClaw skills 文档](https://docs.openclaw.ai/tools/skills)。
+
+**软链方式**（本地开发 KithAgent 时方便）：
+
+```bash
+mkdir -p ~/.openclaw/skills
+for s in agent-sys-user-context agent-sys-file-search agent-sys-admin; do
+  ln -sfn "$(pwd)/skills/$s" "$HOME/.openclaw/skills/$s"
+done
+```
+
+安装后请 **新开 OpenClaw session**，以便 skill snapshot 刷新。skills 会调用 `http://127.0.0.1:7437`，并用 `~/.agent_sys/auth_token` 作为 `X-Agent-Token`。
+
+| Skill | 适用场景 |
+| --- | --- |
+| `agent-sys-user-context` | 读取画像、近期工作、行为报告或个性化回答 |
+| `agent-sys-file-search` | 搜索已索引本地文件，返回可引用证据 |
+| `agent-sys-admin` | 检查 daemon 状态、手动触发 triage/RAG 或调试 |
 
 ### API
 
